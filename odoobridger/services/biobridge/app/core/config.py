@@ -1,0 +1,242 @@
+"""Application configuration — 12-factor, environment driven."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    # --- app -----------------------------------------------------------------
+    app_name: str = "BioBridge"
+    environment: str = "development"
+    debug: bool = False
+    api_v1_prefix: str = "/api/v1"
+    public_base_url: str = "http://localhost:8000"
+    #: The marketing website, e.g. https://biobridge.app — where visitors
+    #: register and buy. Verification links and Stripe's return pages point
+    #: there when set; empty means the app's own pages are used instead.
+    #: Add the same origin to CORS_ORIGINS so the site can call the API.
+    site_url: str = ""
+    #: What customers type into a ZKTeco terminal's "Cloud Server Setting"
+    #: (ADMS push). Empty host = PUBLIC_BASE_URL's host; 0 port = its port
+    #: (80 if none). Terminals speak plain HTTP to /iclock/ on this address.
+    adms_server_host: str = ""
+    adms_server_port: int = 0
+    #: Largest upload a terminal may send in one request (bytes).
+    adms_max_body_bytes: int = 2_000_000
+    #: Website registrations (and resend requests) allowed per IP per hour.
+    registration_rate_per_hour: int = 10
+    #: Where new Contact / Book a demo requests are emailed. Blank = every
+    #: platform staff account.
+    sales_email: str = ""
+    #: Optional: a Calendly / Cal.com / Google Calendar booking page. When set,
+    #: the website offers it after a demo request so the visitor can pick a slot
+    #: themselves instead of waiting for a reply.
+    demo_booking_url: str = ""
+    #: Contact form submissions allowed per IP per hour.
+    contact_rate_per_hour: int = 5
+
+    # --- stores --------------------------------------------------------------
+    database_url: str = "sqlite:///./biobridge.db"
+    #: Empty means "no broker": the API runs syncs inline instead of queuing.
+    redis_url: str = ""
+
+    # --- auth ----------------------------------------------------------------
+    jwt_secret: str = Field(default="dev-only-change-me-at-least-32-characters")
+    #: A fixed platform-staff login, kept in the server's settings rather than
+    #: created by hand with tools/grant_admin.py — for a host where there is no
+    #: shell to run that in. Both must be set. See app/services/staff_bootstrap.py.
+    staff_email: str = ""
+    staff_password: str = ""
+    jwt_algorithm: str = "HS256"
+    access_token_ttl_minutes: int = 60 * 12
+    refresh_token_ttl_days: int = 30
+
+    #: Staff sessions expire far sooner than customer ones, because they are
+    #: worth far more: a console token reaches every tenant, while a customer's
+    #: reaches one. A support engineer signs in to answer a ticket and should
+    #: not still be holding a cross-tenant credential the next morning — twelve
+    #: hours of ambient console access is the wrong default for a laptop in a
+    #: coffee shop. An hour is long enough for the work and short enough that a
+    #: stolen token is usually already dead.
+    staff_access_token_ttl_minutes: int = 60
+    staff_refresh_token_ttl_days: int = 1
+
+    max_failed_logins: int = 8
+    lockout_minutes: int = 15
+
+    # --- crypto --------------------------------------------------------------
+    #: Master key for envelope encryption of tenant credentials. Generate with
+    #:   python -c "import secrets; print(secrets.token_urlsafe(48))"
+    master_encryption_key: str = Field(default="dev-only-master-key-not-for-production")
+
+    # --- scheduling ----------------------------------------------------------
+    #: Who runs the clock.
+    #:   auto      — Celery beat when REDIS_URL is set, otherwise in-process.
+    #:   inprocess — the API process runs it. No broker, no worker, one service.
+    #:   celery    — beat only. The API never dispatches on a timer.
+    #:   off       — nothing is scheduled; syncs happen only when triggered.
+    #: "auto" is the default so a plain `uvicorn app.main:app` actually syncs on
+    #: a schedule. Deployments that add Redis get beat and the API stands down,
+    #: which is what stops both from firing the same tenant in the same minute.
+    scheduler_mode: str = "auto"
+    #: How often the loop wakes. The tick does not decide the sync frequency —
+    #: each tenant's own interval does — so this only bounds how late a due
+    #: tenant can be.
+    scheduler_tick_seconds: int = 60
+    #: Tenants synced at once. A cycle is I/O-bound on two remote systems, so
+    #: this is about not opening fifty sockets to fifty customer LANs at once.
+    scheduler_concurrency: int = 4
+    #: Lease lifetime. Longer than a tick so a slow tick does not lose it,
+    #: short enough that a killed process is replaced within a minute or two.
+    scheduler_lease_ttl_seconds: int = 180
+
+    # --- sync engine ---------------------------------------------------------
+    default_sync_interval_minutes: int = 15
+    #: Devices upload late and their clocks drift, so a strict cursor loses
+    #: punches. Re-reading is free: the ledger is keyed on the vendor's own id.
+    fetch_overlap_minutes: int = 15
+    backfill_limit_days: int = 30
+    default_page_size: int = 200
+    max_pages_per_run: int = 100
+    max_consecutive_failures: int = 5
+    http_timeout_seconds: int = 30
+
+    # --- subscriptions ---------------------------------------------------------
+    #: Length of a self-signup trial, in days. Applied once, at signup — see
+    #: app.api.v1.auth.signup. Staff can set any date by hand afterwards, and
+    #: a staff-created account (app.api.v1.admin.create_tenant) gets the same
+    #: default, theirs to change immediately if it should be something else.
+    trial_days: int = 10
+    #: Assumed length of one billing cycle, in days, for an account that
+    #: skips the trial and starts directly on a chosen plan at signup
+    #: (SignupRequest.skip_trial). There is no billing integration to say
+    #: otherwise — see app.api.v1.auth.signup — so this is a placeholder
+    #: "paid through" period, the same role trial_days plays for a trial.
+    billing_period_days: int = 30
+    #: How close to its renewal date an account has to be before the warning
+    #: banner appears — on both the tenant's own dashboard and the staff
+    #: console, so the two surfaces always agree on what counts as "soon".
+    #: See app.services.scheduling.renewal_warning.
+    subscription_warning_days: int = 7
+    #: Inside this many days of lapsing, the same warning is shown with an
+    #: urgent tone instead of a routine one — still one message, not a second
+    #: banner. See app.services.scheduling.renewal_warning.
+    subscription_urgent_days: int = 3
+
+    # --- security ------------------------------------------------------------
+    #: Customers legitimately run BioTime on a LAN, so this is a policy switch
+    #: rather than a hard block. Public deployments set it false.
+    allow_private_network_targets: bool = True
+    cors_origins: str = ""
+
+    # --- email genuineness -----------------------------------------------------
+    #: Whether a new account's email address gets a real MX/A lookup, not just
+    #: syntax checking, before the account is created. Off would let a signup
+    #: through on "asdf@asdf" — this is what stops it costing a database row.
+    #: The test suite turns this off globally (see tests/conftest.py) so it
+    #: never depends on outbound DNS; a dedicated test re-enables it against a
+    #: mocked resolver.
+    verify_email_deliverability: bool = True
+    #: How long a signup or staff-onboarded account has to click the
+    #: confirmation link before it goes stale and a fresh one has to be
+    #: requested (POST /auth/resend-verification).
+    email_verification_ttl_hours: int = 48
+    #: How long an emailed password-reset link works, and the shortest gap
+    #: between two requests for the same account.
+    #: Alert emails: a red alert must stand this long before anyone is mailed
+    #: (a blip that clears itself isn't worth an email), then is repeated at
+    #: most this often while it stays unresolved.
+    alert_email_grace_minutes: int = 15
+    alert_email_reminder_hours: int = 24
+    password_reset_ttl_minutes: int = 60
+    password_reset_cooldown_seconds: int = 60
+
+    # --- outbound mail -----------------------------------------------------------
+    #: Empty means "no SMTP configured": mail is logged instead of sent, so a
+    #: fresh checkout and the test suite both work with zero setup — the same
+    #: shape REDIS_URL above uses for "no broker".
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    #: From address on outbound mail. Only read once SMTP_HOST is set.
+    mail_from: str = "no-reply@biobridge.app"
+
+    # --- billing (Stripe) --------------------------------------------------------
+    #: Empty means "no online billing": plans are assigned and renewal dates
+    #: set by staff, exactly as before — the same shape SMTP_HOST and
+    #: REDIS_URL use. Test-mode keys (sk_test_…) for development.
+    stripe_secret_key: str = ""
+    #: The signing secret of the webhook endpoint (whsec_…), from the Stripe
+    #: dashboard or `stripe listen`. Without it every webhook is refused.
+    stripe_webhook_secret: str = ""
+    stripe_api_base: str = "https://api.stripe.com"
+
+    # --- OdooBridger platform mode -------------------------------------------
+    #: Off: BioBridge runs on its own — its own signup, login, plans and
+    #: Stripe billing. On: it is the "biometric" service of an OdooBridger
+    #: core, which owns accounts, sign-in (SSO), packages and billing. The two
+    #: modes share everything else; only who decides who may use it changes.
+    platform_mode: bool = False
+    #: The core as browsers reach it, e.g. https://app.odoobridger.com
+    platform_core_url: str = ""
+    #: The core as this server reaches it (token exchange, public key). Empty
+    #: = PLATFORM_CORE_URL. Inside Docker usually http://core:8000.
+    platform_core_internal_url: str = ""
+    #: This service's slug in the core's catalog (the token audience).
+    platform_service_slug: str = "biometric"
+    #: The client secret the core issued for this service (Staff console →
+    #: Services → Rotate secret, or BIOMETRIC_CLIENT_SECRET on the core).
+    platform_client_secret: str = ""
+    #: The core's public key (PEM). Empty: fetched from the core and cached.
+    platform_public_key_pem: str = ""
+
+    @property
+    def platform_core_api(self) -> str:
+        return (self.platform_core_internal_url or self.platform_core_url).rstrip("/")
+
+    @property
+    def billing_enabled(self) -> bool:
+        return bool(self.stripe_secret_key)
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.lower() == "production"
+
+    @property
+    def scheduler_runs_in_process(self) -> bool:
+        """Should this API process run the scheduling loop?
+
+        Resolving "auto" in one place keeps the decision out of the loop, the
+        health endpoint and the UI, which would otherwise each have their own
+        opinion about whether a broker means Celery is really running.
+        """
+        mode = self.scheduler_mode.strip().lower()
+        if mode == "off":
+            return False
+        if mode == "inprocess":
+            return True
+        if mode == "celery":
+            return False
+        return not self.redis_url  # auto
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

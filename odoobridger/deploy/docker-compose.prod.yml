@@ -1,0 +1,35 @@
+# Production: HTTPS for the website, the core and each service, via Caddy.
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
+#
+# deploy/.env needs SITE_DOMAIN, CORE_DOMAIN, BIOMETRIC_DOMAIN and ACME_EMAIL
+# (DNS for all three pointing at this server, ports 80/443 open), plus
+# ENVIRONMENT=production, CORE_PUBLIC_URL=https://$CORE_DOMAIN,
+# SITE_URL=https://$SITE_DOMAIN and BIOMETRIC_PUBLIC_URL=https://$BIOMETRIC_DOMAIN.
+services:
+  core:
+    ports: !reset []
+    expose: ["8000"]
+  biobridge:
+    ports: !reset []
+    expose: ["8000"]
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      core: {condition: service_healthy}
+      biobridge: {condition: service_healthy}
+    ports: ["80:80", "443:443", "443:443/udp", "${ADMS_PORT:-8081}:${ADMS_PORT:-8081}"]
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:?set SITE_DOMAIN}
+      CORE_DOMAIN: ${CORE_DOMAIN:?set CORE_DOMAIN}
+      BIOMETRIC_DOMAIN: ${BIOMETRIC_DOMAIN:?set BIOMETRIC_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      ADMS_PORT: ${ADMS_PORT:-8081}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:

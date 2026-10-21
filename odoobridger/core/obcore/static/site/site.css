@@ -1,0 +1,90 @@
+/* The OdooBridger marketing site. Tokens and controls come from app.css. */
+
+body.site { background: var(--ground); color: var(--ink); font-family: var(--sans); margin: 0; }
+.site a { color: var(--accent); }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+.site-nav { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--ground) 88%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--rule-soft); }
+.site-nav .wrap { display: flex; align-items: center; gap: 22px; height: 64px; }
+.site-nav .links { display: flex; gap: 20px; margin-left: 12px; }
+.site-nav .links a, .site-nav .signin { color: var(--muted); text-decoration: none; font-size: 14px; }
+.site-nav .links a:hover, .site-nav .signin:hover { color: var(--ink); }
+.site-nav .spacer { flex: 1; }
+.site .brand { display: flex; align-items: center; gap: 9px; text-decoration: none; color: var(--ink); }
+
+.btn-lg { display: inline-block; padding: 12px 22px; border-radius: var(--radius-sm); font-weight: 600; font-size: 15px;
+  text-decoration: none; border: 1px solid var(--rule); background: var(--panel); color: var(--ink); cursor: pointer; }
+.btn-lg.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn-sm { padding: 8px 14px; font-size: 13.5px; }
+
+.hero { padding: 88px 0 64px; text-align: center; }
+.hero h1 { font-size: clamp(32px, 5vw, 54px); line-height: 1.08; letter-spacing: -.03em; margin: 0 auto 18px; max-width: 840px; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero p.lead { font-size: 18px; color: var(--muted); max-width: 640px; margin: 0 auto 28px; line-height: 1.55; }
+.hero .ctas { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.hero .proof { margin-top: 26px; font-size: 13px; color: var(--faint); }
+
+section.block { padding: 64px 0; }
+section.block.alt { background: var(--panel); border-top: 1px solid var(--rule-soft); border-bottom: 1px solid var(--rule-soft); }
+.block h2 { font-size: 30px; letter-spacing: -.02em; margin: 0 0 8px; text-align: center; }
+.block p.sub { text-align: center; color: var(--muted); margin: 0 auto 36px; max-width: 620px; }
+
+.cards { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.site-card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); padding: 24px; }
+.alt .site-card { background: var(--ground); }
+.site-card h3 { margin: 0 0 6px; font-size: 18px; }
+.site-card p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14.5px; }
+.site-card .soon { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
+.site-card .num { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent); font-weight: 700; margin-bottom: 12px; }
+
+.toggle { display: flex; justify-content: center; margin-bottom: 26px; }
+.price-service { margin-bottom: 40px; }
+.price-service h3 { font-size: 20px; margin: 0 0 4px; }
+.price-service > p { color: var(--muted); margin: 0 0 18px; }
+.price-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.price-card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); padding: 24px; display: flex; flex-direction: column; position: relative; }
+.price-card.featured { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.price-card .tag { position: absolute; top: -11px; left: 20px; background: var(--accent); color: var(--accent-ink);
+  font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; }
+.price-card .name { font-weight: 650; font-size: 16px; }
+.price-card .amt { font-size: 34px; font-weight: 700; letter-spacing: -.02em; margin: 10px 0 2px; }
+.price-card .amt span { font-size: 14px; color: var(--muted); font-weight: 500; }
+.price-card .desc { color: var(--muted); font-size: 13.5px; min-height: 20px; margin-bottom: 14px; }
+.price-card ul { list-style: none; padding: 0; margin: 0 0 20px; font-size: 14px; }
+.price-card li { padding: 5px 0 5px 22px; position: relative; }
+.price-card li::before { content: "✓"; position: absolute; left: 0; color: var(--ok); font-weight: 700; }
+.price-card .btn-lg { margin-top: auto; text-align: center; }
+
+.form-card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); padding: 28px; max-width: 720px; margin: 0 auto; }
+.form-grid { display: grid; gap: 0 16px; grid-template-columns: 1fr 1fr; }
+.form-grid .full { grid-column: 1 / -1; }
+.checks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 18px; }
+.checks label { font-weight: 400; display: inline-flex; gap: 6px; align-items: center; margin: 0; }
+.hp { position: absolute; left: -9999px; }
+.done { text-align: center; padding: 30px 10px; }
+.done h3 { margin: 0 0 8px; font-size: 22px; }
+
+.pick-svc { border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 12px; }
+.pick-svc > label { display: flex; gap: 10px; align-items: center; font-size: 15px; margin: 0; }
+.pick-svc .pkg-grid { margin-top: 12px; }
+
+footer.site-foot { padding: 48px 0 36px; margin-top: 24px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--rule-soft); background: var(--panel); }
+.foot-grid { display: grid; grid-template-columns: 1.6fr repeat(3, 1fr); gap: 32px; }
+.foot-brand p { margin: 12px 0 0; max-width: 300px; line-height: 1.55; }
+.foot-brand .copy { color: var(--faint); font-size: 13px; }
+.foot-col { display: flex; flex-direction: column; gap: 9px; }
+.foot-col h4 { margin: 0 0 4px; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink); font-weight: 650; }
+.foot-col a { color: var(--muted); text-decoration: none; }
+.foot-col a:hover { color: var(--accent); }
+@media (max-width: 720px) { .foot-grid { grid-template-columns: 1fr 1fr; } .foot-brand { grid-column: 1 / -1; } }
+
+@media (max-width: 720px) {
+  .site-nav .links { display: none; }
+  .form-grid { grid-template-columns: 1fr; }
+  .hero { padding: 56px 0 40px; }
+}
+
+[hidden] { display: none !important; }
+.pkg { position: relative; }
