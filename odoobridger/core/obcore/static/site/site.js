@@ -2,6 +2,7 @@
 
 import { money } from '/assets/api.js';
 import { esc } from '/assets/ui.js';
+import { multiSelect } from '/site/multiselect.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -14,6 +15,8 @@ const COMING = [
 
 let catalog = { services: [] };
 let interval = 'month';
+let activeService = null;
+let contactServices = null;
 
 function paintServices() {
   const live = catalog.services.map((s) => `<div class="site-card"><h3>${esc(s.name)}</h3><p>${esc(s.tagline || s.description || '')}</p></div>`);
@@ -24,8 +27,15 @@ function paintServices() {
 
 function paintPricing() {
   const body = $('#pricingBody');
-  if (!catalog.services.length) { body.innerHTML = '<p class="sub">Pricing is on its way — <a href="#contact">ask us</a>.</p>'; return; }
-  body.innerHTML = catalog.services.map((s) => `
+  const services = catalog.services.filter((s) => s.packages.length);
+  if (!services.length) { body.innerHTML = '<p class="sub">Pricing is on its way — <a href="#contact">ask us</a>.</p>'; return; }
+  if (!services.some((s) => s.slug === activeService)) activeService = services[0].slug;
+  const s = services.find((x) => x.slug === activeService);
+  const tabs = services.length > 1
+    ? `<div class="toggle"><div class="seg svc-tabs" role="tablist" aria-label="Service">${services.map((x) =>
+        `<button type="button" role="tab" class="seg-btn${x.slug === activeService ? ' on' : ''}" data-svc-tab="${esc(x.slug)}">${esc(x.name)}</button>`).join('')}</div></div>`
+    : '';
+  body.innerHTML = `${tabs}
     <div class="price-service">
       <h3>${esc(s.name)}</h3><p>${esc(s.tagline || '')}</p>
       <div class="price-grid">${s.packages.map((p) => {
@@ -40,12 +50,14 @@ function paintPricing() {
           <a class="btn-lg${p.is_default ? ' primary' : ''}" href="${cents == null ? '#contact' : href}">${cents == null ? 'Contact Us' : 'Start Free Trial'}</a>
         </div>`;
       }).join('')}</div>
-    </div>`).join('');
+    </div>`;
+  $$('[data-svc-tab]', body).forEach((b) => b.addEventListener('click', () => { activeService = b.dataset.svcTab; paintPricing(); }));
 }
 
 function paintContactServices() {
   const all = [...catalog.services, ...COMING.filter((c) => !catalog.services.some((s) => s.slug === c.slug))];
-  $('#c_services').innerHTML = all.map((s) => `<label><input type="checkbox" value="${esc(s.slug)}"> ${esc(s.name)}</label>`).join('');
+  contactServices = multiSelect($('#c_services'), all.map((s) => ({ value: s.slug, label: s.name })),
+    { placeholder: 'Select one or more services' });
 }
 
 function wireContact() {
@@ -72,7 +84,7 @@ function wireContact() {
         body: JSON.stringify({
           topic, name: data.name, email: data.email, company: data.company, phone: data.phone || null,
           message: data.message || null, website: data.website || null,
-          services: $$('#c_services input:checked').map((c) => c.value),
+          services: contactServices ? contactServices.values() : [],
           preferred_date: topic === 'Demo' ? data.preferred_date || null : null,
           preferred_window: topic === 'Demo' ? data.preferred_window || null : null,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -93,7 +105,6 @@ $$('[data-interval]').forEach((b) => b.addEventListener('click', () => {
   $$('[data-interval]').forEach((x) => x.classList.toggle('on', x === b));
   paintPricing();
 }));
-$('#year').textContent = new Date().getFullYear();
 
 (async () => {
   try {

@@ -24,6 +24,7 @@ function limitLine(ent = {}) {
   const parts = [];
   if ('max_devices' in ent) parts.push(ent.max_devices == null ? 'Unlimited terminals' : `${ent.max_devices} terminals`);
   if ('max_employees' in ent) parts.push(ent.max_employees == null ? 'unlimited employees' : `${ent.max_employees} employees`);
+  if ('max_seats' in ent) parts.push(ent.max_seats == null ? 'Unlimited seats' : `${ent.max_seats} seats`);
   return parts.join(' · ');
 }
 

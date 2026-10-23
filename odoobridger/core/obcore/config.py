@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     biometric_client_secret: str = ""
     biometric_base_url: str = "http://localhost:8001"
     biometric_internal_url: str = ""
+    # --- the demo service (Team Desk), registered at boot when its secret is set
+    demo_client_secret: str = ""
+    demo_base_url: str = "http://localhost:8002"
+    demo_internal_url: str = ""
 
     http_timeout_seconds: int = 20
     registration_rate_per_hour: int = 10

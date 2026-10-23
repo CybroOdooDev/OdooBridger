@@ -431,6 +431,9 @@ def list_services(_: StaffUser = Depends(get_staff), db: Session = Depends(get_d
         row = service_out(s, staff=True)
         row["accounts"] = db.scalar(select(func.count(AccountService.id)).where(
             AccountService.service_id == s.id, AccountService.status != ServiceStatus.cancelled.value)) or 0
+        for pk in row["packages"]:
+            pk["accounts"] = db.scalar(select(func.count(AccountService.id)).where(
+                AccountService.package_id == pk["id"], AccountService.status != ServiceStatus.cancelled.value)) or 0
         out.append(row)
     return out
 

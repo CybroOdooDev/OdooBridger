@@ -185,3 +185,22 @@ def test_pages_are_served(client):
     for path in ("/", "/site/signup.html", "/site/terms.html", "/site/privacy.html", "/app/", "/staff/", "/assets/app.css", "/assets/shell.js",
                  "/app/app.js", "/staff/app.js", "/staff/leads.js", "/site/site.js"):
         assert client.get(path).status_code == 200, path
+
+
+def test_demo_service_is_registered_only_when_its_secret_is_set(client, monkeypatch):
+    from sqlalchemy import select
+
+    from obcore.config import settings
+    from obcore.db import SessionLocal
+    from obcore.models import Service
+    from obcore.services.catalog import ensure_demo
+
+    db = SessionLocal()
+    monkeypatch.setattr(settings, "demo_client_secret", "")
+    assert ensure_demo(db) is None
+    monkeypatch.setattr(settings, "demo_client_secret", "s3cret")
+    svc = ensure_demo(db)
+    db.commit()
+    assert svc.slug == "demo" and svc.sso_callback_path == "/sso"
+    assert db.scalar(select(Service).where(Service.slug == "demo")).packages[0].entitlements == {"max_seats": 3}
+    db.close()

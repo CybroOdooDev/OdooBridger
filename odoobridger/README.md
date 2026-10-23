@@ -120,6 +120,13 @@ Services & Packages, and add Stripe price ids). Production:
 `SITE_DOMAIN`, `CORE_DOMAIN` and `BIOMETRIC_DOMAIN`, plus the plain-HTTP ADMS
 port for ZKTeco push terminals.
 
+**Demo service.** To see a customer with several services, run
+`python3 deploy/make-env.py --demo` (adds `DEMO_CLIENT_SECRET`) and start with
+`docker compose -f deploy/docker-compose.yml --profile demo up -d --build`.
+"Team Desk (Demo)" appears on the website, signup and portal beside Biometric
+Attendance, on http://localhost:8002. It is one file (`services/demo/app.py`)
+and also shows what a service must implement.
+
 Without `SMTP_HOST` emails are written to the core's log (handy locally: the
 set-password link is there).
 

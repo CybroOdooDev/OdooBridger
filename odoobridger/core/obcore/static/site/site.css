@@ -88,3 +88,46 @@ footer.site-foot { padding: 48px 0 36px; margin-top: 24px; color: var(--muted); 
 
 [hidden] { display: none !important; }
 .pkg { position: relative; }
+
+/* Multi-select dropdown (services) */
+.ms { position: relative; }
+.ms summary { list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer;
+  padding: 11px 14px; border: 1px solid var(--rule); border-radius: var(--radius-sm); background: var(--panel); font-size: 14px; }
+.ms summary::-webkit-details-marker { display: none; }
+.ms summary:hover { border-color: var(--muted); }
+.ms[open] summary { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ms summary svg { flex: none; color: var(--muted); transition: transform .15s; }
+.ms[open] summary svg { transform: rotate(180deg); }
+.ms-text.placeholder { color: var(--muted); }
+.ms-list { position: absolute; z-index: 5; left: 0; right: 0; margin-top: 6px; padding: 6px; background: var(--panel);
+  border: 1px solid var(--rule); border-radius: var(--radius-sm); box-shadow: var(--shadow); max-height: 280px; overflow: auto; }
+.ms-list label { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; border-radius: 8px; cursor: pointer; margin: 0; font-weight: 400; }
+.ms-list label:hover { background: var(--panel-2); }
+.ms-list label input { margin: 3px 0 0; flex: none; }
+.ms-list b { display: block; font-size: 14px; font-weight: 600; }
+.ms-list small { display: block; color: var(--muted); font-size: 12.5px; }
+.pick-svc { margin-top: 14px; padding: 14px 16px; border: 1px solid var(--rule); border-radius: var(--radius-sm); }
+.pick-head { margin-bottom: 10px; }
+.svc-tabs { flex-wrap: wrap; }
+
+/* Signup: the form beside the pricing of the chosen services */
+.signup-layout { display: grid; gap: 28px; align-items: start; grid-template-columns: minmax(0, 1fr); max-width: 760px; margin: 0 auto; }
+.signup-layout:has(.price-panel:not([hidden])) { max-width: none; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); }
+.signup-layout .form-card { max-width: none; margin: 0; }
+.price-panel { display: grid; gap: 22px; }
+.price-panel[hidden] { display: none; }
+.price-panel h3 { margin: 0 0 10px; font-size: 16px; }
+.price-grid.compact { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.price-panel .price-card { text-align: left; cursor: pointer; font: inherit; color: inherit; padding: 18px; }
+.price-panel .price-card .amt { font-size: 26px; }
+.price-panel .price-card ul { margin: 0; font-size: 13px; }
+.price-panel .price-card:hover { border-color: var(--accent); }
+.pick-field { margin-top: 14px; }
+@media (max-width: 900px) {
+  .signup-layout:has(.price-panel:not([hidden])) { grid-template-columns: minmax(0, 1fr); max-width: 760px; }
+}
+
+/* The form stays in view while the pricing beside it scrolls. */
+@media (min-width: 901px) {
+  .signup-layout:has(.price-panel:not([hidden])) .form-card { position: sticky; top: 84px; max-height: calc(100vh - 104px); overflow-y: auto; }
+}

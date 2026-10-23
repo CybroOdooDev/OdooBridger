@@ -2,7 +2,7 @@
 
 import '/assets/password-toggle.js';
 import { fmtDate, money } from '/assets/api.js';
-import { $, $$, banner, empty, esc, field, fmtAgo, guard, loading, readForm, stat, toast, wireTips } from '/assets/ui.js';
+import { $, $$, banner, empty, esc, field, fmtAgo, busy, guard, loading, readForm, stat, toast, wireTips } from '/assets/ui.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
 import { client } from './client.js';
 import { renderLeads } from './leads.js';
@@ -398,37 +398,109 @@ async function renderPayments(mount) {
 /* =========================================================================
  * Catalog: services and packages
  * ====================================================================== */
-function packageForm(p = {}) {
-  return `
-    <div class="grid cols-2">
-      ${field({ name: 'name', label: 'Name', value: p.name || '', required: true })}
-      ${field({ name: 'description', label: 'Description', value: p.description || '' })}
-      ${field({ name: 'monthly_price_cents', label: 'Monthly price (cents)', type: 'number', value: p.monthly_price_cents ?? '' })}
-      ${field({ name: 'yearly_price_cents', label: 'Yearly price (cents)', type: 'number', value: p.yearly_price_cents ?? '' })}
-      ${field({ name: 'stripe_price_id', label: 'Stripe monthly price id', value: p.stripe_price_id || '', placeholder: 'price_…' })}
-      ${field({ name: 'stripe_yearly_price_id', label: 'Stripe yearly price id', value: p.stripe_yearly_price_id || '', placeholder: 'price_…' })}
-      ${field({ name: 'trial_days', label: 'Trial days', type: 'number', value: p.trial_days ?? '' })}
-      ${field({ name: 'currency', label: 'Currency', value: p.currency || 'usd' })}
-    </div>
-    ${field({ name: 'entitlements', label: 'Entitlements (JSON, sent to the service)', type: 'textarea',
-      value: JSON.stringify(p.entitlements || {}, null, 1) })}
-    ${field({ name: 'features', label: 'Features on the pricing page (one per line)', type: 'textarea', value: (p.features || []).join('\n') })}
-    <label><input type="checkbox" name="is_default" ${p.is_default ? 'checked' : ''}> Recommended package</label>
-    <label><input type="checkbox" name="is_active" ${p.is_active !== false ? 'checked' : ''}> On sale</label>`;
-}
+/* What each service's entitlements mean, as labelled limit boxes. A service not
+ * listed here gets a JSON box instead. Empty = unlimited. */
+const LIMIT_FIELDS = {
+  biometric: [
+    { key: 'max_employees', label: 'Employees', help: 'Badges matched to an Odoo employee. Lowering it never unmaps anyone; only new matches wait.' },
+    { key: 'max_devices', label: 'Devices', help: 'Terminals the account has added. Punches from terminals beyond the limit are held until it covers them.' },
+    { key: 'min_sync_interval_minutes', label: 'Fastest sync (min)', help: 'The fastest interval a customer on this package can choose.' },
+  ],
+};
 
-function packageBody(form) {
-  const v = readForm(form);
-  let entitlements;
-  try { entitlements = JSON.parse(v.entitlements || '{}'); } catch { throw new Error('Entitlements must be valid JSON, e.g. {"max_devices": 5}'); }
-  return {
-    name: v.name, description: v.description || null, monthly_price_cents: v.monthly_price_cents,
-    yearly_price_cents: v.yearly_price_cents, stripe_price_id: v.stripe_price_id || null,
-    stripe_yearly_price_id: v.stripe_yearly_price_id || null, trial_days: v.trial_days,
-    currency: (v.currency || 'usd').toLowerCase(), entitlements,
-    features: (v.features || '').split('\n').map((x) => x.trim()).filter(Boolean),
-    is_default: v.is_default, is_active: v.is_active,
-  };
+const dollars = (cents) => (cents == null ? '' : cents / 100);
+const cents = (v) => (v == null || v === '' ? null : Math.round(Number(v) * 100));
+
+function openPackageDialog(service, pkg, onSaved) {
+  document.querySelector('dialog.plan-dialog')?.remove();
+  const dlg = document.createElement('dialog');
+  dlg.className = 'wizard config-dialog plan-dialog';
+  document.body.append(dlg);
+  const p = pkg || { is_active: true, is_default: false, entitlements: {} };
+  const limits = LIMIT_FIELDS[service.slug];
+  const close = () => { dlg.close(); dlg.remove(); };
+  const accounts = pkg?.accounts || 0;
+
+  dlg.innerHTML = `
+    <div class="wiz-head">
+      <strong>${pkg ? `Edit ${esc(pkg.name)}` : `New ${esc(service.name)} Package`}</strong>
+      <button type="button" class="link wiz-x" data-close aria-label="Close">&times;</button>
+    </div>
+    <div class="wiz-body">
+      <form id="pkgForm">
+        <div class="grid cols-2">
+          ${field({ name: 'name', label: 'Name', value: p.name || '', required: true, placeholder: 'Growth' })}
+          ${field({ name: 'price', label: 'Price per month (USD)', type: 'number', value: dollars(p.monthly_price_cents),
+            tip: true, help: 'What the pricing page shows. Empty shows "Custom". What a customer is charged is the Stripe price below, so keep the two in step.' })}
+        </div>
+        ${field({ name: 'yearly_price', label: 'Price per year (USD)', type: 'number', value: dollars(p.yearly_price_cents),
+          tip: true, help: 'Shown when a visitor switches to yearly. Empty means no yearly option.' })}
+        ${field({ name: 'description', label: 'Description', value: p.description || '', placeholder: 'Growing teams on several devices.' })}
+        ${field({ name: 'features', label: 'Features on the pricing page', type: 'textarea', value: (p.features || []).join('\n'),
+          tip: true, help: 'One per line. Empty lists the limits below.' })}
+        <h3 style="margin:6px 0 10px;font-size:13px">Limits <span class="hint">empty = unlimited</span></h3>
+        ${limits
+          ? `<div class="grid cols-3">${limits.map((l) => field({ name: `lim_${l.key}`, label: l.label, type: 'number',
+              value: p.entitlements?.[l.key] ?? '', tip: true, help: l.help })).join('')}</div>`
+          : field({ name: 'entitlements', label: 'Entitlements (JSON, sent to the service)', type: 'textarea',
+              value: JSON.stringify(p.entitlements || {}, null, 1) })}
+        <h3 style="margin:6px 0 10px;font-size:13px">Selling</h3>
+        <div class="grid cols-2">
+          ${field({ name: 'stripe_price_id', label: 'Stripe monthly price', value: p.stripe_price_id || '', placeholder: 'price_…',
+            tip: true, help: 'A recurring monthly Price. Empty means it cannot be bought online.' })}
+          ${field({ name: 'stripe_yearly_price_id', label: 'Stripe yearly price', value: p.stripe_yearly_price_id || '', placeholder: 'price_…',
+            tip: true, help: 'A recurring yearly Price. Empty means yearly payment cannot be bought online.' })}
+        </div>
+        <div class="grid cols-3">
+          ${field({ name: 'trial_days', label: 'Trial (days)', type: 'number', value: p.trial_days ?? '',
+            tip: true, help: 'Empty uses the platform default.' })}
+          ${field({ name: 'is_active', label: 'Status', value: String(p.is_active !== false), boolean: true, required: true,
+            options: [{ value: 'true', label: 'On Sale' }, { value: 'false', label: 'Retired: kept for accounts on it' }] })}
+          ${field({ name: 'is_default', label: 'Recommended', value: String(!!p.is_default), boolean: true, required: true,
+            options: [{ value: 'false', label: 'No' }, { value: 'true', label: 'Yes' }],
+            tip: true, help: 'Marked on the pricing page and chosen when a signup picks nothing.' })}
+        </div>
+        ${accounts ? `<div class="hint" style="margin-top:4px">${accounts} account${accounts === 1 ? ' is' : 's are'} on this package; changed limits reach them straight away.</div>` : ''}
+      </form>
+    </div>
+    <div class="wiz-foot">
+      <button type="button" class="link" data-close>Cancel</button>
+      <div class="actions"><button type="submit" form="pkgForm" class="primary save">${pkg ? 'Save Package' : 'Create Package'}</button></div>
+    </div>`;
+
+  $$('[data-close]', dlg).forEach((b) => b.addEventListener('click', close));
+  dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });
+  dlg.addEventListener('click', (e) => { if (e.target === dlg) close(); });
+
+  $('#pkgForm', dlg).addEventListener('submit', (event) => {
+    event.preventDefault();
+    const v = readForm(event.target);
+    let entitlements;
+    if (limits) {
+      entitlements = { ...(p.entitlements || {}) };
+      limits.forEach((l) => { const n = v[`lim_${l.key}`]; entitlements[l.key] = n === '' || n == null ? null : Number(n); });
+    } else {
+      try { entitlements = JSON.parse(v.entitlements || '{}'); } catch { toast('Entitlements must be valid JSON, e.g. {"max_devices": 5}', 'bad'); return; }
+    }
+    const body = {
+      name: v.name.trim(), description: (v.description || '').trim() || null,
+      monthly_price_cents: cents(v.price), yearly_price_cents: cents(v.yearly_price),
+      stripe_price_id: (v.stripe_price_id || '').trim() || null,
+      stripe_yearly_price_id: (v.stripe_yearly_price_id || '').trim() || null,
+      trial_days: v.trial_days === '' ? null : v.trial_days, currency: p.currency || 'usd', entitlements,
+      features: (v.features || '').split('\n').map((x) => x.trim()).filter(Boolean),
+      is_default: v.is_default, is_active: v.is_active,
+    };
+    busy($('.save', dlg), async () => {
+      const saved = await guard(() => (pkg ? api.patch(`/staff/packages/${pkg.id}`, body) : api.post(`/staff/services/${service.id}/packages`, body)));
+      if (!saved) return;
+      close();
+      toast(`${saved.name} ${pkg ? 'saved' : 'created'}`, 'ok');
+      onSaved();
+    });
+  });
+  dlg.showModal();
+  $('#name', dlg).focus();
 }
 
 function serviceForm(s = {}) {
@@ -496,16 +568,12 @@ async function renderCatalog(mount) {
       onSubmit: () => api.post(`/staff/services/${b.dataset.secret}/secret`) });
     if (ok) await showSecret(ok.client_secret, ok.message);
   }));
-  $$('[data-new-pkg]', mount).forEach((b) => b.addEventListener('click', async () => {
-    const r = await dialog({ title: 'New Package', wide: true, submitLabel: 'Create', body: packageForm(),
-      onSubmit: (form) => api.post(`/staff/services/${b.dataset.newPkg}/packages`, packageBody(form)) });
-    if (r) reload();
+  $$('[data-new-pkg]', mount).forEach((b) => b.addEventListener('click', () => {
+    openPackageDialog(svcs.find((x) => x.id === b.dataset.newPkg), null, reload);
   }));
-  $$('[data-edit-pkg]', mount).forEach((b) => b.addEventListener('click', async () => {
-    const p = svcs.flatMap((s) => s.packages).find((x) => x.id === b.dataset.editPkg);
-    const r = await dialog({ title: `Edit ${p.name}`, wide: true, body: packageForm(p),
-      onSubmit: (form) => api.patch(`/staff/packages/${p.id}`, packageBody(form)) });
-    if (r) reload();
+  $$('[data-edit-pkg]', mount).forEach((b) => b.addEventListener('click', () => {
+    const svc = svcs.find((x) => x.packages.some((q) => q.id === b.dataset.editPkg));
+    openPackageDialog(svc, svc.packages.find((q) => q.id === b.dataset.editPkg), reload);
   }));
 }
 

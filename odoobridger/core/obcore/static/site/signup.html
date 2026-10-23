@@ -15,13 +15,14 @@
     <a class="brand" href="/"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></a>
     <div class="links"><a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a><a href="/#contact">Contact</a></div>
     <span class="spacer"></span>
-    <a class="signin" href="/app/">Sign In</a>
+    <a class="signin" href="/app/" target="_blank" rel="noopener">Sign In</a>
     <a class="btn-lg primary btn-sm" href="/site/signup.html">Start Free Trial</a>
   </div></nav>
 
   <section class="block"><div class="wrap">
     <h2>Start Your Free Trial</h2>
     <p class="sub">No card needed. You'll get an email to confirm it's you and choose your password.</p>
+    <div class="signup-layout">
     <div class="form-card" id="card">
       <form id="form" novalidate>
         <div class="form-grid">
@@ -34,58 +35,94 @@
               <button type="button" class="seg-btn on" data-interval="month">Monthly</button>
               <button type="button" class="seg-btn" data-interval="year">Yearly</button>
             </div></div>
-          <div class="field full"><label>Services</label><div id="services"></div></div>
+          <div class="field full"><label>Services</label><div id="services"></div><div id="pickers"></div></div>
           <input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
         </div>
         <p class="err" id="err"></p>
         <button class="btn-lg primary" type="submit" id="go">Create My Account</button>
-        <p class="muted" style="margin-top:14px;font-size:13px">Already have an account? <a href="/app/">Sign in</a></p>
+        <p class="muted" style="margin-top:14px;font-size:13px">Already have an account? <a href="/app/" target="_blank" rel="noopener">Sign in</a></p>
       </form>
+    </div>
+    <aside class="price-panel" id="pricePanel" aria-label="Pricing for your services"></aside>
     </div>
   </div></section>
 
   <script type="module">
     import { money } from '/assets/api.js';
     import { esc } from '/assets/ui.js';
+    import { multiSelect } from '/site/multiselect.js';
     const $ = (s, r = document) => r.querySelector(s);
     const $$ = (s, r = document) => [...r.querySelectorAll(s)];
     const params = new URLSearchParams(window.location.search);
     let interval = params.get('billing') === 'year' ? 'year' : 'month';
     let catalog = { services: [] };
 
-    function paint() {
+    let menu = null;
+    let picks = {};
+
+    const priceOf = (p) => (interval === 'year' ? p.yearly_price_cents : p.monthly_price_cents);
+    const priceText = (p) => { const c = priceOf(p); return c == null ? 'Custom' : `${money(c, p.currency)}/${interval === 'year' ? 'yr' : 'mo'}`; };
+    const chosenServices = () => catalog.services.filter((s) => (menu ? menu.values() : []).includes(s.slug));
+    const pickedId = (s) => picks[s.slug] || (s.packages.find((p) => p.is_default) || s.packages[0] || {}).id;
+
+    function paintPickers() {
       $$('[data-interval]').forEach((b) => b.classList.toggle('on', b.dataset.interval === interval));
-      const chosen = new Set($$('[data-svc]:checked').map((c) => c.dataset.svc));
-      const picks = Object.fromEntries($$('input[type=radio]:checked').map((r) => [r.name.slice(4), r.value]));
-      if (!$('#services').dataset.painted) {
-        if (params.get('service')) chosen.add(params.get('service'));
-        else if (catalog.services.length === 1) chosen.add(catalog.services[0].slug);
-        if (params.get('package')) picks[params.get('service')] = params.get('package');
-      }
-      $('#services').innerHTML = catalog.services.map((s) => {
-        const pick = picks[s.slug] || (s.packages.find((p) => p.is_default) || s.packages[0] || {}).id;
-        return `<div class="pick-svc">
-          <label><input type="checkbox" data-svc="${esc(s.slug)}" ${chosen.has(s.slug) ? 'checked' : ''}> <strong>${esc(s.name)}</strong>
-            <span class="muted" style="font-size:13px">${esc(s.tagline || '')}</span></label>
-          <div class="pkg-grid" ${chosen.has(s.slug) ? '' : 'hidden'}>${s.packages.map((p) => {
-            const cents = interval === 'year' ? p.yearly_price_cents : p.monthly_price_cents;
-            return `<label class="pkg"><input type="radio" name="pkg_${esc(s.slug)}" value="${esc(p.id)}" ${p.id === pick ? 'checked' : ''}>
-              <b>${esc(p.name)}</b><div class="price">${cents == null ? 'Custom' : `${money(cents, p.currency)}<span class="muted" style="font-size:12px">/${interval === 'year' ? 'yr' : 'mo'}</span>`}</div>
-              ${(p.features || []).length ? `<ul>${p.features.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}</label>`;
-          }).join('')}</div></div>`;
-      }).join('') || '<p class="muted">No services are on sale yet.</p>';
-      $('#services').dataset.painted = '1';
-      $$('[data-svc]').forEach((c) => c.addEventListener('change', paint));
+      $$('#pickers select').forEach((sel) => { picks[sel.name.slice(4)] = sel.value; });
+      const chosen = chosenServices();
+      // Inside the form: one plan dropdown per chosen service.
+      $('#pickers').innerHTML = chosen.map((s) => `
+        <div class="field pick-field"><label for="pkg_${esc(s.slug)}">Plan for ${esc(s.name)}</label>
+          <select id="pkg_${esc(s.slug)}" name="pkg_${esc(s.slug)}">${s.packages.map((p) =>
+            `<option value="${esc(p.id)}"${p.id === pickedId(s) ? ' selected' : ''}>${esc(p.name)} — ${esc(priceText(p))}</option>`).join('')}</select>
+        </div>`).join('');
+      $$('#pickers select').forEach((sel) => sel.addEventListener('change', () => { picks[sel.name.slice(4)] = sel.value; paintPricing(); }));
+      paintPricing();
     }
 
-    $$('[data-interval]').forEach((b) => b.addEventListener('click', () => { interval = b.dataset.interval; paint(); }));
+    // Outside the form: the pricing of the chosen services; a plan card selects that plan.
+    function paintPricing() {
+      const panel = $('#pricePanel');
+      const chosen = chosenServices();
+      panel.hidden = !chosen.length;
+      panel.innerHTML = chosen.map((s) => `
+        <div class="price-service">
+          <h3>${esc(s.name)}</h3>
+          <div class="price-grid compact">${s.packages.map((p) => `
+            <button type="button" class="price-card${p.id === pickedId(s) ? ' featured' : ''}" data-svc="${esc(s.slug)}" data-pkg="${esc(p.id)}" aria-pressed="${p.id === pickedId(s)}">
+              ${p.id === pickedId(s) ? '<span class="tag">Selected</span>' : ''}
+              <span class="name">${esc(p.name)}</span>
+              <span class="amt">${priceOf(p) == null ? 'Custom' : `${money(priceOf(p), p.currency)}<span>/${interval === 'year' ? 'year' : 'month'}</span>`}</span>
+              <span class="desc">${esc(p.description || '')}</span>
+              <ul>${(p.features || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
+            </button>`).join('')}</div>
+        </div>`).join('');
+      $$('[data-pkg]', panel).forEach((card) => card.addEventListener('click', () => {
+        picks[card.dataset.svc] = card.dataset.pkg;
+        const sel = $(`#pkg_${card.dataset.svc}`);
+        if (sel) sel.value = card.dataset.pkg;
+        paintPricing();
+      }));
+    }
+
+    function build() {
+      const initial = params.get('service') ? [params.get('service')]
+        : catalog.services.length === 1 ? [catalog.services[0].slug] : [];
+      if (params.get('package') && params.get('service')) picks[params.get('service')] = params.get('package');
+      if (!catalog.services.length) { $('#services').innerHTML = '<p class="muted">No services are on sale yet.</p>'; return; }
+      menu = multiSelect($('#services'), catalog.services.map((s) => ({ value: s.slug, label: s.name, hint: s.tagline })),
+        { placeholder: 'Select one or more services', selected: initial.filter((slug) => catalog.services.some((s) => s.slug === slug)),
+          onChange: paintPickers });
+      paintPickers();
+    }
+
+    $$('[data-interval]').forEach((b) => b.addEventListener('click', () => { interval = b.dataset.interval; paintPickers(); }));
     $('#form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const data = Object.fromEntries(new FormData(e.target));
       const err = $('#err');
       err.textContent = '';
-      const services = $$('[data-svc]:checked').map((c) => ({
-        service: c.dataset.svc, package_id: ($(`input[name="pkg_${c.dataset.svc}"]:checked`) || {}).value || null,
+      const services = (menu ? menu.values() : []).map((slug) => ({
+        service: slug, package_id: ($(`select[name="pkg_${slug}"]`) || {}).value || null,
       }));
       if (!data.company || !data.full_name || !data.email) { err.textContent = 'Please fill in your company, name and email.'; return; }
       if (!services.length) { err.textContent = 'Choose at least one service.'; return; }
@@ -114,7 +151,7 @@
 
     (async () => {
       try { catalog = await (await fetch('/api/v1/public/catalog')).json(); } catch { /* shown empty */ }
-      paint();
+      build();
     })();
   </script>
   <footer class="site-foot"><div class="wrap">
@@ -127,7 +164,7 @@
       <nav class="foot-col" aria-label="Product"><h4>Product</h4>
         <a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a></nav>
       <nav class="foot-col" aria-label="Company"><h4>Company</h4>
-        <a href="/#contact">Contact Sales</a><a href="/#contact">Book A Demo</a><a href="/app/">Sign In</a></nav>
+        <a href="/#contact">Contact Sales</a><a href="/#contact">Book A Demo</a><a href="/app/" target="_blank" rel="noopener">Sign In</a></nav>
       <nav class="foot-col" aria-label="Legal"><h4>Legal</h4>
         <a href="/site/terms.html">Terms</a><a href="/site/privacy.html">Privacy</a></nav>
     </div>

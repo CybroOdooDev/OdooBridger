@@ -15,6 +15,7 @@ target, example = here / ".env", here / ".env.example"
 
 p = argparse.ArgumentParser()
 p.add_argument("--staff", help="staff email for the /staff consoles", default="staff@odoobridger.local")
+p.add_argument("--demo", action="store_true", help="also set DEMO_CLIENT_SECRET for the demo service")
 p.add_argument("--force", action="store_true", help="replace an existing .env")
 args = p.parse_args()
 
@@ -25,6 +26,8 @@ gen = lambda: secrets.token_urlsafe(48)
 values = {k: gen() for k in ("POSTGRES_PASSWORD", "CORE_JWT_SECRET", "CORE_MASTER_KEY",
                              "BIOBRIDGE_JWT_SECRET", "BIOBRIDGE_MASTER_KEY", "BIOMETRIC_CLIENT_SECRET")}
 values["POSTGRES_PASSWORD"] = secrets.token_hex(16)
+if args.demo:
+    values["DEMO_CLIENT_SECRET"] = gen()
 values["STAFF_EMAIL"] = args.staff
 values["STAFF_PASSWORD"] = secrets.token_urlsafe(12)
 
