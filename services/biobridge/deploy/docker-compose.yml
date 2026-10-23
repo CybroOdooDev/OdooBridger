@@ -1,0 +1,161 @@
+# BioBridge on Docker. Run from the project root:
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#       api + postgres, on http://localhost:8000. The API runs the schedule
+#       itself — this is the whole system on one machine.
+#
+#   ... -f deploy/docker-compose.prod.yml up -d --build
+#       the same, behind Caddy with automatic HTTPS on your domain, plus a
+#       plain-HTTP port for ZKTeco push terminals. See deploy/README-docker.md.
+#
+#   ... --profile celery up -d
+#       adds redis, a worker and beat. Beat and the API's own scheduler share
+#       one database lease, so only one of them dispatches at a time. Only
+#       when one box is not enough.
+#
+#   ... --profile import run --rm import-sqlite
+#       one-off: copy an existing biobridge.db into this Postgres.
+#
+# Configuration comes from the env file (default: the project's .env; set
+# BIOBRIDGE_ENV_FILE to use another). DATABASE_URL in it is ignored — the
+# stack always talks to its own Postgres. POSTGRES_PASSWORD must be set, in
+# the shell or in deploy/.env (compose reads that file for ${…} values).
+
+name: biobridge
+
+x-app: &app
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: biobridge:latest
+  env_file: [{path: "${BIOBRIDGE_ENV_FILE:-../.env}", required: true}]
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg://biobridge:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/biobridge
+  # Connections that point at this machine (a mock BioTime, a local Odoo)
+  # reach it as host.docker.internal — 127.0.0.1 inside a container is the
+  # container. The service on the host must listen on 0.0.0.0, not 127.0.0.1.
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  depends_on:
+    postgres:
+      condition: service_healthy
+  # Bring it back, always. An unsupervised scheduler is a scheduler that stops
+  # one night and is noticed at the end of the month.
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: {max-size: "20m", max-file: "5"}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: biobridge
+      POSTGRES_USER: biobridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      # Without this the API can start before Postgres accepts connections and
+      # die on its first query; compose then restarts it, which works but looks
+      # like a fault in the logs.
+      test: ["CMD-SHELL", "pg_isready -U biobridge -d biobridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    # Local use: the dashboard on :8000, and ZKTeco push terminals on the LAN
+    # pointed at this machine's IP and :8000. The production override replaces
+    # this with Caddy.
+    ports: ["${API_PORT:-8000}:8000"]
+    # The image's CMD: schema first (Alembic; a no-op when nothing is pending,
+    # locked so two starts take turns), then serve.
+
+  # --- one-off: copy an existing SQLite database in ---------------------------
+  import-sqlite:
+    <<: *app
+    profiles: [import]
+    restart: "no"
+    volumes:
+      - "${SQLITE_FILE:-../biobridge.db}:/import/biobridge.db:ro"
+    environment:
+      <<: *app-env
+      # The key the old install used, when this stack has a different one.
+      OLD_MASTER_ENCRYPTION_KEY: ${OLD_MASTER_ENCRYPTION_KEY:-}
+    command: ["python", "tools/sqlite_to_postgres.py", "--sqlite", "/import/biobridge.db",
+              "--rewrite-localhost"]
+
+  # --- development: a mock BioTime server (profile "mock") -------------------
+  # Reads the tenant's roster and enabled companies from this stack's Postgres
+  # (a mock on the host would still read the old biobridge.db). Published on
+  # the host too, so a connection to http://host.docker.internal:8100 — what
+  # the SQLite import turns http://127.0.0.1:8100 into — reaches it.
+  #   docker compose -f deploy/docker-compose.yml --profile mock up -d mock-biotime
+  # Another tenant on another port:
+  #   docker compose -f deploy/docker-compose.yml --profile mock run -d -p 8099:8099 \
+  #       mock-biotime --tenant other-slug --port 8099 --tz Asia/Dubai
+  mock-biotime:
+    <<: *app
+    profiles: [mock]
+    ports: ["${MOCK_PORT:-8100}:${MOCK_PORT:-8100}"]
+    volumes: ["../mock_data:/app/mock_data"]
+    # As your own user, so mock_data/ on the host stays yours (the image's
+    # own user, uid 10001, could not write there).
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    healthcheck: {disable: true}
+    entrypoint: ["python", "tools/mock_biotime.py", "--host", "0.0.0.0"]
+    command: ["--tenant", "${MOCK_TENANT:-cybrotech}", "--port", "${MOCK_PORT:-8100}",
+              "--tz", "${MOCK_TZ:-Asia/Kolkata}"]
+
+  # --- the celery profile: only started with --profile celery ---------------
+  redis:
+    image: redis:7-alpine
+    profiles: [celery]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    profiles: [celery]
+    environment:
+      <<: *app-env
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # The API runs the migrations; wait for it so a first deploy never has a
+      # worker query columns that are not there yet.
+      api:
+        condition: service_healthy
+    command: ["celery", "-A", "app.workers.celery_app", "worker",
+              "-Q", "sync,maintenance", "--concurrency", "4", "-l", "info"]
+
+  beat:
+    <<: *app
+    profiles: [celery]
+    environment:
+      <<: *app-env
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # One beat. A second would find the scheduler lease held and dispatch
+    # nothing, but run one.
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "-l", "info"]
+
+volumes:
+  pgdata:
+  redisdata:

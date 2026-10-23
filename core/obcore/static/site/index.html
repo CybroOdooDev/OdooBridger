@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OdooBridger — Connect Odoo To Everything Else</title>
+  <meta name="description" content="OdooBridger connects Odoo to biometric terminals, marketplaces, shipping and more. One account, one login, one invoice.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='1' width='14' height='14' rx='3.5' fill='%234f46e5'/><path d='M4.5 8h7M8 4.5v7' stroke='%23ffffff' stroke-width='1.6' stroke-linecap='round'/></svg>">
+  <script src="/assets/theme.js"></script>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/core.css">
+  <link rel="stylesheet" href="/site/site.css">
+</head>
+<body class="site">
+  <nav class="site-nav"><div class="wrap">
+    <a class="brand" href="/"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></a>
+    <div class="links"><a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a><a href="/site/contact.html">Contact</a></div>
+    <span class="spacer"></span>
+    <a class="signin" href="/app/" target="_blank" rel="noopener">Sign In</a>
+    <a class="btn-lg primary btn-sm" href="/site/signup.html">Start Free Trial</a>
+  </div></nav>
+
+  <header class="hero"><div class="wrap">
+    <h1>Connect <em>Odoo</em> to everything your business runs on</h1>
+    <p class="lead">OdooBridger is a family of managed integrations for Odoo — biometric attendance first, with marketplaces and shipping next. One account, one login and one invoice for all of them.</p>
+    <div class="ctas">
+      <a class="btn-lg primary" href="/site/signup.html">Start Free Trial</a>
+      <a class="btn-lg" href="/site/contact.html?topic=demo">Book A Demo</a>
+    </div>
+    <p class="proof">No card needed for the trial · Works with Odoo Online, Odoo.sh and self-hosted</p>
+  </div></header>
+
+  <section class="block alt" id="services"><div class="wrap">
+    <h2>Services</h2>
+    <p class="sub">Each service runs on its own, managed by us. Add the ones you need; they share your account and your bill.</p>
+    <div class="cards" id="serviceCards"></div>
+  </div></section>
+
+  <section class="block" id="how"><div class="wrap">
+    <h2>How It Works</h2>
+    <p class="sub">Set up once. After that, it just runs.</p>
+    <div class="cards">
+      <div class="site-card"><div class="num">1</div><h3>Create your account</h3><p>Pick the services you want and start a free trial. You confirm your email and choose your own password.</p></div>
+      <div class="site-card"><div class="num">2</div><h3>Connect Odoo and your systems</h3><p>Open a service from your portal — you're signed in already. Connect your Odoo database and the system on the other side.</p></div>
+      <div class="site-card"><div class="num">3</div><h3>One invoice for everything</h3><p>When you're ready, add payment details once. Every service is on one subscription, monthly or yearly.</p></div>
+    </div>
+  </div></section>
+
+  <section class="block alt" id="pricing"><div class="wrap">
+    <h2>Pricing</h2>
+    <p class="sub">Per service, per month. Save with yearly billing.</p>
+    <div class="toggle"><div class="seg" role="group" aria-label="Billing">
+      <button type="button" class="seg-btn on" data-interval="month">Monthly</button>
+      <button type="button" class="seg-btn" data-interval="year">Yearly</button>
+    </div></div>
+    <div id="pricingBody"><p class="sub">Loading…</p></div>
+  </div></section>
+
+  <section class="block" id="contact"><div class="wrap">
+    <h2>Talk To Us</h2>
+    <p class="sub">Book a demo or ask a question. We reply within one working day.</p>
+    <div class="ctas" style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+      <a class="btn-lg primary" href="/site/contact.html">Contact Us</a>
+    </div>
+  </div></section>
+
+  <footer class="site-foot"><div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="/"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></a>
+        <p>Integrations for Odoo, on one account and one invoice.</p>
+        <p class="copy">© <span class="js-year"></span> OdooBridger</p>
+      </div>
+      <nav class="foot-col" aria-label="Product"><h4>Product</h4>
+        <a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a></nav>
+      <nav class="foot-col" aria-label="Company"><h4>Company</h4>
+        <a href="/site/contact.html">Contact Sales</a><a href="/site/contact.html?topic=demo">Book A Demo</a><a href="/app/" target="_blank" rel="noopener">Sign In</a></nav>
+      <nav class="foot-col" aria-label="Legal"><h4>Legal</h4>
+        <a href="/site/terms.html">Terms</a><a href="/site/privacy.html">Privacy</a></nav>
+    </div>
+  </div></footer>
+  <script>document.querySelectorAll('.js-year').forEach(function (e) { e.textContent = new Date().getFullYear(); });</script>
+
+  <script type="module" src="/site/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Start Your Free Trial — OdooBridger</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='1' width='14' height='14' rx='3.5' fill='%234f46e5'/><path d='M4.5 8h7M8 4.5v7' stroke='%23ffffff' stroke-width='1.6' stroke-linecap='round'/></svg>">
+  <script src="/assets/theme.js"></script>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/core.css">
+  <link rel="stylesheet" href="/site/site.css">
+</head>
+<body class="site">
+  <nav class="site-nav"><div class="wrap">
+    <a class="brand" href="/"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></a>
+    <div class="links"><a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a><a href="/site/contact.html">Contact</a></div>
+    <span class="spacer"></span>
+    <a class="signin" href="/app/" target="_blank" rel="noopener">Sign In</a>
+    <a class="btn-lg primary btn-sm" href="/site/signup.html">Start Free Trial</a>
+  </div></nav>
+
+  <section class="signup-hero"><div class="wrap signup-grid">
+    <div class="signup-copy">
+      <p class="eyebrow">Get Started</p>
+      <h1>Your Odoo Integrations, Set Up In Minutes</h1>
+      <p class="lead">Create one account, pick the services you need, and start your trial. No card needed.</p>
+      <ul class="checklist">
+        <li><b>Every feature included:</b> try each service in full before you pay.</li>
+        <li><b>One account, one invoice:</b> add or remove services whenever you like.</li>
+        <li><b>Your own password:</b> we email a link to confirm your address, then you choose it.</li>
+      </ul>
+    </div>
+
+    <div class="form-card signup-form" id="card">
+      <form id="form" novalidate>
+        <div class="tabs2" role="group" aria-label="How to start">
+          <button type="button" data-mode="trial">Free Trial</button>
+          <button type="button" data-mode="buy">Buy Now</button>
+        </div>
+        <div class="field"><label>Services</label><div id="services"></div></div>
+        <div id="pickers"></div>
+        <div class="field"><label id="billingLabel">Billing</label>
+          <div class="bill-pill" role="group" aria-labelledby="billingLabel">
+            <button type="button" data-interval="month">Monthly</button>
+            <button type="button" data-interval="year">Yearly<span class="save" id="saveBadge" hidden></span></button>
+          </div>
+          <input type="hidden" id="interval" name="interval" value="month"></div>
+        <div class="form-grid">
+          <div class="field"><label for="company">Company name</label><input id="company" name="company" required></div>
+          <div class="field"><label for="full_name">Your name</label><input id="full_name" name="full_name" required></div>
+        </div>
+        <div class="field"><label for="email">Company email</label><input id="email" name="email" type="email" placeholder="you@yourcompany.com" required>
+          <div class="help">The confirmation link is sent here, so use an inbox you can reach.</div></div>
+        <div class="field"><label for="timezone">Timezone</label><select id="timezone" name="timezone"></select></div>
+        <input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
+        <p class="err" id="err"></p>
+        <button class="btn-lg primary" type="submit" id="go">Start Free Trial</button>
+        <p class="muted" style="margin-top:14px;font-size:13px">Already registered? <a href="/app/" target="_blank" rel="noopener">Sign in</a>. By continuing you agree to the <a href="/site/terms.html">Terms</a> and <a href="/site/privacy.html">Privacy policy</a>.</p>
+      </form>
+    </div>
+
+    <aside class="price-panel" id="pricePanel" aria-label="Plans for your services" hidden></aside>
+  </div></section>
+
+  <script type="module">
+    import { money } from '/assets/api.js';
+    import { esc } from '/assets/ui.js';
+    import { multiSelect } from '/site/multiselect.js';
+    const $ = (s, r = document) => r.querySelector(s);
+    const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+    const params = new URLSearchParams(window.location.search);
+    let mode = params.get('mode') === 'buy' ? 'buy' : 'trial';
+    let interval = params.get('billing') === 'year' ? 'year' : 'month';
+    let catalog = { services: [] };
+
+    let menu = null;
+    let picks = {};
+
+    const priceOf = (p) => (interval === 'year' ? p.yearly_price_cents : p.monthly_price_cents);
+    const priceText = (p) => { const c = priceOf(p); return c == null ? 'Custom' : `${money(c, p.currency)}/${interval === 'year' ? 'yr' : 'mo'}`; };
+    const chosenServices = () => catalog.services.filter((s) => (menu ? menu.values() : []).includes(s.slug));
+    const pickedId = (s) => picks[s.slug] || (s.packages.find((p) => p.is_default) || s.packages[0] || {}).id;
+
+    function paintPickers() {
+      $$('#pickers select').forEach((sel) => { picks[sel.name.slice(4)] = sel.value; });
+      const chosen = chosenServices();
+      // Inside the form: one plan dropdown per chosen service.
+      $('#pickers').innerHTML = chosen.map((s) => `
+        <div class="field pick-field"><label for="pkg_${esc(s.slug)}">Plan for ${esc(s.name)}</label>
+          <select id="pkg_${esc(s.slug)}" name="pkg_${esc(s.slug)}">${s.packages.map((p) =>
+            `<option value="${esc(p.id)}"${p.id === pickedId(s) ? ' selected' : ''}>${esc(p.name)} — ${esc(priceText(p))}</option>`).join('')}</select>
+        </div>`).join('');
+      $$('#pickers select').forEach((sel) => sel.addEventListener('change', () => { picks[sel.name.slice(4)] = sel.value; paintPricing(); }));
+      paintPricing();
+    }
+
+    // Outside the form: the plan picked for each chosen service (change it with the select in the form).
+    function paintPricing() {
+      const panel = $('#pricePanel');
+      const chosen = chosenServices();
+      panel.hidden = !chosen.length;
+      panel.innerHTML = chosen.map((s) => {
+        const p = s.packages.find((x) => x.id === pickedId(s)) || s.packages[0];
+        if (!p) return '';
+        return `
+        <div class="plan-summary">
+          <p class="eyebrow">${mode === 'buy' ? 'Your Plan' : 'Your Trial Plan'} · ${esc(s.name)}</p>
+          <h3>${esc(p.name)}</h3>
+          <p class="plan-price">${priceOf(p) == null ? 'Custom' : `${money(priceOf(p), p.currency)}<span> / ${interval === 'year' ? 'year' : 'month'}${mode === 'buy' ? '' : ' after the trial'}</span>`}</p>
+          <ul>${(p.features || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
+        </div>`;
+      }).join('');
+    }
+
+    function build() {
+      const initial = params.get('service') ? [params.get('service')]
+        : catalog.services.length === 1 ? [catalog.services[0].slug] : [];
+      if (params.get('package') && params.get('service')) picks[params.get('service')] = params.get('package');
+      if (!catalog.services.length) { $('#services').innerHTML = '<p class="muted">No services are on sale yet.</p>'; return; }
+      menu = multiSelect($('#services'), catalog.services.map((s) => ({ value: s.slug, label: s.name, hint: s.tagline })),
+        { placeholder: 'Select one or more services', selected: initial.filter((slug) => catalog.services.some((s) => s.slug === slug)),
+          onChange: paintPickers });
+      paintPickers();
+    }
+
+    // "Save 17%" on Yearly: the best saving across the plans on sale.
+    function saveBadge() {
+      let best = 0;
+      catalog.services.forEach((svc) => svc.packages.forEach((p) => {
+        if (p.monthly_price_cents && p.yearly_price_cents) best = Math.max(best, Math.round(100 - p.yearly_price_cents / (p.monthly_price_cents * 12) * 100));
+      }));
+      const el = $('#saveBadge');
+      el.hidden = best <= 0;
+      el.textContent = `Save ${best}%`;
+    }
+    function showInterval() {
+      $('#interval').value = interval;
+      $$('[data-interval]').forEach((b) => { const on = b.dataset.interval === interval; b.classList.toggle('on', on); });
+      saveBadge();
+    }
+    $$('[data-interval]').forEach((b) => b.addEventListener('click', () => { interval = b.dataset.interval; showInterval(); paintPickers(); }));
+    showInterval();
+    function showMode() {
+      $$('[data-mode]').forEach((b) => b.classList.toggle('on', b.dataset.mode === mode));
+      $('#go').textContent = mode === 'buy' ? 'Continue To Payment' : 'Start Free Trial';
+      paintPricing();
+    }
+    $$('[data-mode]').forEach((b) => b.addEventListener('click', () => { mode = b.dataset.mode; showMode(); }));
+
+    // Timezones: the browser's own is the default.
+    (function () {
+      const own = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+      const zones = (Intl.supportedValuesOf ? Intl.supportedValuesOf('timeZone') : []);
+      if (!zones.includes(own)) zones.unshift(own);
+      $('#timezone').innerHTML = zones.map((z) => `<option value="${esc(z)}"${z === own ? ' selected' : ''}>${esc(z)}${z === own ? ' (default)' : ''}</option>`).join('');
+    })();
+    $('#form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(e.target));
+      const err = $('#err');
+      err.textContent = '';
+      const services = (menu ? menu.values() : []).map((slug) => ({
+        service: slug, package_id: ($(`select[name="pkg_${slug}"]`) || {}).value || null,
+      }));
+      if (!data.company || !data.full_name || !data.email) { err.textContent = 'Please fill in your company, name and email.'; return; }
+      if (!services.length) { err.textContent = 'Choose at least one service.'; return; }
+      $('#go').disabled = true;
+      try {
+        const response = await fetch('/api/v1/public/signup', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ company: data.company, full_name: data.full_name, email: data.email,
+            country: null, website: data.website || null, services, interval, mode,
+            timezone: data.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : 'Please check the form and try again.');
+        $('#card').innerHTML = `<div class="done"><h3>Check Your Email</h3><p>${esc(payload.message)}</p>
+          <p class="muted" style="font-size:13px">Nothing arrived? Check spam, or <a href="#" id="resend">send it again</a>.</p></div>`;
+        $('#resend').addEventListener('click', async (ev) => {
+          ev.preventDefault();
+          await fetch('/api/v1/public/resend', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: data.email }) });
+          ev.target.textContent = 'sent';
+        });
+      } catch (error) {
+        err.textContent = error.message;
+        $('#go').disabled = false;
+      }
+    });
+
+    (async () => {
+      try { catalog = await (await fetch('/api/v1/public/catalog')).json(); } catch { /* shown empty */ }
+      build();
+      saveBadge();
+      showMode();
+    })();
+  </script>
+  <footer class="site-foot"><div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="/"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></a>
+        <p>Integrations for Odoo, on one account and one invoice.</p>
+        <p class="copy">© <span class="js-year"></span> OdooBridger</p>
+      </div>
+      <nav class="foot-col" aria-label="Product"><h4>Product</h4>
+        <a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a></nav>
+      <nav class="foot-col" aria-label="Company"><h4>Company</h4>
+        <a href="/site/contact.html">Contact Sales</a><a href="/site/contact.html?topic=demo">Book A Demo</a><a href="/app/" target="_blank" rel="noopener">Sign In</a></nav>
+      <nav class="foot-col" aria-label="Legal"><h4>Legal</h4>
+        <a href="/site/terms.html">Terms</a><a href="/site/privacy.html">Privacy</a></nav>
+    </div>
+  </div></footer>
+  <script>document.querySelectorAll('.js-year').forEach(function (e) { e.textContent = new Date().getFullYear(); });</script>
+</body>
+</html>

@@ -1,0 +1,83 @@
+/* OdooBridger additions on top of the shared design system (app.css). */
+
+.wiz { background: var(--panel); color: var(--ink); }
+.wiz > header, .wiz-status { border-color: var(--rule-soft); }
+.wiz.narrow { width: min(560px, calc(100vw - 24px)); }
+.wiz form.wiz-body { display: block; }
+
+/* Services on the portal */
+.svc-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.svc-card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius); padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; box-shadow: var(--shadow); }
+.svc-card.add { border-style: dashed; box-shadow: none; background: transparent; }
+.svc-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.svc-name { font-size: 16px; font-weight: 650; }
+.svc-tag { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.svc-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; margin: 0; }
+.svc-facts dt { color: var(--muted); }
+.svc-facts dd { margin: 0; }
+.svc-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
+a.btn.primary-link, a.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+
+/* Package picker */
+.pkg-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+.pkg { border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: 12px 14px; cursor: pointer; display: block; font-weight: 400; margin: 0; }
+.pkg:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
+.pkg input { position: absolute; opacity: 0; pointer-events: none; }
+.pkg b { display: block; font-size: 14px; }
+.pkg .price { font-size: 18px; font-weight: 650; margin: 4px 0; }
+.pkg ul { margin: 6px 0 0; padding-left: 16px; font-size: 12px; color: var(--muted); }
+
+/* Key/value rows and small tables */
+.kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; font-size: 13.5px; margin: 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.table-wrap { overflow-x: auto; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--panel-2); }
+.secret-box { font-family: var(--mono); font-size: 12.5px; padding: 10px 12px; background: var(--panel-2); border-radius: var(--radius-sm); overflow-wrap: anywhere; user-select: all; }
+.section-title { font-size: 13px; font-weight: 600; margin: 22px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.stack > * + * { margin-top: 14px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.right { text-align: right; }
+.nowrap { white-space: nowrap; }
+
+@media (max-width: 640px) {
+  .kv { grid-template-columns: 1fr; }
+  .kv dt { margin-top: 6px; }
+}
+
+.pkg { position: relative; }
+
+/* Segmented choices (interval, topic): the chosen one in the accent. */
+.seg-btn.on:not(.pending):not(.scheduled):not(.completed) { background: var(--accent); color: var(--accent-ink); }
+.seg { border-color: var(--rule); }
+/* Pills the shared sheet has no tone for. */
+.pill { background: var(--accent-soft); color: var(--accent); }
+.pill.trialing { background: var(--accent-soft); color: var(--accent); }
+.pill.pending { background: var(--warn-soft); color: var(--warn); }
+.pill.success { background: var(--ok-soft); color: var(--ok); }
+.pill.skipped { background: var(--panel-2); color: var(--muted); }
+/* Checkboxes and radios are never full-width. */
+input[type=checkbox], input[type=radio] { width: auto; margin: 0 6px 0 0; vertical-align: middle; }
+label:has(> input[type=checkbox]) { display: flex; align-items: center; font-weight: 400; margin: 6px 0; }
+.wiz-facts .pill { justify-self: start; }
+
+/* One compact row for search, filters and the primary action. */
+.filterbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.filterbar .fb-spacer { flex: 1; }
+.filterbar select, .filterbar input { width: auto; height: 34px; padding: 0 10px; font-size: 13px; }
+.filterbar select { padding-right: 28px; min-width: 120px; }
+.filterbar button { height: 34px; padding: 0 14px; }
+.fb-search { position: relative; display: block; margin: 0; width: 240px; max-width: 100%; }
+.fb-search svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+.fb-search input { width: 100%; padding-left: 31px; }
+@media (max-width: 640px) { .fb-search { width: 100%; } .filterbar .fb-spacer { display: none; } }
+
+/* Odoo page: a service's readiness checks */
+.checks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.check { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2, #f1f2f6); color: var(--muted); }
+.check.ok { background: var(--ok-soft); color: var(--ok); }
+.check.bad { background: var(--bad-soft); color: var(--bad); }
+
+pre.code { background: var(--panel-2, #f1f2f6); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; font-size: 12.5px; overflow-x: auto; white-space: pre; margin: 6px 0 0; }

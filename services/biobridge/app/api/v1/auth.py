@@ -1,0 +1,611 @@
+"""Signup, login, refresh, logout."""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session
+
+from app.api.deps import standalone_only, get_current_user
+from app.core.config import settings
+from app.core.security import (
+    SCOPE_STAFF,
+    SCOPE_TENANT,
+    access_ttl,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    hash_password,
+    hash_token,
+    refresh_ttl,
+    scope_of,
+    verify_password,
+)
+from app.db.session import get_db
+from app.models import SubscriptionPlan, Tenant, TenantStatus, User, UserRole, UserSession
+from app.schemas import (
+    ChangePasswordIn,
+    ForgotPasswordIn,
+    ResetPasswordIn,
+    LoginRequest,
+    MessageOut,
+    SignupRequest,
+    SubscriptionPlanOut,
+    TokenPair,
+    UserOut,
+    SignInCodeIn,
+    VerifyCheckOut,
+    VerifyEmailOut,
+    VerifyEmailRequest,
+)
+from app.services.email_check import UngenuineEmailError, assert_genuine_email
+from app.services.email_verification import (
+    issue_verification_token,
+    peek_token,
+    send_verification_email,
+    verify_token,
+)
+from app.services.onboarding import (
+    consume_signin_code,
+    issue_signin_code,
+    send_account_ready,
+)
+from app.services import password_reset
+from app.services.timeutils import ensure_aware, is_past
+
+log = logging.getLogger(__name__)
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+#: One message for every way a sign-in can fail on credentials, at either door.
+#: Anything more specific is an oracle — for which emails exist, or for which of
+#: them are staff.
+BAD_CREDENTIALS = "Incorrect email or password"
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48] or "tenant"
+
+
+def _unique_slug(db: Session, base: str) -> str:
+    slug, n = base, 1
+    while db.scalar(select(func.count(Tenant.id)).where(Tenant.slug == slug)):
+        n += 1
+        slug = f"{base}-{n}"
+    return slug
+
+
+def _client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def _issue(db: Session, user: User, request: Request, scope: str) -> TokenPair:
+    """Mint a token pair for one surface and record the revocable session.
+
+    ``scope`` is the caller's decision, not the user's attribute: it says which
+    door these credentials were presented at. Every field below follows from it,
+    including how long the session lives.
+    """
+    access = create_access_token(user.id, user.tenant_id, user.role, scope)
+    refresh = create_refresh_token(user.id, user.tenant_id, user.role, scope)
+    payload = decode_token(refresh, expected_kind="refresh")
+    now = datetime.now(timezone.utc)
+
+    db.add(
+        UserSession(
+            user_id=user.id,
+            tenant_id=user.tenant_id,
+            scope=scope,
+            token_hash=hash_token(payload["jti"]),
+            ip_address=_client_ip(request),
+            device_label=(request.headers.get("user-agent") or "")[:120] or None,
+            last_seen_at=now,
+            expires_at=now + refresh_ttl(scope),
+        )
+    )
+    return TokenPair(
+        access_token=access,
+        refresh_token=refresh,
+        expires_in=int(access_ttl(scope).total_seconds()),
+        scope=scope,
+    )
+
+
+@router.get("/plans", response_model=list[SubscriptionPlanOut], dependencies=[Depends(standalone_only)])
+def list_active_plans(db: Session = Depends(get_db)) -> list[SubscriptionPlan]:
+    """The tiers open to a self-service choice — signup's picker and the
+    customer's own Settings page both read this list.
+
+    Deliberately public: the signup screen calls it before anyone has a
+    token. Deliberately excludes retired plans (``is_active`` false) — unlike
+    the staff console's ``/admin/plans``, which still needs to show a retired
+    plan for the account already sitting on one. Nothing here is a reason to
+    hide pricing from a signed-out visitor.
+    """
+    return db.scalars(
+        select(SubscriptionPlan)
+        .where(SubscriptionPlan.is_active.is_(True))
+        .order_by(SubscriptionPlan.monthly_price_cents.is_(None), SubscriptionPlan.monthly_price_cents)
+    ).all()
+
+
+@router.post("/signup", response_model=TokenPair, status_code=status.HTTP_201_CREATED, dependencies=[Depends(standalone_only)])
+def signup(payload: SignupRequest, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+    try:
+        email = assert_genuine_email(payload.email).lower()
+    except UngenuineEmailError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    if db.scalar(select(func.count(User.id)).where(User.email == email)):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An account with that email already exists")
+
+    # The signup screen offers two things, not one: "start a free trial" —
+    # the plan picker (GET /auth/plans) is optional there, and an unset
+    # plan_id falls back to whichever plan is marked default, or to no plan
+    # at all if this deployment has never set one up (tools/seed_plans.py) —
+    # or "choose a plan now", which skips the trial outright. The second one
+    # requires an actual plan: "no trial, no chosen plan" is not a request
+    # this endpoint can act on.
+    if payload.skip_trial and not payload.plan_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Choose a plan to start without a trial."
+        )
+
+    chosen_plan = None
+    if payload.plan_id:
+        chosen_plan = db.scalars(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.id == payload.plan_id,
+                SubscriptionPlan.is_active.is_(True),
+            )
+        ).first()
+        if chosen_plan is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "No such plan")
+    if chosen_plan is None:
+        chosen_plan = db.scalars(
+            select(SubscriptionPlan).where(SubscriptionPlan.is_default.is_(True))
+        ).first()
+
+    # The platform-wide default interval can be faster than a plan's own
+    # floor allows — Starter's 60-minute floor against a 15-minute platform
+    # default, say. A signup has no interval field of its own to violate that
+    # on purpose, so it starts at whichever is slower rather than opening on
+    # a setting its own plan would reject if it were saved again unchanged.
+    sync_interval = settings.default_sync_interval_minutes
+    if chosen_plan and chosen_plan.min_sync_interval_minutes:
+        sync_interval = max(sync_interval, chosen_plan.min_sync_interval_minutes)
+
+    # "Choose a plan now" reads as having already paid for it — status opens
+    # active, not trialing, and the clock counts a billing cycle rather than
+    # a trial. There is no payment behind either number (see the module docs
+    # in app.core.config) — both are just how long this account's access is
+    # good for before something has to renew it.
+    if payload.skip_trial:
+        initial_status = TenantStatus.active.value
+        period_days = settings.billing_period_days
+    else:
+        initial_status = TenantStatus.trialing.value
+        period_days = settings.trial_days
+
+    tenant = Tenant(
+        name=payload.company_name,
+        slug=_unique_slug(db, _slugify(payload.company_name)),
+        status=initial_status,
+        timezone=payload.timezone,
+        sync_interval_minutes=sync_interval,
+        plan_id=chosen_plan.id if chosen_plan else None,
+        subscription_renews_at=datetime.now(timezone.utc) + timedelta(days=period_days),
+    )
+    db.add(tenant)
+    db.flush()
+
+    user = User(
+        tenant_id=tenant.id,
+        email=email,
+        full_name=payload.full_name,
+        hashed_password=hash_password(payload.password),
+        role=UserRole.owner.value,
+    )
+    db.add(user)
+    db.flush()
+
+    raw_verify_token = issue_verification_token(user)
+
+    # Signup creates a customer workspace, so it can only ever be the customer
+    # surface. Nothing here can make a staff session.
+    tokens = _issue(db, user, request, SCOPE_TENANT)
+    db.commit()
+
+    # A passing MX/A lookup already says the domain is real; this is the
+    # stronger proof that this particular person controls the inbox. Best
+    # effort deliberately — the account is already usable, and a down mail
+    # server must not turn a good signup into a failed one. Unsent means the
+    # person can ask again with POST /auth/resend-verification.
+    try:
+        send_verification_email(user, raw_verify_token)
+    except Exception as exc:  # noqa: BLE001 — signup must not fail because mail did
+        log.warning("Could not send verification email to %s: %s", user.email, exc)
+
+    return tokens
+
+
+def _verify_credentials(db: Session, payload: LoginRequest) -> User:
+    """Check an email and password, with the lockout accounting.
+
+    Shared by both doors deliberately. What the two do once the password is
+    known to be right differs; how they treat a wrong one must not, or the
+    console door becomes the weaker of the two to guess against.
+    """
+    user = db.scalars(select(User).where(User.email == payload.email.lower())).first()
+    now = datetime.now(timezone.utc)
+
+    locked_until = ensure_aware(user.locked_until) if user is not None else None
+    if locked_until and locked_until > now:
+        wait = int((locked_until - now).total_seconds() / 60) + 1
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"Too many failed attempts. Try again in {wait} minute(s).",
+        )
+
+    if user is None or not verify_password(payload.password, user.hashed_password):
+        # The same message either way: a different response for a missing
+        # account lets anyone enumerate which emails are registered.
+        if user is not None:
+            user.failed_login_count += 1
+            if user.failed_login_count >= settings.max_failed_logins:
+                user.locked_until = now + timedelta(minutes=settings.lockout_minutes)
+                user.failed_login_count = 0
+                log.warning("Locked account %s after repeated failures", user.email)
+            db.commit()
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, BAD_CREDENTIALS)
+
+    if not user.is_active:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account is disabled")
+
+    return user
+
+
+def _refuse_pending(db: Session, email: str) -> None:
+    """A website registration that has not confirmed its email has no
+    password yet — say what to do instead of "wrong password". Checked
+    before the password, so it reveals only what the registration page
+    already told this visitor."""
+    user = db.scalars(select(User).where(User.email == email.lower())).first()
+    if user is not None and user.credentials_pending:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Confirm your email first — open the link we emailed you to choose your password.",
+        )
+
+
+def _record_login(user: User) -> None:
+    user.failed_login_count = 0
+    user.locked_until = None
+    user.last_login_at = datetime.now(timezone.utc)
+
+
+@router.post("/login", response_model=TokenPair, dependencies=[Depends(standalone_only)])
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+    """The customer door. Issues a tenant-scoped session — to customers only.
+
+    Platform staff is a backend role, not a customer role: a staff account is
+    refused here, whatever it also owns, and is answered exactly as a wrong
+    password is. Saying "this is a staff account" would turn the customer form
+    into a lookup for which addresses hold the flag.
+    """
+    _refuse_pending(db, payload.email)
+    user = _verify_credentials(db, payload)
+
+    if user.is_platform_admin:
+        log.warning("Customer sign-in refused: %s is platform staff", user.email)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, BAD_CREDENTIALS)
+
+    if user.tenant_id is None:
+        # No workspace and not staff: nothing for a customer session to show.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, BAD_CREDENTIALS)
+
+    _record_login(user)
+    tokens = _issue(db, user, request, SCOPE_TENANT)
+    db.commit()
+    return tokens
+
+
+@router.post("/staff/login", response_model=TokenPair)
+def staff_login(
+    payload: LoginRequest, request: Request, db: Session = Depends(get_db)
+) -> TokenPair:
+    """The console door. Issues a short-lived staff-scoped session.
+
+    Separate from ``/login`` so that a console credential is never entered into
+    the customer-facing form and vice versa: the two surfaces no longer share a
+    sign-in page to phish, and a staff session gets its own much shorter life.
+    """
+    user = _verify_credentials(db, payload)
+
+    if not user.is_platform_admin:
+        # Right password, wrong door — answered exactly as a wrong password is.
+        # "You are not staff" would turn this endpoint into a lookup for which
+        # accounts hold the flag, and those are precisely the credentials worth
+        # phishing. The refusal is logged instead, where we can see it and an
+        # attacker cannot.
+        log.warning("Console sign-in refused: %s is not platform staff", user.email)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, BAD_CREDENTIALS)
+
+    _record_login(user)
+    tokens = _issue(db, user, request, SCOPE_STAFF)
+    db.commit()
+    return tokens
+
+
+@router.post("/refresh", response_model=TokenPair)
+def refresh(refresh_token: str, db: Session = Depends(get_db)) -> TokenPair:
+    try:
+        payload = decode_token(refresh_token, expected_kind="refresh")
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+    session = db.scalars(
+        select(UserSession).where(UserSession.token_hash == hash_token(payload["jti"]))
+    ).first()
+    if session is None or not session.is_active or is_past(session.expires_at):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expired or revoked")
+
+    user = db.get(User, session.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found or disabled")
+
+    # The scope comes from the signed token, not from the user: a refresh
+    # returns to the same surface the session was opened on, so a customer
+    # session can never be renewed into a console one.
+    scope = scope_of(payload)
+
+    if scope != SCOPE_STAFF and user.is_platform_admin:
+        # Staff is console-only. A customer session that predates the flag (or
+        # one opened before this rule) must not keep renewing itself.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "Platform staff sign in at the staff console"
+        )
+
+    if scope == SCOPE_STAFF and not user.is_platform_admin:
+        # The flag was taken away while the session was open. Every console
+        # route would refuse this token anyway, but ending the session here
+        # means revoking staff access actually ends it rather than leaving a
+        # console session alive until its refresh token runs out.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "This account no longer has console access"
+        )
+
+    session.last_seen_at = datetime.now(timezone.utc)
+    db.commit()
+    return TokenPair(
+        access_token=create_access_token(user.id, user.tenant_id, user.role, scope),
+        refresh_token=refresh_token,
+        expires_in=int(access_ttl(scope).total_seconds()),
+        scope=scope,
+    )
+
+
+@router.post("/logout", response_model=MessageOut)
+def logout(refresh_token: str = "", db: Session = Depends(get_db)) -> MessageOut:
+    if refresh_token:
+        try:
+            payload = decode_token(refresh_token, expected_kind="refresh")
+        except ValueError:
+            return MessageOut(message="Signed out")
+        db.execute(
+            update(UserSession)
+            .where(
+                UserSession.token_hash == hash_token(payload["jti"]),
+                UserSession.revoked_at.is_(None),
+            )
+            .values(revoked_at=datetime.now(timezone.utc), revoked_reason="logout")
+        )
+        db.commit()
+    return MessageOut(message="Signed out")
+
+
+@router.post("/verify-email/check", response_model=VerifyCheckOut, dependencies=[Depends(standalone_only)])
+def verify_email_check(payload: VerifyEmailRequest, db: Session = Depends(get_db)) -> VerifyCheckOut:
+    """Is this confirmation link still good, and does the page need to ask for
+    a password? Does not use the link up."""
+    user = peek_token(db, payload.token)
+    if user is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That link is invalid or has expired.")
+    return VerifyCheckOut(email=user.email, needs_password=bool(user.credentials_pending))
+
+
+@router.post("/verify-email", response_model=VerifyEmailOut, dependencies=[Depends(standalone_only)])
+def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)) -> VerifyEmailOut:
+    """The confirmation page lands here.
+
+    Unauthenticated on purpose — the token itself is the credential, and the
+    person clicking it may not have signed in on this device.
+
+    An account registered from the website has no password yet, so for it the
+    same step also sets one: the address is confirmed, the password stored,
+    and a one-time ``signin_code`` returned so the page's "Sign in" button
+    opens the dashboard directly.
+    """
+    candidate = peek_token(db, payload.token)
+    if candidate is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "That link is invalid or has expired."
+        )
+    if candidate.credentials_pending and not payload.password:
+        # Before the token is spent, so the person can simply try again.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose a password to finish setting up your account.")
+    user = verify_token(db, payload.token)
+    if user.credentials_pending:
+        user.hashed_password = hash_password(payload.password)
+        user.credentials_pending = False
+        user.must_change_password = False
+        code = issue_signin_code(user)
+        db.commit()
+        sent = send_account_ready(db, user)
+        return VerifyEmailOut(
+            message=("Email confirmed and password set. We've emailed a note confirming how to sign in."
+                     if sent else "Email confirmed and password set. You can sign in now."),
+            signin_code=code,
+        )
+    db.commit()
+    return VerifyEmailOut(message="Email confirmed.")
+
+
+@router.post("/signin-code", response_model=TokenPair, dependencies=[Depends(standalone_only)])
+def signin_with_code(payload: SignInCodeIn, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+    """Exchange the one-time code from the confirmation page for a customer
+    session. Single use, short-lived, and refused for staff or workspace-less
+    accounts exactly as the password door is."""
+    user = consume_signin_code(db, payload.code)
+    if user is None or user.is_platform_admin or user.tenant_id is None:
+        db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That sign-in link has expired — sign in with your email and password.")
+    _record_login(user)
+    tokens = _issue(db, user, request, SCOPE_TENANT)
+    db.commit()
+    return tokens
+
+
+@router.post("/change-password", response_model=MessageOut, dependencies=[Depends(standalone_only)])
+def change_password(
+    payload: ChangePasswordIn,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Set a new password — required after signing in with an emailed one.
+
+    Signs out every *other* session: whoever else may have seen the old
+    password (it was in an email) loses access with it.
+    """
+    first_time = bool(user.must_change_password)
+    if not (first_time and not payload.current_password):
+        if not payload.current_password or not verify_password(payload.current_password, user.hashed_password):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Your current password is not right.")
+    if verify_password(payload.new_password, user.hashed_password):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose a password different from the current one.")
+    user.hashed_password = hash_password(payload.new_password)
+    user.must_change_password = False
+    # The session in use is the newest one — the sign-in that just happened.
+    current = db.scalar(
+        select(UserSession.id).where(UserSession.user_id == user.id, UserSession.revoked_at.is_(None))
+        .order_by(UserSession.created_at.desc()).limit(1))
+    stmt = update(UserSession).where(UserSession.user_id == user.id, UserSession.revoked_at.is_(None))
+    if current:
+        stmt = stmt.where(UserSession.id != current)
+    db.execute(stmt.values(revoked_at=datetime.now(timezone.utc), revoked_reason="password_changed"))
+    db.commit()
+    return MessageOut(message="Password changed.")
+
+
+@router.post("/forgot-password", response_model=MessageOut, dependencies=[Depends(standalone_only)])
+def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)) -> MessageOut:
+    """Email a reset link. The answer is the same whether or not the address
+    has an account, so this can't be used to find out who is registered."""
+    issued = password_reset.request_reset(db, payload.email)
+    db.commit()
+    if issued is not None:
+        try:
+            password_reset.send_reset_email(db, *issued)
+        except Exception as exc:  # noqa: BLE001 — the reply must not depend on mail
+            log.warning("Could not send password reset to %s: %s", payload.email, exc)
+            # Nothing reached them, so don't make them wait out the cooldown.
+            issued[0].password_reset_sent_at = None
+            db.commit()
+    return MessageOut(message="If that address has a BioBridge account, we've emailed a link to reset the password.")
+
+
+@router.post("/reset-password", response_model=MessageOut, dependencies=[Depends(standalone_only)])
+def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)) -> MessageOut:
+    """The emailed link lands here. The token is the credential."""
+    user = password_reset.consume(db, payload.token, payload.new_password)
+    if user is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That link is invalid or has expired. Ask for a new one.")
+    db.commit()
+    try:
+        password_reset.send_changed_email(db, user)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not send password-changed notice to %s: %s", user.email, exc)
+    return MessageOut(message="Password changed. Sign in with your new password.")
+
+
+@router.post("/resend-verification", response_model=MessageOut, dependencies=[Depends(standalone_only)])
+def resend_verification(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> MessageOut:
+    """Always for the signed-in caller's own address.
+
+    Not a public "resend to this email" endpoint: that would let anyone spam
+    verification mail at an address they don't own, and would double as a way
+    to probe which addresses have an account at all.
+    """
+    if user.email_verified_at is not None:
+        return MessageOut(message="This email is already confirmed.")
+
+    raw_verify_token = issue_verification_token(user)
+    db.commit()
+    try:
+        send_verification_email(user, raw_verify_token)
+    except Exception as exc:  # noqa: BLE001 — see signup's identical guard
+        log.warning("Could not resend verification email to %s: %s", user.email, exc)
+    return MessageOut(message="Verification email sent.")
+
+
+@router.get("/me", response_model=UserOut)
+def me(user: User = Depends(get_current_user)) -> User:
+    """Who am I — regardless of whether I have a customer workspace.
+
+    Deliberately not tenant-scoped: platform staff have no tenant, and this is
+    the first call the dashboard makes after sign-in.
+    """
+    return user
+
+
+# ===========================================================================
+# OdooBridger platform mode
+# ===========================================================================
+@router.get("/mode")
+def auth_mode() -> dict:
+    """How the dashboard should sign people in: here, or through OdooBridger."""
+    if not settings.platform_mode:
+        return {"platform_mode": False}
+    core = settings.platform_core_url.rstrip("/")
+    return {
+        "platform_mode": True,
+        "service": settings.platform_service_slug,
+        "portal_url": f"{core}/app/",
+        # The dashboard adds redirect_uri and state.
+        "authorize_url": f"{core}/app/#/open/{settings.platform_service_slug}",
+        "billing_url": f"{core}/app/#/billing",
+        "account_url": f"{core}/app/#/services",
+    }
+
+
+class PlatformSsoIn(BaseModel):
+    code: str
+
+
+@router.post("/platform/sso", response_model=TokenPair)
+def platform_sso(payload: PlatformSsoIn, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+    """Finish an OdooBridger sign-in: trade the one-time code for the user's
+    identity, bring their account and user up to date, open a session."""
+    from app.services import platform_link
+
+    if not settings.platform_mode:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Platform mode is off on this BioBridge.")
+    try:
+        claims = platform_link.exchange_code(payload.code)
+        user = platform_link.sign_in(db, claims)
+    except platform_link.PlatformError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+    _record_login(user)
+    tokens = _issue(db, user, request, SCOPE_TENANT)
+    db.commit()
+    return tokens

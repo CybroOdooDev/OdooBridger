@@ -1,0 +1,1982 @@
+# BioBridge
+
+Multi-tenant middleware that pulls biometric punches from a customer's ZKTeco
+BioTime server and writes clean `hr.attendance` records into their Odoo.
+
+Traffic runs outward in both directions — BioBridge *polls* BioTime and *writes*
+to Odoo — so the customer installs no agent and no Odoo module. They expose a
+BioTime port and issue an Odoo API key.
+
+```
+ZKTeco devices → BioTime (customer LAN) ──REST──▶ BioBridge ──JSON-2 / XML-RPC──▶ Odoo
+```
+
+## Quick start
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # do this first — see the note below
+pip install -r requirements-dev.txt
+
+cp .env.example .env               # defaults are fine for local work
+uvicorn app.main:app --reload --reload-dir app   # dashboard on http://localhost:8000/
+```
+
+`--reload-dir app` matters, not just tidiness: without it, the reloader watches the
+whole project root, `.venv` included, and `.venv` holds every dependency's entire
+source tree — tens of thousands of files. That reliably blows past the OS's inotify
+watch limit on a fresh machine or container, and uvicorn fails before it ever binds
+the port. See the note below if you hit `OSError: OS file watch limit reached`
+anyway — the app's own code under `app/` is all `--reload` ever needs to watch.
+
+Open `http://localhost:8000/` and create an account — that is the dashboard.
+`/docs` is the same API as OpenAPI, for anyone integrating.
+
+Outside production the app creates its tables on startup, so a fresh checkout
+boots into a working system. Production does not: point `DATABASE_URL` at
+Postgres and run the schema step yourself, once.
+
+```bash
+python3 tools/init_db.py           # create the tables (--drop wipes first)
+```
+
+### Database migrations (Alembic)
+
+Schema changes are versioned with [Alembic](https://alembic.sqlalchemy.org).
+After pulling a new version — and as part of every deploy — run:
+
+```bash
+python3 tools/db_upgrade.py            # apply anything pending
+python3 tools/db_upgrade.py --check    # report only (exit 1 if behind)
+```
+
+It works from any starting point: an empty database is built, a versioned one is
+brought up to date, and a database made before Alembic was adopted (tables
+exist, no version table) is brought level and adopted the first time. The
+Docker image runs it before the API starts; on PostgreSQL it takes a database
+lock, so two containers starting together take turns.
+
+Making a schema change:
+
+```bash
+# 1. edit the model
+alembic revision --autogenerate -m "add widget size"
+# 2. READ the file it wrote in alembic/versions/ — autogenerate is a draft
+python3 tools/db_upgrade.py
+```
+
+A new NOT NULL column on a table that already has rows needs a `server_default`
+(or a data step in the revision). `tests/test_migrations.py` fails if the models
+and the migrations ever disagree, so a model change without a revision is caught
+before it ships.
+
+**Older note — `tools/migrate.py`.** Before Alembic, `create_all` was topped up
+by this additive tool. `db_upgrade.py` still uses it, once, to adopt a legacy
+database; there is no need to run it yourself any more. `create_all` only adds
+missing tables. It never alters an existing one, so a
+model that gains a **column** has that column simply absent — and the first query
+mentioning it fails with `no such column`, mid-request or mid-sync. The old
+tool, if you do run it:
+
+```bash
+python3 tools/migrate.py            # report what the database is missing
+python3 tools/migrate.py --apply    # add it
+```
+
+That handles additive changes — new tables, nullable columns, missing indexes —
+and one that is not additive: relaxing a `NOT NULL` the model has since made
+optional. PostgreSQL takes an `ALTER`; SQLite has no such statement, so the
+table is rebuilt (create, copy, drop, rename) inside a transaction, and the
+database file is copied first because that is the one step here that could lose
+a row. Renames, drops and retypes are still Alembic's job.
+
+**Skip it and login breaks.** `select(User)` names every column the model
+declares, so one missing column makes every login fail before the password is
+even checked. The app warns at boot, and a request that hits the gap answers
+**503** naming the fix rather than a bare 500 — because from a login form a 500
+reads as "wrong password" and sends you hunting in the wrong place.
+
+Activate the virtualenv before anything else. Ubuntu 24.04 and most current
+distributions ship `python3` with no `python` alias, and a system `pip install`
+is blocked by PEP 668; the venv gives you both a working `python` and somewhere
+to install. Without it you get `No module named pytest` while `uvicorn` appears
+to work, because it resolved from some other project on the system.
+
+Install `requirements-dev.txt`, not `requirements.txt` — the dev file pulls in
+the runtime dependencies *and* pytest. `requirements.txt` alone is the
+production set, with no test tooling, which is the point of the split.
+
+If port 8000 is taken (`[Errno 98] Address already in use`), find the holder
+with `ss -ltnp | grep :8000` and either stop it or run on another port:
+
+```bash
+uvicorn app.main:app --reload --reload-dir app --port 8001
+```
+
+If instead the traceback ends in `OSError: OS file watch limit reached` naming a
+path under `.venv` (Celery is a common one — it alone ships thousands of files),
+`--reload-dir app` above is the fix, not a bigger limit: it stops the reloader
+recursing into every installed dependency and watches only the code that
+actually changes. Raising the limit instead works too, and needs no code change:
+
+```bash
+sudo sysctl fs.inotify.max_user_watches=524288    # this boot only
+```
+
+But that is treating the symptom — the reloader is still doing thousands of
+times more work than watching `app/` alone does, on every machine this ever
+runs on.
+
+SQLite and no broker out of the box, so there is no database or queue to set up.
+The schedule runs inside this process, so syncs start happening on their own as
+soon as both sides are connected — see [Running on a
+schedule](#running-on-a-schedule). Triggered syncs run **inline** rather than
+queueing into a void, so a deployment with no Celery worker still works; it just
+does the sync inside the request.
+
+Try the whole loop with no hardware:
+
+```bash
+python3 tools/mock_biotime.py --tenant <slug>            # fake BioTime on :8099, live punches by default; log in as username <slug>
+python3 tools/mock_zk_terminal.py --tenant <slug> --company <id>   # fake standalone ZKTeco unit on :4370 (add it as zk://127.0.0.1:4370), live punches; control on :5370
+# optional, one-off history only:  python3 tools/generate_punches.py --tenant <slug>
+python3 tools/e2e_proof.py --odoo-url https://your.odoo.com \
+    --odoo-db yourdb --odoo-user you@example.com --odoo-key <api-key>
+```
+
+## Tests
+
+```bash
+source .venv/bin/activate     # or: .venv/bin/python -m pytest
+python -m pytest              # ~900 tests, no skips, about 7 minutes
+```
+
+The suite is offline and self-contained: `tests/conftest.py` refuses any
+connection or DNS lookup outside this machine (a test that tries gets an
+immediate "cannot reach" error, the same path a real outage takes), drops
+proxy settings, and gives each test process its own temporary database, so it
+never touches `./biobridge.db` and test files can run in parallel.
+
+If it reports **skips**, a dev dependency is missing. Without `pytest-asyncio`
+pytest skips every async test and still exits 0 — a green run with the entire
+scheduling loop untested. `tests/conftest.py` turns that into a hard failure
+naming the fix, because a missing dependency must not be able to hide a broken
+scheduler.
+
+Coverage is aimed at what actually breaks in the field: pairing across sync
+cycles, timezone conversion in four zones, ledger idempotency, cursor behaviour
+when a provider fails mid-fetch, tenant isolation through the real HTTP stack,
+that a tenant's derived key cannot decrypt another tenant's secrets, and the
+quiet scheduling failures — a schedule that never fires, one that fires twice
+from two replicas, one that drifts later every run. The staff console has its
+own file, and most of it tests what that console *cannot* reach.
+
+`tools/e2e_proof.py` goes further and drives the engine against a **live Odoo**
+with no stubs on either side.
+
+## Running on a schedule
+
+Nobody presses a button. `uvicorn app.main:app` runs the clock itself: the API
+process holds a loop that wakes every `SCHEDULER_TICK_SECONDS`, asks which
+accounts are past their own interval, and syncs them.
+
+That is the whole deployment. No crontab, no broker, no worker — one supervised
+service:
+
+```bash
+sudo cp deploy/biobridge.service /etc/systemd/system/
+sudo systemctl enable --now biobridge        # survives crashes and reboots
+```
+
+or on Docker: `docker compose -f deploy/docker-compose.yml up -d --build` (Postgres + the API),
+with `deploy/docker-compose.prod.yml` adding Caddy HTTPS and nightly backups for a server.
+`deploy/README-docker.md` covers both, and moving an existing `biobridge.db` across
+(`tools/sqlite_to_postgres.py`).
+
+**Is it actually running?** That is the question that matters, because a
+BioBridge whose API answers while its scheduler is dead looks perfectly healthy
+from the outside — attendance just stops appearing in Odoo, and nobody notices
+until payroll. So:
+
+```bash
+curl -fsS localhost:8000/health/scheduler   # 200 when live, 503 when stalled
+```
+
+Point an uptime monitor at that, not at `/health`. The dashboard reads the same
+signal and says *Next sync in 7 min* or *Automatic sync is not running* — derived
+from the scheduler's heartbeat, never from the configured interval.
+
+### Scaling it
+
+| Situation | What to run |
+| --- | --- |
+| One box | Just the API. `SCHEDULER_MODE=auto` |
+| Several API replicas | Still just the API — a database lease elects one dispatcher |
+| Syncs on their own machines | `REDIS_URL=…` plus a Celery worker and beat |
+
+Two API replicas do not mean two syncs. Every tick claims a lease — a single row,
+claimed by a conditional `UPDATE`, atomic on SQLite and Postgres alike — and only
+the holder dispatches. A process that is killed releases nothing and needs to:
+the lease expires and the next tick takes over. That is the entire failover
+story, with no election and no coordinator.
+
+Celery beat claims the same lease and calls the same `services.scheduling`
+functions, so the two paths cannot drift and the health signal reads identically
+under either.
+
+### The rules it follows
+
+- **Due-ness is measured from the last run's start, not its finish.** Otherwise a
+  four-minute cycle on a fifteen-minute interval drifts four minutes every run,
+  and by evening "every 15 minutes" means something else.
+- **A never-synced account is due immediately**, so connecting both sides and
+  waiting produces data rather than a fifteen-minute silence that reads as
+  broken.
+- **A slow cycle is never started on top of itself.** The tenant is skipped until
+  it finishes.
+- **Repeated failures widen the interval ×4.** A customer's BioTime box that has
+  been off for a week should not be polled every fifteen minutes forever. One
+  success restores the configured interval.
+- **Concurrency is bounded** (`SCHEDULER_CONCURRENCY`): fifty accounts must not
+  mean fifty simultaneous connections into fifty customer LANs.
+- **An account with nothing connected is skipped**, not dispatched into a failed
+  run that says "nothing is connected" seconds after signup.
+- **Stale open shifts are closed hourly.** One employee who forgets to badge out
+  otherwise holds a record that blocks every later check-in for that person.
+
+### Changing one customer's cadence, as staff
+
+Each account sets its own interval in Settings. Support can set it for any
+account from the **Platform → All accounts** console: a table of every customer
+with their interval, next sync, last result, and whether they have been backed
+off into the slow lane.
+
+From **Platform → All accounts**, staff can:
+
+| | |
+| --- | --- |
+| Scheduling | Interval, automatic sync on/off, clear the failure backoff |
+| Account | Company name, status, display timezone |
+| Pairing | Mode, dedupe window, max shift, shift-day boundary, orphan-out policy |
+| Onboarding | Create an account and its owner, password shown once, plan optional |
+| Subscription | Stop and restart syncing with a reason; assign a plan; set the renewal date — see [Subscription plans](#subscription-plans) |
+| Support | Run a sync now; see why an account is stuck |
+
+Status is the off switch that does not depend on the customer: only *trialing*
+and *active* sync, so suspending one stops it immediately. Changing pairing
+rules does not rewrite history — existing records stand and the new rules apply
+from the next run.
+
+#### Stopping an account for non-payment
+
+Each row in the console has **Deactivate**, and a deactivated one has
+**Activate**. Two clicks to stop (the second is where an optional reason gets
+typed), one to restart. No dialog: nothing in this app uses a modal, and a
+`confirm()` blocks the whole page.
+
+```
+POST /api/v1/admin/tenants/{id}/deactivate   {"reason": "unpaid invoice 4021"}
+POST /api/v1/admin/tenants/{id}/activate
+```
+
+Its own action rather than the Status dropdown in the form below, because this
+is the one taken when a subscription lapses: it deserves one click from the
+list, a reason attached, and one clear line in the audit trail instead of
+`status: active -> suspended` among a form's other changes.
+
+**It changes `status`, never `sync_enabled`.** Those are different questions and
+conflating them is the trap: `sync_enabled` is the customer's own switch, so a
+suspension built on it is one the customer simply turns back on. Keeping them
+apart also means reactivating hands back the setting they chose rather than
+switching syncing on for an account that had it off on purpose.
+
+**Nothing is destroyed and nothing is hidden.** The customer keeps their
+records, their dashboard and every screen; only the collection of new punches
+stops. That is what makes this safe to use on a billing decision that might be
+wrong — and it is why the gate is a status change rather than anything that
+touches data.
+
+Deactivating closes all three doors, which it did not always:
+
+| | Before | Now |
+| --- | --- | --- |
+| The scheduler | skipped the account | skips it |
+| The customer's **Sync now** | **ran the sync** | refused, 403 with the reason |
+| The console's **Sync now** | refused | refused |
+| `SyncEngine.run_cycle` | ran | refuses, and records a run saying why |
+
+The middle row was the hole: suspension stopped the clock without stopping the
+syncing, so an account stopped for non-payment kept syncing for as long as
+somebody kept pressing the button. The engine now checks it too, so a route
+added later that forgets still cannot sync a stopped account — there is exactly
+one place a cycle can start. It refuses as a `SyncAborted`, which records the
+run and its reason but is exempt from the failure streak: a stopped account is
+not a failing one and must not be slow-laned or badged degraded for it.
+
+**The customer is told.** They get a banner on the overview and in Settings, the
+sidebar pill reads *sync stopped*, and the schedule card says the account is
+stopped. That last one was actively misleading before: `next_run_at` is null for
+a suspended account, so the card fell through to "this account has sync turned
+off in Settings" and sent people to a screen where their own switch was plainly
+still on.
+
+**The reason is a staff note and stays one.** It is returned only to the
+console, never on `/tenant`, and it is deliberately kept out of the audit
+`detail` as well — that trail belongs to the customer and exists to be shown to
+them, so "chasing payment, third email" must not be sitting in it the first time
+someone adds that screen. It lives on the tenant row and in the server log.
+
+**Diagnostics are counts and error text, never the ledger.** Staff see how many
+punches are pending, in error, unmapped or stuck at the retry cap, plus each
+distinct Odoo message — with employee names scrubbed out. That last part needs
+real work rather than just withholding columns, because Odoo writes the person's
+name into its own error: *"Cannot create new attendance record for Sara Tanaka,
+the employee was already checked in…"*. Handing that over while hiding the badge
+column would leak exactly what the console claims not to show, so the text is
+redacted against that tenant's known employee names and reads
+`…for <employee>, the employee was already checked in…`.
+
+**A platform user is not a tenant.** `User.tenant_id` is nullable, and staff
+have none. Forcing one on them put a phantom company in the customer list,
+counted it in "N accounts scheduled", and polled a BioTime server that does not
+exist — while handing a support engineer a meaningless attendance dashboard of
+their own. With no tenant, every tenant-scoped route answers **403** naming the
+reason, the scheduler has nothing to pick up, and the dashboard shows the
+console alone: no Overview, no Connections, a *platform staff* pill where the
+company name would be.
+
+A tenant is optional, not forbidden. Someone who genuinely is both a customer
+and staff keeps their account — they just hold one hat at a time, which is what
+the two doors below are for; `--list` says who is which.
+
+#### Two doors, two kinds of session
+
+Everyone signs in on the same page (`/#/login`). Underneath there are still two
+doors, and the token each one mints is scoped to its surface:
+
+| | Customer door | Console door |
+| --- | --- | --- |
+| Endpoint | `POST /auth/login` | `POST /auth/staff/login` |
+| Token scope | `tenant` | `staff` |
+| Reaches `/api/v1/admin/*` | never | yes |
+| Reaches tenant routes | yes | never |
+| Access token life | 12 h | 1 h |
+| Refresh token life | 30 d | 1 d |
+
+**A fixed staff login, for a host with no shell.** `grant_admin.py` needs a
+shell or a database login on the server. Where there is neither, set
+`STAFF_EMAIL` and `STAFF_PASSWORD` (12+ characters) in the server's settings and
+restart: the API creates that account at start-up — staff, no workspace — and
+signs in at `/#/staff/login` like any other. It is still not reachable from the
+product: only whoever controls the server's environment can set it, which is the
+bar a database login already sets.
+
+* Changing `STAFF_PASSWORD` and restarting **rotates** the password and ends the
+  sessions the old one opened. The setting is the source of truth.
+* Removing the settings does **not** remove the account or its access — revoke it
+  with `grant_admin.py --revoke`, or disable the user.
+* An address that already belongs to a **customer** workspace is left alone, with
+  a log warning, so a setting can never take over a customer's login. Use another
+  address, or promote that account with `grant_admin.py`.
+* A restart also clears a lock-out of this one login.
+
+`tests/test_staff_bootstrap.py`.
+
+**Staff is a backend role, not a customer role.** A platform staff account
+(`is_platform_admin`) signs in at the console door only. The customer door
+refuses it — whatever else the account owns — and answers exactly as it answers
+a wrong password, because "this is a staff account" would turn the customer form
+into a lookup for which addresses hold the flag. The server enforces it on every
+request too: a customer-scoped token held by a staff-flagged account is refused
+at every workspace route and cannot be refreshed, so granting the flag ends any
+customer session the account already had.
+
+The sign-in page follows the same split. *Sign in* only ever calls the customer
+door. **Log in as admin**, the link under the sign-in card (`/#/staff/login`),
+only ever calls the console door, and answers a non-staff account exactly like a
+wrong password. There is no second session and no switch between a workspace and
+the console: staff see the console, customers see their workspace.
+
+Things worth knowing:
+
+- **The flag alone does not open the console for a session already held.**
+  After `grant_admin.py`, the person signs in at the console door.
+- **Give staff their own account.** Create it with `grant_admin.py --create`
+  (no workspace). Promoting an address that owns a workspace leaves that
+  workspace's data in place but locks the account out of it.
+- The console session still lives a day at most, and *Sign out* ends it.
+
+The console door answers a non-staff account exactly as it answers a wrong
+password. Saying "you are not staff" would turn it into a lookup for which
+accounts hold the flag — the shortlist most worth phishing — so the refusal is
+logged server-side instead. Rate limiting and lockout are shared with the
+customer door, so the console is not the softer target.
+
+None of this is what keeps anyone out: `get_platform_admin` and `get_principal`
+check every request server-side, and they are still the control. What the split
+buys is that a console credential is never typed into the customer form, that a
+cross-tenant token expires in an hour rather than twelve, and that
+`user_session.scope` can answer "which live sessions could reach other
+customers" during an incident — a question `tenant_id` cannot answer, because a
+staff account that still owns a workspace has a tenant either way.
+
+Reaching any of it needs `is_platform_admin`, which is **not** a role either.
+Roles (owner, admin, viewer) are positions inside one customer's account and
+every query filters on that account. No HTTP route sets the flag — the only way
+in is on the server:
+
+```bash
+python3 tools/grant_admin.py --create --email ops@yourcompany.com   # no tenant
+python3 tools/grant_admin.py --list
+python3 tools/grant_admin.py --email someone@existing.com           # promote
+python3 tools/grant_admin.py --email someone@existing.com --revoke
+```
+
+The privilege therefore costs exactly what a database login costs, and cannot be
+escalated through the product: a compromised support account cannot promote
+itself or anyone else.
+
+Credentials are never exposed — the console shows *whether* Odoo and a device
+platform are connected, never the URLs or keys — and neither is the punch
+ledger. Every change is written into **that customer's own** audit trail, naming
+the staff user, so it is visible to the customer rather than only to you.
+
+One thing to know: a new interval counts from that account's **last** sync, not
+from now, because due-ness is measured that way everywhere. Shortening the
+interval on a customer who synced ten minutes ago makes them due immediately —
+the console shows the recomputed next run so that is visible rather than
+surprising.
+
+### Proving it
+
+Two of these have their own proof, and neither needs Odoo or BioTime: each boots
+the app against a throwaway database and drives a real browser, because what
+they check are rendering decisions that fail silently.
+
+```bash
+python3 tools/login_doors_proof.py    # the two sign-in doors
+python3 tools/gate_proof.py           # stopping and restarting an account
+```
+
+`login_doors_proof.py` asserts that a customer is never shown the console, that
+a staff account — with or without a workspace — is refused at the customer door
+with a wrong-password answer and admitted only at the console door, and that
+signing out of the console returns to the *console* login rather than the
+customer one.
+
+`gate_proof.py` stops an account from the console and then checks what the
+*customer* sees — the banner, the pill, the schedule card, the refused Sync now
+button, the untouched switch in their Settings — and that the staff reason never
+appears on their screen. Then it restarts the account and checks they are back
+to normal.
+
+`tests/test_login_separation.py` and `tests/test_subscription_gate.py` cover the
+API side of each, including that a customer-door token is refused by `/admin/*`
+even when the account is staff, and that a suspended customer's own Sync now is
+refused.
+
+```bash
+python3 tools/schedule_proof.py --base http://127.0.0.1:8000 \
+    --odoo-url https://your.odoo.com --odoo-db yourdb \
+    --odoo-user you@example.com --odoo-key <api-key>
+```
+
+Creates an account, connects both sides, sets a one-minute interval — and then
+does nothing but watch. It fails unless it sees a run tagged `schedule` land
+attendance in Odoo; a `manual` run would only prove the button works. Start the
+API with `SCHEDULER_TICK_SECONDS=5` so it finishes in a minute.
+
+## Subscription plans
+
+A plan is a tier with enforced limits, not a billing record. Nothing in this
+codebase charges a card — the platform's own choice is to drive syncing off an
+internal "paid through" date on the tenant (`subscription_renews_at`), and let
+staff move that date by whatever process they already use to get paid. Two
+limits are enforced today:
+
+| Limit | Enforced | Where |
+| --- | --- | --- |
+| `min_sync_interval_minutes` | On the **customer's own** settings save | `PATCH /api/v1/tenant` |
+| `max_employees` | On **new** badge-to-employee matches during a sync | `SyncEngine._resolve_mappings` |
+
+**Staff are never blocked by either.** The interval floor is a limit on
+self-service, not on the platform's own ability to make an exception — the
+console can set a tighter interval than a plan allows, the same way it can
+already change status or pairing rules directly. The employee cap only ever
+holds back a *new* match; a plan assigned or lowered after a tenant already
+has more mapped employees than its new cap allows does not unmap anyone —
+the badges already relying on it keep working, and only the next new one is
+held back, with a note explaining why instead of "no such employee".
+
+Staff manage plans in the console under **Platform → Plans**: create a
+tier, change its price and limits (employees, devices, fastest sync), link a
+Stripe Price, make it the default for new accounts, or retire it. Plans are
+never deleted — an account on a retired plan keeps it. Limit changes apply to
+every account on the plan from its next sync.
+
+For one customer's exception, **All accounts → Configure → Limits for this
+account** overrides any limit for that account alone (empty = use the plan,
+0 = no limit). Overrides stay if the plan changes. The same dialog shows usage
+against the limits — employees matched, devices, held punches, sync speed.
+Assigning a plan raises a faster sync interval to the plan's floor.
+
+A fresh deployment gets its first tiers from:
+
+```bash
+python3 tools/seed_plans.py          # create Starter/Growth/Scale if missing
+python3 tools/seed_plans.py --reset  # overwrite them with the script's values
+```
+
+Re-running it without `--reset` never undoes an edit made in the console.
+
+### Choosing a plan yourself
+
+A tenant is never stuck with whatever plan they were assigned. Two places:
+
+- **Signup** — `GET /api/v1/auth/plans` (public, no token needed) lists the
+  active plans. Two different questions, not one dropdown: `plan_id` picks
+  which plan (left unset, falls back to whichever is `is_default`), and
+  `skip_trial` decides whether there is a trial at all.
+  - `skip_trial: false` (the default) — status opens `trialing` for
+    `TRIAL_DAYS`, whatever `plan_id` says. Picking a plan here just commits
+    the trial to that plan's limits instead of the default's.
+  - `skip_trial: true` — status opens `active` immediately, for
+    `BILLING_PERIOD_DAYS` instead of a trial, and `plan_id` is then
+    required: "no trial, no chosen plan" is not a request this endpoint can
+    act on. There is still no billing integration behind this — nothing
+    processes a payment — `active` and a billing-cycle-length date are just
+    the bookkeeping for "treat this as already paid for", the same
+    fictional-but-useful stand-in `subscription_renews_at` already is
+    everywhere else in this feature.
+- **Settings, afterward** — `PATCH /api/v1/tenant` takes the same `plan_id`.
+  Repeatable, any time, no confirmation step beyond the one click for an
+  account not yet on a paid plan — see below for what changes once one is.
+
+Both are self-service; staff's own `plan_id` on
+`PATCH /api/v1/admin/tenants/{id}/config` still exists, unchanged, for
+onboarding a customer directly or overriding their choice (and always
+applies immediately — see "Deferred switching" below). One thing a customer
+cannot do that staff can: clear their own plan back to none.
+`TenantUpdate.plan_id` refuses `null` — an active plan or nothing happens —
+because going unenforced is not a self-service action.
+
+A switch that takes effect (immediately or once deferred — next section —
+lands) is judged the same way a plan already assigned is: the employee cap
+only ever holds back a *new* match (see above — nothing here needed to
+change for that), and the interval floor is enforced the moment it lands. If
+the account's `sync_interval_minutes` is then under the new plan's floor, it
+is raised automatically rather than left holding a setting the plan it just
+joined would reject — the same fix already applied to a fresh signup, now
+applied everywhere a switch could reintroduce it.
+
+#### Deferred switching: not mid-period
+
+Self-service switching applies immediately **unless the account is already
+on a paid plan** — `status == active` and a `plan_id` already assigned, i.e.
+something has actually been paid for. In that case the new choice is queued
+in `Tenant.pending_plan_id` instead of landing on the spot, and only takes
+effect once the *current* plan's `subscription_renews_at` is reached — the
+same sweep that moves the renewal date (below) promotes it. A `trialing`
+account has paid for nothing yet, and a `past_due` one has already lapsed,
+so either still switches on the spot, exactly as if this did not exist.
+
+Choosing the plan already in effect while a switch is queued cancels it
+(`pending_plan_id` back to null) — that is the only "undo" this needs, since
+there is nothing else to roll back. Settings shows the pending choice and
+when it lands (`GET /api/v1/tenant`'s `pending_plan_id` / `pending_plan_name`
+— also on the staff console's tenant rows) so it is never a silent queue.
+Staff setting `plan_id` directly always supersedes and clears any pending
+switch — their override outranks a customer's still-queued one.
+
+### The automatic renewal-date check
+
+A scheduled sweep — `app.services.scheduling.sweep_subscriptions` — moves
+accounts across `subscription_renews_at` the same way staff already move them
+by hand:
+
+- `trialing` / `active` past its renewal date → `past_due`. **No grace
+  period**: the moment the date passes, syncing stops, exactly like a manual
+  deactivate. `past_due` was already excluded from `SYNCABLE_STATUSES`, so
+  the gate itself needed no change — this only automates *reaching* it.
+- `past_due` whose date has since moved into the future → `active`. Staff (or
+  a future billing integration) pushes the date forward; the next sweep
+  notices and lets the account back in.
+- `suspended` and `cancelled` are **never** touched, in either direction —
+  those are deliberate acts and must outlast the sweep, or the deactivate
+  button would become a temporary measure instead of the one it is documented
+  to be.
+
+**A null `subscription_renews_at` is never touched either — the single most
+important rule in this feature.** That is the state of every tenant that
+existed before this column did. If the sweep treated "no date set" as
+"already lapsed", turning it on would suspend every existing customer the
+first time it ran. An account only ever lapses because a real date passed.
+
+The same pass also promotes a queued plan switch (`pending_plan_id` — see
+"Deferred switching" above) the moment `subscription_renews_at` is reached,
+independently of whichever direction above the account also moves in at that
+same tick — including a tenant that is already `past_due` and stays that
+way, so a switch queued before a lapse is not lost by it. A tenant kept
+permanently `active` by staff extending the date *before* it is ever reached
+is the one case this cannot promote early: with nothing here to notice an
+extension that lands ahead of the deadline, the switch simply waits for
+whatever date is current when it is finally reached, later if the date keeps
+moving. Reactive renewals — staff renewing after noticing `past_due`, which
+is how this hand-operated system is actually used today — land the switch
+exactly on the original date, since the sweep already caught that moment
+before anyone intervened.
+
+It runs on its own hourly slot, in whichever scheduler is active —
+`app.services.scheduler.Scheduler._run_subscription_sweep` in-process, or the
+`sweep-subscriptions` beat task under Celery — sharing the exact same
+function either way, the same guarantee the due-tenant sweep already makes.
+
+### The warning, instead of a grace period
+
+The literal ask this answers: a warning for subscriptions ending shortly, not
+a delay after they do. Once `subscription_renews_at` is within
+`SUBSCRIPTION_WARNING_DAYS` (default 7) and the account is still `trialing`
+or `active`, `renewal_warning` appears on `GET /api/v1/dashboard` (rendered as
+a banner on the customer's Overview page, and inline on the Settings "Plan"
+card) and on the staff console's `GET /api/v1/admin/tenants[/​{id}]` (a
+"renewing soon" tag on the row). It is `null` once an account has actually
+lapsed — the louder "stopped syncing" messaging already covers that case, and
+showing both would bury the one that matters.
+
+Inside `SUBSCRIPTION_URGENT_DAYS` (default 3) the *same* warning carries
+`urgent: true` instead of becoming a second message — the customer's Overview
+banner and the Settings Plan card render it in the "bad" tone instead of
+"warn" at that point, and the console's row tag reads "renewing very soon".
+One `trialing` or `active` account is judged by one date either way, so a
+trial ending in 2 days and a paid plan ending in 2 days read identically.
+
+### Configuration
+
+| Variable | Default | |
+| --- | --- | --- |
+| `TRIAL_DAYS` | `10` | Initial `subscription_renews_at` for a trial signup |
+| `BILLING_PERIOD_DAYS` | `30` | Initial `subscription_renews_at` for a signup that skips the trial (`SignupRequest.skip_trial`) — staff onboarding still always starts a trial, on `TRIAL_DAYS`, whichever plan it assigns |
+| `SUBSCRIPTION_WARNING_DAYS` | `7` | How close to the renewal date before the warning appears |
+
+## Online billing (Stripe)
+
+Off until `STRIPE_SECRET_KEY` is set; with it off, nothing below applies and
+plans work exactly as described above. Code: `app/services/billing.py`,
+`app/api/v1/billing.py`; tests: `tests/test_billing.py`.
+
+**Who pays where.** New customers buy on the website (signup → *Buy now* →
+Stripe Checkout; the account is created when the payment webhook arrives).
+After that Stripe charges the saved card automatically every month, and the
+customer manages it in the app under **Settings → Billing**: next renewal date
+and amount, the card renewals go to (*Update card* opens Stripe's page),
+invoices with PDFs, **Pay now** for a failed or open renewal invoice (Stripe's
+hosted invoice page), and cancel at period end / *Keep my subscription*. Trial
+accounts made on the website pay from Settings → Plan → *Choose a plan*.
+
+**Keys.** Staff set the secret key and webhook signing secret in the console
+under **Platform → Payments** (encrypted in `platform_setting`; only a hint like
+`sk_test_…4242` is ever shown). They take precedence over `STRIPE_*` in `.env`
+while switched on. The page shows the webhook URL and events to subscribe, when
+the last event arrived, and *Test connection* checks the key and every active
+plan's price (exists, monthly, same amount as the plan). Price ids stay on each
+plan (Platform → Plans).
+
+**Setting it up (test mode first):**
+
+1. In Stripe, create one **Product** per plan with a **monthly recurring
+   Price**, and note each `price_…` id.
+2. Add a webhook endpoint at `<PUBLIC_BASE_URL>/api/v1/billing/webhook` for
+   `checkout.session.completed`, `customer.subscription.created`,
+   `customer.subscription.updated`, `customer.subscription.deleted`,
+   `invoice.paid` and `invoice.payment_failed`. Locally:
+   `stripe listen --forward-to localhost:8000/api/v1/billing/webhook`.
+3. Turn on the **Customer Portal** (Settings → Billing → Customer portal) so
+   customers can update their card, see invoices and cancel.
+4. Set `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STARTER`,
+   `STRIPE_PRICE_GROWTH`, `STRIPE_PRICE_SCALE` (see `.env.example`), then run
+   `python3 tools/db_upgrade.py` and `python3 tools/seed_plans.py`.
+
+**How it behaves:**
+
+- **No card at signup.** The trial is BioBridge's own. Choosing a plan opens
+  Stripe Checkout; the plan starts when Stripe confirms payment, not on the click.
+- **Stripe is the authority once subscribed.** Webhooks set `active`,
+  `past_due` (a failed payment) or `cancelled`, and `subscription_renews_at`
+  follows the paid period. The renewal-date sweep leaves these accounts alone.
+  Every webhook is signature-checked, recorded once (`stripe_event`), and
+  applied from a fresh read of the subscription, so retries and out-of-order
+  delivery are harmless.
+- **Plan switches wait for renewal**, as before. Stripe is given the new price
+  immediately with no proration, so the next invoice is at the new price and
+  nothing is charged or refunded mid-period.
+- **Manage billing** in Settings → Plan opens the Customer Portal.
+- **Staff suspension wins.** A webhook never lifts a `suspended` account.
+- A plan with no `stripe_price_id` can't be bought online; staff can still
+  assign it by hand from the console.
+
+## Closing accounts and lapsed subscriptions
+
+- **Syncing stops automatically** when a subscription isn't renewed: a trial
+  ending without a plan, a renewal date passing (staff-billed accounts), a
+  failed Stripe renewal, or a cancellation reaching the end of its paid period.
+  The account becomes `past_due` / `cancelled`, keeps all its data, and resumes
+  when paid again. Owners and admins get an email each time. For Stripe-billed
+  accounts the renewal sweep also stops an account 3 days after its period
+  ended with no renewal recorded — a safety net for missed webhooks.
+- **Customers cancel** under Settings → Billing → *Cancel subscription* (at
+  period end; undoable until then).
+- **Owners delete their account** under Settings → General → *Delete account*:
+  a reason is required ("Other" needs a few words), then the company name and
+  password. A running Stripe subscription is cancelled immediately (no refund),
+  and everything is deleted (`app/services/account_deletion.py`).
+- **Staff delete an account** from All accounts → *Delete*, offered only once
+  it is deactivated (suspended or cancelled), with the name typed back.
+- Every deletion leaves one `account_closure` row — name, owner, plan, who
+  closed it and why — listed under Platform → **Closed accounts**.
+- **Plans** can be deleted from Platform → Plans only while no account is on
+  them (or switching to them) and no website checkout is open; otherwise retire.
+
+## Odoo API: JSON-2 or XML-RPC
+
+Odoo 20 removes XML-RPC *and* JSON-RPC (`/xmlrpc`, `/xmlrpc/2`, `/jsonrpc`).
+Their replacement, the JSON-2 API (`POST /json/2/<model>/<method>` with
+`Authorization: bearer <API key>`), first shipped in Odoo 19 — so BioBridge
+speaks both and picks per server:
+
+| Odoo        | API BioBridge uses |
+|-------------|--------------------|
+| 19 and later | JSON-2            |
+| 14 – 18     | XML-RPC (the only external API they have) |
+
+The version is read from `GET /web/version` (falling back to XML-RPC's
+`version()` on Odoo versions that don't answer it, and assuming JSON-2 where
+neither exists) on first use, and remembered for an hour per server — an Odoo
+upgraded from 18 to 19 moves over by itself, and **Test connection** always
+looks again. The test result says which API is in use ("Connected to Odoo 19.0
+over the JSON-2 API …"). Nothing to configure, and the customer still enters
+the same URL, database, login and API key.
+
+On JSON-2 the API key alone identifies the user, so BioBridge checks that the
+key belongs to the login entered and says so if not. Odoo 19 API keys have an
+expiry date: an expired key fails with a message telling the customer to
+create a new one. A WAF in front of Odoo needs to allow `/json/2/*` (and
+`/web/version`) instead of `/xmlrpc/2/*`.
+
+The optional `biobridge_attendance` add-on (1.0.1) now exposes
+`biobridge.device.biobridge_upsert`: the old `_biobridge_upsert` name starts
+with an underscore, and Odoo refuses private methods over *any* external API.
+Update the add-on on databases that have it.
+
+## How a sync run works
+
+```
+fetch → ingest → normalise → register → (provision) → map → pair → push → record
+```
+
+`provision` is opt-in per source — see "Employee mapping" below.
+
+Two invariants make a run safe to interrupt:
+
+- The ledger is keyed on `(tenant_id, source_id, external_id)` — the vendor's own
+  id, scoped to its source. Ingesting the same window twice is a no-op, so the
+  re-read window costs nothing and a full re-pull is safe.
+- The cursor advances only **after** punches are stored, and only to the newest
+  punch actually seen. A crash costs a retry, never a gap.
+- A read that stops at a provider's page cap (BioTime's `MAX_PAGES_PER_RUN`,
+  and each vendor's own guard) is never trusted as complete. BioTime pages in id
+  order, not time order, so a cut-short read can leave unread punches *before*
+  the newest one it returned. The engine splits that window in half and reads
+  both halves again, down to 10-minute slices, at most 12 reads per source per
+  run; the cursor stops where the complete reading stops, and a large backlog
+  is worked off over the next runs ("large backlog — continuing next run").
+
+### Reading by record id (late uploads)
+
+The time cursor has one blind spot: a punch that reaches the platform late with
+an old timestamp (a terminal that was offline for a day uploads its backlog)
+falls before the re-read window and is never fetched. Platforms that number
+their records with an id that only grows, and can be asked for records after
+one, are also read by id:
+
+1. Every run reads by time first, exactly as above — nothing depends on the id.
+2. It then asks for everything with an id above the highest id already stored
+   (`record_cursor` in the connection's config), whatever its timestamp, back to
+   the backfill limit. Anything new there was uploaded late.
+3. The id cursor moves, with the time cursor, only after both reads are stored.
+   If new punches arrive with ids **below** the cursor, the platform restarted its
+   count (log cleared, device reset, Hikvision's counter wrapping) and the
+   cursor follows it down.
+4. A platform that rejects or ignores the id condition is marked
+   `record_cursor_unsupported` and read by time only from then on. Changing the
+   connection's address clears both keys.
+
+| Platform | Id used | How it is asked |
+|---|---|---|
+| Hikvision ISAPI terminal | event `serialNo` | `AcsEventCond.beginSerialNo` |
+| Suprema BioStar 2 | event `id` | `id` GREATER condition, ordered and paged by id |
+| Matrix COSEC | sequence + rollover | its own `cosec_cursor` (already position-based) |
+| ZKTeco BioTime | transaction `id`, `upload_time` | see below |
+| Dahua terminal | record `RecNo` | gaps in the numbers the time read saw — see below |
+| Matrix COSEC CENTRA | template's Index No | `eventta?action=get;index=N;count=500`, asked from the last stored index (works whether the server reads it as "from" or "after"); 40 pages per run, the rest next run. Needs Index No in the API template |
+| ZKTeco terminal (port 4370) | none | the log has no ids; the terminal records its own punches as they happen, so there are no late uploads to catch |
+
+**Dahua.** `recordFinder.cgi` has no documented "after this RecNo" condition,
+but RecNo counts up as the terminal stores records (failed attempts included).
+Every RecNo the time read returns is noted; a number between the id cursor and
+the highest one seen that did not come back is a record stored with a time
+outside the window (the terminal's clock was set back, say). Only then are older
+days searched, newest first, up to 31 days per run, for those numbers. If the
+budget runs out the cursor waits below the first missing number. Gaps that a
+full search never finds three runs in a row (numbering shared with other record
+types, deleted records) switch the terminal to time only
+(`dahua_recno_misses`). A record whose clock was set *ahead* is not found this
+way.
+
+**BioTime.** Its transaction list ignores id filters and ordering (tested on a
+live server), but it does take `upload_time`, and one transaction can be read by
+id. Two reads cover late uploads:
+
+- *By upload time.* The live window is also asked `?upload_time=<window start>`.
+  What comes back is checked: a server that filters "from that time on" is
+  remembered as `biotime_upload_filter: from`; one that ignores the value, or
+  matches it exactly, as `off` and is not asked again.
+- *By id gaps.* BioTime numbers transactions as it receives them, so an id
+  between two the time read returned, but missing from it, is a transaction
+  with a punch time outside the window — a late upload (or a deleted one). Each
+  gap is read on its own (`/iclock/api/transactions/<id>/`), then the ids past the
+  newest until one does not exist. At most 200 lookups per run; the id cursor
+  stops where the lookups stopped.
+
+Both vendor conditions are honoured by the simulated servers in the tests; they
+still need confirming on a real terminal and server. If either is ignored, step
+4 catches it on the first run.
+
+### The one thing this gets right that a naive port does not
+
+A check-in arrives in one cycle and the check-out in the next — that is the
+normal case, because the whole point of polling every few minutes is that the
+check-out has not happened yet.
+
+Pair only the punches that are still pending and the second cycle sees a lone
+check-out, pairs it as a *new open interval starting at the check-out time*, and
+writes a phantom record. In `alternating` mode that phantom is left open, and the
+hourly maintenance task then closes it at +16 h — a spurious 16-hour attendance,
+every day, on every employee.
+
+So `pair_punches` takes the employee's **currently open shift** as an input, read
+from Odoo and reconciled with what we stored on the mapping row. A lone check-out
+then does the only sensible thing: it closes the shift it belongs to.
+
+```python
+result = pair_punches(punches, config, open_shift=OpenShift(id, check_in))
+# -> Interval(check_in=<recorded>, check_out=<this punch>, closes_attendance_id=id)
+```
+
+`tests/test_pairing.py::test_lone_checkout_closes_the_open_shift_instead_of_opening_one`
+is the test that pins it.
+
+### A punch that lands inside a record Odoo already has
+
+Odoo refuses overlapping attendances for one employee, closed ones included. Its
+message — "the employee was already checked in on …" — prints the *new*
+check-in, which makes it read as if the old record were still open. Retrying
+such a write can never succeed, so before creating a record the engine asks
+Odoo for the one that already spans the check-in (`OdooClient.attendance_covering`):
+
+* **Closed by BioBridge at the shift limit** (a forgotten check-out, cut at
+  `max_shift_hours`): that end time was a guess. The record is shortened to end
+  where the new check-in begins — the same rule as a check-in that follows a
+  forgotten check-out — and the new record is created. The local copy is kept in
+  step, including when the hourly sweep closes a stale shift.
+* **A real record** (punched in and out): the punch is marked *skipped*, with
+  the record's id and times in its message, instead of an error that Retry
+  cannot fix.
+
+**An older record left open behind newer ones.** Punches can be processed out of
+order — a badge that was unmatched, or held, for days is released after later
+punches were sent. Odoo lets such a record be *created* open (an open record skips
+the overlap check) but refuses to *close* it later with a real check-out that
+reaches past a newer record: `hr.attendance.write failed … the employee was
+already checked in on <the newer record>`. That message names the newer record,
+and because it fails the whole employee's batch, every punch after it errors too.
+Before pairing, the engine looks for a record that begins after the open one
+(`OdooClient.attendance_after`); if there is one, the open record is closed there
+(never later than the shift limit), flagged as closed automatically, and the
+punches then start fresh. The hourly stale-shift sweep applies the same ceiling.
+
+The same ceiling applies to every write: before an interval is sent — closing a
+record, or creating a closed one — its check-out is cut back to where the next
+record already in Odoo begins (flagged as closed automatically, with a log
+warning), because Odoo refuses a check-out that runs past another record's
+check-in on create and on write alike. Punches paired across a gap would
+otherwise fail on every sync.
+
+Failures are isolated per interval. If Odoo refuses one shift for an employee, only
+the punches of that shift are marked as errors — each with a message that names the
+interval ("Interval 2026-10-19 08:00 to 2026-10-19 17:00: …") — and the employee's
+other shifts in the same batch still sync. Previously one refusal marked every
+pending punch of that employee as an error, so a backlog of hundreds of old punches
+could never drain.
+
+A shift can also be closed in Odoo by something other than a sync — the hourly
+stale-shift sweep, or a person editing it. Each cycle looks up the records
+BioBridge still shows as open (one query) and takes the check-out Odoo has, so
+the Attendance page never keeps saying "Open" for a record that is closed.
+
+`tests/test_odoo_overlap.py`. `FakeOdoo` enforces the same overlap rule, so any
+other path that tried to write one would fail a test.
+
+## Employee mapping
+
+Odoo is the roster of record. A punch's badge (`emp_code`) is matched to an
+`hr.employee` by trying `barcode` → `pin` → `registration_number` →
+`work_email`, in that order, against whichever of those fields actually
+exist on the customer's Odoo (`OdooClient.find_employee` /
+`MATCH_FIELDS`). A match is cached on `EmployeeMapping`; ambiguous matches
+(two employees sharing the same field value) and unmatched badges are
+surfaced for a human to resolve by hand, or, if `tenant.auto_create_employees`
+is on, an unmatched badge creates a new `hr.employee`.
+
+That direction — device badge to Odoo — always assumed the person already
+existed on the device. Going the other way — Odoo employee to device — is
+`DeviceSource.auto_provision_employees`, off by default per source. When
+on, `SyncEngine._provision_employees` runs once per cycle, ahead of
+mapping and independent of the punch stream: it reads Odoo's active
+roster, picks each employee's matching identifier with the same
+`MATCH_FIELDS` priority (`OdooClient.employee_code_for`, the mirror of
+`find_employee`), and calls the provider's `create_employee` for anyone
+missing there. The matching key never changes per vendor — only the create
+call does, which is why enabling this for BioTime and ZKTeco needed no
+change to the matching logic itself, just each provider implementing
+`fetch_employees`/`create_employee` (`Capability.READ_EMPLOYEES` /
+`WRITE_EMPLOYEES`).
+
+**Test connection** does a narrower version of the same thing, on demand:
+for a provider that can create employees (ZKTeco and BioTime), the settings
+page follows a successful test (or Connect) with `POST
+/sources/{id}/provision-employees`, which creates on the device every
+**active** Odoo employee who is **not mapped to a device user yet** and has a
+**Badge ID or PIN** — those two fields only, never a registration number or
+work email (`app/services/provisioning.py`). "Not mapped" means BioBridge has
+no mapped badge for that Odoo employee and the device has no user with that
+code, so running it again creates nobody twice. Two Odoo employees sharing a
+Badge ID are both refused and reported, and a code the device can't hold (a
+non-numeric one on ZK6 firmware) is reported rather than failing the rest.
+It's a separate call so the terminal import itself never fails over an Odoo
+or employee problem, and the result shows in its own message.
+
+**This provisions identity only, never a biometric template.** No vendor's
+protocol lets a fingerprint or face be pushed to a device remotely —
+BioTime's REST API doesn't expose it and neither does ZKTeco's wire
+protocol. `create_employee` creates the record (id/name, and for ZKTeco a
+device `uid` slot) a person can then clock against once someone enrolls
+their fingerprint or face locally at the terminal, or issues a card/PIN.
+"Seamless" here means the roster entry is waiting for them before their
+first day, not that enrollment itself is remote — that step needs a human
+at the physical device, for every vendor.
+
+ZKTeco standalone terminals store a user id in one of two ways, depending
+on firmware (the record layout is detected per device — see "The table
+layouts" in `app/integrations/providers/zkteco.py`): as text of up to 24
+characters, or, on older "ZK6" firmware, as a plain 32-bit number.
+`ZKDeviceProvider.create_employee` refuses an `emp_code` the device's own
+layout can't hold unchanged — longer than 24 characters, or on ZK6 anything
+but digits without leading zeros — because it would enroll fine and then
+silently fail to match every future punch back to that person. (This used
+to say the attendance log truncates ids to 9 bytes. It doesn't: that came
+from BioBridge misreading the record, since fixed.)
+
+## Multi-company Odoo isolation
+
+A customer's own `tenant_id` isolates two BioBridge tenants from each
+other in BioBridge's own database, always, regardless of what's on the
+Odoo side. That says nothing about a customer running Odoo's *own*
+multi-company feature — several companies inside one Odoo instance, each
+with its own employees, its own device platform, sold to BioBridge as
+what looks like two unrelated tenants but is actually one Odoo database
+underneath. Left alone, `OdooClient` has no idea that distinction exists:
+every `search_read` it issues is scoped only by whatever companies the
+authenticated Odoo API user happens to be a member of, which for a shared
+integration user is often "all of them."
+
+**Company switches (what the Settings page shows).** Instead of picking one
+company from a dropdown, Settings → Odoo lists every company the login can
+reach, each with a switch, all **on** by default. What is stored is the
+exceptions — `OdooConnection.disabled_company_ids` — so a company created in
+Odoo later arrives switched on. `OdooClient.company_scope()` turns that into
+the enabled ids (read from Odoo each run); `execute` sends them as
+`allowed_company_ids` (first = default company for new records) and searches
+use `company_id = X` / `in [...]`. At least one must stay on — an empty list
+would fall back to *every* company, so it is refused. Employees of a company
+switched off are set aside at the next sync (`EmployeeMapping.status =
+out_of_scope`): hidden from the Employees list, not counted against the plan,
+not synced, never auto-created into another company, and restored with the
+same Odoo link when the company is switched back on (their punches wait in
+the ledger meanwhile). The paragraphs below describe the older single-company
+pin, which still works and reads as "every other company is off".
+
+`OdooConnection.company_id` closes that gap — the res.company id this one
+connection is pinned to, set from the company list Test Connection returns
+(`OdooClient.list_companies`, and `ping()` refuses to proceed if the
+configured id isn't actually visible to that login). Once set,
+`OdooClient.execute` puts it in `allowed_company_ids` on *every* call, not
+just the ones this file happens to add a domain filter to — that context
+is what makes Odoo's own multi-company record rules apply, and it holds
+even for a call with no domain at all (`close_attendance` writes by id).
+`find_employee`, `list_employees`, `create_employee` and the attendance
+lookups add an explicit `company_id` domain condition too, as
+defense-in-depth alongside the context, guarded by `fields_of` the same
+way every other optional field in this client is.
+
+One exception needed its own fix rather than inheriting the guarantee for
+free: `x_biobridge_device` (bootstrap-mode device tracking, `## Employee
+mapping` above's sibling — see `ensure_device_tracking_bootstrap`) is a
+plain custom model BioBridge creates over the API. Company scoping there is
+a genuine, load-bearing field (`x_company_id`), added during bootstrap. A
+connection bootstrapped before that field existed gets it from **Update
+setup** on the Odoo connection card (Settings), which re-runs the bootstrap
+and adds only what's missing. That button didn't exist at first: the only
+way to run the bootstrap disappeared once device tracking was on, so older
+connections had no way to get the field. Devices already in Odoo with no
+company are claimed by the next push from a company-scoped connection (the
+company is filled in on the same row, rather than a second device being
+created for the same serial number — see `upsert_device`).
+
+Everything above is about what *BioBridge itself* reads and writes over
+Odoo's API — it says nothing about what a person clicking around inside Odoo's
+own UI sees. `company_id` (or `x_company_id`) sitting on a device row does
+nothing there by itself: ir.model.access controls whether a user can read
+`biobridge.device`/`x_biobridge_device` at all, not which rows of it they
+see with a given company active in the switcher — only an `ir.rule` does
+that, and neither model had one. Both do now: the real add-on gets a
+standard company-scoped rule from its own
+`security/biobridge_device_security.xml` (`[('company_id', 'in',
+company_ids)]`, no `groups_id` — a global rule, the same shape most of
+Odoo's own multi-company models use), and bootstrap mode gets the
+equivalent for `x_biobridge_device`, created the same Studio-style way as
+everything else `ensure_device_tracking_bootstrap` sets up (and, like
+`x_company_id` itself, backfilled onto a connection that bootstrapped
+before this rule existed).
+
+The bootstrap rule's domain isn't a plain `('x_company_id', 'in',
+company_ids)`, on purpose: `x_company_id` is optional (unlike the add-on's
+`company_id`, which is `required=True` and so never blank), and neither
+bootstrap nor `upsert_device` goes back and backfills a value onto a device
+row that predates the field, or onto any device registered by a connection
+whose own `OdooConnection.company_id` is left unset — which is correctly
+the recommended setup for an ordinary single-company Odoo. A row like that
+has `x_company_id = False`, and `False` is never `in` any non-empty list of
+company ids — so a plain `'in'` domain would hide such rows from *every*
+company's session, turning "isolation not configured" into "devices
+silently vanish from the list" the moment this rule is installed. The
+actual domain is `['|', ('x_company_id', '=', False), ('x_company_id',
+'in', company_ids)]`: unset stays visible everywhere (matching the
+no-isolation behavior these rows already had), while a row that does carry
+a company id is properly restricted to it.
+
+The very first release of this rule did use the plain domain, and setup used
+to skip any rule that already existed by name, so an Odoo set up with that
+release kept it. The symptoms: "doesn't have 'read' access to BioBridge
+Device … Blame the following rules: x_biobridge_device.biobridge_company"
+on a device with no company, and "doesn't have 'create' access to BioBridge
+Device" when a connection with no company registers a terminal. Setup now
+rewrites BioBridge's own rule to the current domain whenever it differs, so
+**Settings → Odoo → Update setup** fixes an affected Odoo in one click.
+
+Leaving `company_id` unset is still the right choice for an ordinary
+single-company Odoo — there's nothing to isolate from, and every existing
+connection predates this field and keeps working exactly as before.
+
+### Device identity is per-source, not per-tenant
+
+A separate isolation gap, entirely inside BioBridge's own database and
+unrelated to anything above: `Device.serial_number` used to be unique only
+per **tenant** (`UniqueConstraint("tenant_id", "serial_number")`), not per
+**source**. A serial number is only actually unique within its own vendor
+account's namespace — two `DeviceSource`s (two BioTime accounts, say, one
+per Odoo company) can each legitimately report a terminal carrying the same
+serial. Under the old constraint, whichever source's "Import terminals" run
+saw a given serial *first* owned it forever: a second source reporting the
+same serial got folded into that first source's existing `Device` row
+instead of getting its own, and its terminals then showed up mixed into the
+wrong source's device list. This is what a customer running two BioTime
+accounts, one per company, actually hit.
+
+The fix is per source, matching how `sync_engine.py`'s own device lookup
+was already scoped (`discover_devices`'s dedup lookup was the one place
+that wasn't):
+
+- `Device`'s unique constraint is now `(tenant_id, source_id,
+  serial_number)`.
+- `discover_devices` (the "Import terminals" handler,
+  `app/api/v1/connections.py`) looks up existing devices by `source_id`,
+  not tenant-wide.
+- A terminal a source used to report and no longer does is flagged, not
+  deleted or disabled — `Device.missing_since` is set the first time it
+  goes unseen, left alone on repeat imports that still don't see it (so it
+  reflects when it first went missing, not the latest check), and cleared
+  the moment the terminal reappears in an import *or* sends a punch
+  (`SyncEngine._ingest`), whichever happens first. This keeps the row's
+  alias, punch history and pairing override intact through a terminal that
+  is briefly offline or mid-relocation, rather than losing them to a
+  delete-and-recreate. The settings page shows a "missing" pill with how
+  long, next to the device's name.
+
+Existing installs pick this up through `tools/migrate.py`: SQLite has no
+`ALTER ... DROP CONSTRAINT` / `ADD CONSTRAINT`, so a reshaped unique
+constraint goes through the same whole-table rebuild `--apply` already uses
+for relaxing a NOT NULL (create the new shape under a temporary name, copy
+every row, drop the old table, rename — the database file is backed up
+first). PostgreSQL gets the real `ALTER TABLE ... DROP/ADD CONSTRAINT`
+statements instead. Either way this is additive to existing data: no row is
+dropped, and two devices that happen to share a serial across sources
+simply stop colliding.
+
+### The device on each attendance record
+
+With device tracking on, every `hr.attendance` BioBridge creates carries the
+terminal its check-in was punched on (`x_device_id` without the add-on,
+`device_id` with it). The terminal comes from the check-in punch's link to a
+BioBridge `Device` — and when that link is missing because the punch was
+fetched before its terminal was imported, from the punch's own serial
+number (`app/services/device_links.py:device_for_punch`); it used to be
+left empty in that case.
+
+Records already in Odoo without a device — pushed before device tracking
+was on, or before that fix — are filled in by
+
+    python3 tools/link_attendance_devices.py            # report
+    python3 tools/link_attendance_devices.py --apply    # write, over Odoo's API
+
+which takes each record's terminal from its earliest traceable punch, and
+only touches records BioBridge created that have no device in Odoo yet (a
+device set by hand is never overwritten). Safe to run again.
+
+## Layout
+
+```
+app/
+  core/          config · Fernet envelope encryption · JWT and password hashing
+  db/            declarative base, UUID and timestamp mixins, session factory
+  models/        tenant · users · sessions · connections · devices · ledger
+  integrations/
+    base.py      the seam: AttendanceProvider, PunchEvent, Capability, registry
+    providers/   biotime, zkteco (standalone terminals) — add a vendor here,
+                 nothing above changes
+    odoo.py      Odoo client: JSON-2 (Odoo 19+) or XML-RPC (14–18), auto-detected
+  services/
+    timeutils.py every timezone conversion, and nowhere else
+    pairing.py   punch stream → intervals. Pure, no DB, no network
+    sync_engine.py  the pipeline
+    scheduling.py   who is due, and who may dispatch. Shared by both schedulers
+    scheduler.py    the loop that runs inside the API process
+    connections.py  the only module that decrypts credentials
+  api/           deps (tenant isolation) · auth · connections · sync
+                 admin.py — the one router that crosses tenants, staff only
+  workers/       Celery app, beat schedule, per-tenant Redis lock
+  static/        the dashboard — plain ES modules, no build step
+deploy/          systemd unit · Dockerfile · compose, with restart policies
+tools/           mock BioTime server · schema init and migrate · grant_admin · proofs
+                 UI smoke · ledger dump · resync · user inspector
+                 ledger dump · resync
+```
+
+## The dashboard
+
+Served from `/app/`, with `/` redirecting there. Six screens:
+
+| Screen | What it answers |
+| --- | --- |
+| Overview | Is it running, did the last sync work, what needs me |
+| Attendance | What did BioBridge write, and did it land in Odoo |
+| Activity | Every punch ever pulled, with its state and why. Filter by device, badge and date |
+| Employees | Which badges are stuck unmatched, and fix them here |
+| Connections | Both credentials, a test button, the terminal list |
+| Settings | Pairing mode, dedupe window, shift caps, working hours |
+
+It is hand-written ES modules with no bundler, no framework and no `npm install`:
+the files you edit are the files the browser runs. That is a deliberate trade —
+this ships into customer infrastructure, and a build toolchain is one more thing
+to keep alive for a six-screen admin UI. Routing is hash-based for the same
+reason: it needs no rewrite rules from whatever proxy sits in front.
+
+The access token is held in memory only; the refresh token sits in
+`sessionStorage`, so a reload keeps you signed in and closing the tab does not.
+
+Every screen states what it is about to do before it does it — the Odoo URL
+field warns about the `/odoo` suffix that causes most failed connections, and the
+server-timezone field warns that a wrong value shifts every attendance by hours.
+
+Every timezone field (a source's server/device timezone, a tenant's own display
+timezone, both places it's set during signup or onboarding) is a plain text
+input with an `<input list>`/`<datalist>` of every IANA zone name
+(`Intl.supportedValuesOf('timeZone')`, "UTC" added back in since that API's own
+list omits it) for autocomplete-as-you-type — still free text, not a strict
+`<select>`, so an older browser without that API just loses the suggestions,
+not the field. What actually stops a bad value is the server: every schema with
+a timezone field (`app/schemas.py`'s `_validate_timezone`) rejects anything that
+isn't a real zone `zoneinfo` recognizes, so a typo is a 422 at save time instead
+of a silent fall-back to UTC three steps later in `app/services/timeutils.py`.
+
+### What did this sync fetch?
+
+Every run on Activity links to the punches it brought in — click the punch count
+on the row. The ledger then explains the arithmetic the counters hide: *read 40
+punches, added 6; the other 34 were already here.* That gap is the overlap
+re-read, deliberate and usually small: each run re-reads
+`FETCH_OVERLAP_MINUTES` of known punches, because devices upload late and their
+clocks drift.
+
+So attribution is to the run that **first ingested** a punch, not every run that
+read it. A punch is fetched many times and ingested once, and re-attributing it
+on each re-read would rewrite older runs' history under you.
+
+From a terminal:
+
+```bash
+python3 tools/show_punches.py --email you@example.com --runs   # ids and counts
+python3 tools/show_punches.py --email you@example.com --run <run-id>
+```
+
+### When someone cannot log in
+
+```bash
+python3 tools/show_users.py                          # every account
+python3 tools/show_users.py --check you@acme.com --password 'secret'
+python3 tools/show_users.py --email you@acme.com --unlock
+python3 tools/show_users.py --email you@acme.com --set-password 'new one'
+```
+
+It reads the database directly, not the API — the reason to run it is usually
+that the API will not let you in, and a diagnostic that needs the thing you are
+diagnosing is no diagnostic. It checks the schema first (a missing column breaks
+every login), then reports each account's lockout, active flag, failure count and
+last login, and `--check` verifies a password against the stored hash so "wrong
+password" is separated from "something between the browser and the database is
+broken". Hashes are never printed.
+
+Login refuses for five reasons, and they answer differently: **503** with a
+missing column, **429** while locked out after 8 failed attempts (15 minutes),
+**403** if the account is disabled, **403** at the customer door for a staff
+account with no workspace of its own (see [two doors](#two-doors-two-kinds-of-session)),
+**401** for a genuine mismatch.
+
+One to watch for on the console door: a staff member who mistypes their email
+gets the same **401** as someone whose account simply is not staff, because the
+door deliberately does not distinguish the two. If a real staff sign-in is
+refused, check `--list` before suspecting the password — and the server log,
+which records the non-staff refusal by name.
+
+### When a device platform is unreachable
+
+A sync whose BioTime server is off now reads like this, in the run list and on
+the Connections page:
+
+```
+Cannot reach BioTime at http://10.0.0.9:8090: the connection was refused —
+nothing is listening on that port. Check BioTime is running, that the port in
+the URL is the one it serves on, and that this host can reach it.
+```
+
+Four causes are separated, because they need opposite responses:
+
+| What you see | What it means |
+|---|---|
+| connection was refused | the host is up, nothing is on that port — wrong port, or BioTime is stopped |
+| hostname does not resolve | DNS; use the IP if the box has no entry |
+| nothing answered within *N*s | packets are being dropped — a firewall, or a VPN that is down |
+| accepted but did not reply | BioTime is up but slow; a shorter sync interval keeps each query's window small |
+
+Punches already in the ledger are untouched — an outage delays the push, it does
+not lose anything. One dead site does not stop the others: each source is
+fetched independently, a failed one is marked `failed` with its own message, and
+the run finishes `partial`. Only when *every* source fails does the run fail, and
+that counts towards the failure streak, so a server that stays dead is eventually
+badged `degraded` and moved to the slow lane rather than polled every few minutes
+forever.
+
+#### Finding out which layer is broken
+
+"Connection refused" is where diagnosis starts. This walks the connection
+outward and stops at the first thing that genuinely fails:
+
+```bash
+python3 tools/check_source.py                        # every active source
+python3 tools/check_source.py --tenant acme
+python3 tools/check_source.py --url http://10.0.0.9:8090 --username admin
+```
+
+```
+demo-company / Primary BioTime  —  http://localhost:8090
+  [  ok  ] URL parses: http://localhost:8090
+  [  ok  ] DNS resolves to 127.0.0.1
+  [ FAIL ] nothing accepts a connection on localhost:8090 (Connection refused)
+
+  Broken at: tcp
+
+  What to do:
+    - The connection was refused, which means the host is up and answered
+      — nothing is listening on that port.
+    - Something IS listening on localhost: port(s) 8099. If BioTime moved,
+      point the Server URL at the right one.
+```
+
+It reads the database directly rather than the API, because the reason to run it
+is usually that something is down. It writes nothing, so it is safe against
+production. Things it catches that guessing does not:
+
+- **An open port that never answers.** TCP connecting instantly and HTTP timing
+  out has three causes that look identical: a server that is merely slow, a
+  non-HTTP service on the port, and a single-threaded server wedged by an
+  abandoned connection. It sends a raw request on a bare socket with a longer
+  budget and reports which — "it IS a web server, just slower than 14s" versus a
+  banner naming what actually owns the port versus "accepted the connection,
+  then sent nothing".
+
+- **The port moved.** On a refusal it scans the ports BioTime is commonly on and
+  names the live one. On a *timeout* it deliberately does not — a filter drops
+  every port equally, so a scan there can only point at the wrong cause.
+- **`localhost` from a container.** If BioBridge is containerised, `localhost` is
+  the container, not the machine you are looking at; the port really is open and
+  really is unreachable. It says so.
+- **A bad password, not a bad network.** Reaching the auth layer at all proves
+  the network is fine.
+
+#### Generating the punches it serves
+
+```bash
+python3 tools/generate_punches.py
+python3 tools/generate_punches.py --days 10 --emp-codes 1001,0042,A7,9001
+python3 tools/generate_punches.py --tz Asia/Kolkata --check-in 08:30 --check-out 17:30
+```
+
+Writes a `punches.json` timed **relative to right now**, not to fixed clock
+values — which matters more than it sounds like it should. A punch hand-typed
+for 17:00 today, written at 15:00, sits in the future relative to any sync that
+runs before 17:00, and BioTime's own fetch window silently drops anything past
+"now" (`app/services/sync_engine.py`'s `end_utc` is capped at `utcnow + 5
+minutes` of clock-skew tolerance). The punch is simply never fetched — no error,
+no log line — and it reads exactly like a pairing bug instead of a clock
+problem. That is how "attendance records were matched only for check-ins"
+happens: the check-in was in the past, the check-out was still in the future
+when the sync ran.
+
+Re-run it whenever the file feels stale rather than keeping one around; that is
+the intended use, not a one-time fixture. Defaults to the three badges
+`tools/mock_biotime.py` already knows by name (Ahmed Sharma, Sara Tanaka, Jane
+Haddad) across the last 5 weekdays, with today's shift left open — check-in
+written, no check-out — whenever the current time is still before the
+configured check-out. That is deliberate: an in-progress shift is a real state
+worth having in the fixture, and it is a genuine test of the pairing engine's
+open-shift handling rather than an edge case to avoid.
+
+**`--tz` must match the *device source's* configured server timezone in
+BioBridge** (Connections screen), not your own machine's — `punch_time` is a
+naive local string, interpreted in whatever zone the source is set to. Getting
+this wrong does not error, it just shifts every punch by the difference and can
+push some of them outside the fetch window, which again looks like a pairing
+bug rather than a mismatched setting.
+
+#### Running the mock on the right port
+
+The mock defaults to **8099**, which is usually not what is in the connection
+form — and a port mismatch fails forever while looking exactly like a dead
+server. It prints the URL to paste, and binds loopback-only unless told
+otherwise:
+
+```bash
+python3 tools/mock_biotime.py --tenant <slug> --port 8090
+python3 tools/mock_biotime.py --tenant <slug> --host 0.0.0.0 --port 8090   # BioBridge elsewhere
+```
+
+#### Live punches (simulation)
+
+A generated file is a snapshot: once a sync has passed it, re-running the
+generator produces punches **older than the sync's cursor** and ids BioBridge
+has **already stored**, and both are skipped without a word. For a stream that
+always has something new, let the mock produce punches itself:
+
+```bash
+python3 tools/mock_biotime.py --company 4 --port 8007 --tz Asia/Kolkata --simulate --interval 20
+curl -X POST localhost:8007/mock/punch -d '{"emp_code": "5"}'                 # toggles in / out
+curl -X POST localhost:8007/mock/punch -d '{"emp_code": "5", "state": "out"}'
+curl localhost:8007/mock/state                                                # who is in / out
+```
+
+`--simulate` makes a random employee clock in or out *now* every `--interval`
+seconds (`--burst N` for more per tick), alternating in / out per person. Ids
+continue from the file's highest, starting from the current epoch second for an
+empty file, so deleting or regenerating the file never reuses one.
+`generate_punches.py` likewise continues the ids of the file it replaces.
+The roster is cached per company id in `roster_company<id>.json`, tagged with the
+Odoo server it came from; pointing the tools at a different Odoo (`--odoo-url`/
+`--odoo-db`, or a different saved connection) reads the roster afresh instead of
+serving the old one. `punches.json` is separate: at start-up the mock drops any saved
+punch whose badge is not in the current roster or whose terminal is not one of its
+terminals (it prints what it dropped), because served again they keep re-creating
+terminals and unmatched badges you deleted in BioBridge. `--keep-strays` serves them
+anyway; `--reset-punches` empties the file. `--tz` must match the connection's Server Timezone. Overlaps are still Odoo's to
+refuse: a simulated stream never overlaps itself, but it can collide with
+attendance records already in Odoo for the same time.
+
+Deleting a terminal in BioBridge removes only its row; its punches stay in the ledger.
+A terminal with real history (synced, pending, error or held punches) is restored by the
+next sync, because those punches are history of that device. One whose punches were only
+unmatched, skipped (badge deleted from the unmatched list) or deleted stays gone. To clear
+a stray terminal: delete its unmatched badges first, then delete the terminal.
+
+It runs in the foreground and dies with its terminal. If a sync that was working
+starts refusing connections after you close a shell or reboot, that is why —
+`nohup`, `tmux`, or a systemd unit alongside `deploy/biobridge.service`.
+
+It is threaded, and that is not incidental. It used to be a single-threaded
+`HTTPServer`, where one client that opened a connection and never completed a
+request blocked every subsequent one *forever* — and a browser tab left open on
+it is enough to do that. The kernel keeps accepting into the backlog, so the
+port still passes a TCP check while nothing is ever served: a sync that reads as
+a hung BioTime, on a mock that looks fine. Each connection now gets its own
+thread and goes quiet after 10 idle seconds.
+
+#### Proving the error path itself
+
+```bash
+python3 tools/outage_proof.py
+```
+
+Runs a real cycle through the real provider against a dead port, and prints the
+three places the failure surfaces — the run row, the connection status, and the
+streak.
+
+### Looking at the punch records
+
+Activity holds the ledger: every punch ever pulled, with the time the device
+reported, the same instant in UTC, the direction BioBridge decided on, the Odoo
+record it landed in, and the error if it did not. Filter by terminal, badge and
+date range; the filters live in the URL, so a filtered view is a link you can
+paste into a ticket.
+
+The same thing from a terminal, when the answer belongs in a mail or a
+spreadsheet rather than a browser:
+
+```bash
+python3 tools/show_punches.py --base http://127.0.0.1:8000 \
+    --email you@example.com --badge 1002 --from 2026-09-13 --to 2026-09-15
+python3 tools/show_punches.py --email you@example.com \
+    --device GATE-01 --state error --csv errors.csv
+```
+
+It groups by terminal, prints device-local and UTC side by side — nearly every
+"the times are wrong" report is visible right there as a constant offset — and
+repeats each distinct error in full rather than truncated into a column.
+
+### Re-pushing after you fix something in Odoo
+
+"Delete the attendance in Odoo and sync again" **re-creates nothing**, and it is
+worth knowing why before trying it on a live database. Three separate mechanisms
+stand in the way:
+
+- A punch that reached Odoo is marked `synced`, and the push step never looks at
+  it again. That is what stops every sync rewriting the whole history — so the
+  run after your deletion reports success having done nothing.
+- A punch that has failed five times is dropped from the push entirely
+  (`attempts < 5`). Past that the run reports **success with zero errors** while
+  those punches sit in `error` indefinitely. Clearing the Odoo record does not
+  revive them; only resetting the counter does.
+- Attendance is mirrored locally against the Odoo record id, so a shift
+  re-created under a new id shows up **twice** on the Attendance screen — once
+  for the dead id, once for the live one.
+
+So the recovery is: delete only the records actually in the way, put the affected
+punches back in the queue, then sync.
+
+```bash
+python3 tools/resync.py --base http://127.0.0.1:8000 --email you@example.com
+# ^ report: what is stuck, the attempt counts, and each distinct Odoo message
+
+python3 tools/resync.py --email you@example.com --reset-errors --sync
+```
+
+`--reset-synced` re-pushes punches that already landed, for when you have
+deliberately removed their Odoo records — Odoo refuses them as overlaps if you
+have not. `--prune` lists the shifts mirrored more than once. Nothing is
+destructive without a flag and a typed confirmation.
+
+`tools/ui_smoke.py` drives it in a real browser: sign up, connect both sides,
+import terminals, run a sync, read every screen, filter the ledger, and fail on
+any console error.
+
+```bash
+python3 tools/ui_smoke.py --base http://127.0.0.1:8000 \
+    --odoo-url https://your.odoo.com --odoo-db yourdb \
+    --odoo-user you@example.com --odoo-key <api-key> \
+    --shot-dir /tmp/bbshots        # a screenshot per screen
+```
+
+**Elapsed is not Odoo's Worked Hours.** The attendance table shows punch-to-punch
+time. From Odoo 17 onward `hr.attendance.worked_hours` subtracts the break in the
+employee's working schedule, so a 9-hour span can read 8.0 there. Both numbers
+are right; they measure different things.
+
+## Design notes worth knowing
+
+**Tenant isolation is one dependency.** `get_principal` derives the tenant from
+the JWT and asserts the token's `tid` matches the user row. There is no row-level
+security in the database, so every query filters on `principal.tenant.id` — an
+unscoped query is a cross-tenant leak. Routes return **404**, not 403, for an
+object belonging to another tenant, so an id's existence is never confirmed.
+`tests/test_tenant_isolation.py` holds this in place: every route needs a login
+unless it is on a short public allowlist, every route that takes an object id is
+probed with another account's ids (expects 404 and the object unchanged), and two
+accounts with the same serial numbers, badges and record numbers keep separate
+ledgers, record cursors and Odoo device-removal queues. A new route with an id in
+its path is picked up by that test automatically.
+
+**Push terminals are global, their data is not.** An ADMS serial number belongs
+to one account at a time. Removing the connection (or deleting the account)
+runs `adms.forget_owner`: the user list the terminal reported, its log stamps
+and any command still waiting for it are dropped, so the next owner inherits
+none of it. The push provider only sees a terminal its own connection holds
+(`adms.owned_by`).
+
+**Credentials are encrypted per tenant.** Fernet with a key derived via HKDF from
+the master key, salted with the tenant id, version-tagged `v1:` for rotation. A
+database dump decrypts to nothing, and one tenant's key cannot read another's
+rows. `services/connections.py` is the only module that calls `decrypt`.
+
+**Secrets are write-only by absence.** An API key appears on the input schema and
+has no field on the output schema. There is no masking helper to forget to call.
+
+**Timezones live in one module.** BioTime reports naive local wall-clock; Odoo
+stores naive UTC. Getting it wrong does not raise — it produces plausible
+attendance that is hours out, which is why `timeutils.py` has its own test suite.
+
+**Failures are graded.** A configuration problem (`SyncAborted`) does not count
+towards the failure streak, so a tenant mid-onboarding is never slow-laned. A
+genuine outage does, and at five consecutive failures connections are marked
+degraded and polling drops to a quarter rate.
+
+**Per-source isolation.** Each device source is fetched in its own try/except. One
+unreachable site does not skip every other site's punches — with several sources,
+letting a failure propagate is data loss disguised as a failed run.
+
+**Odoo's constraints are respected by construction.** At most one open attendance
+per employee, no overlapping intervals, `check_in`/`check_out` naive UTC, and
+`worked_hours` computed by Odoo — never written.
+
+## Configuration
+
+Everything is environment driven; see `.env.example`. The values that matter
+most:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DATABASE_URL` | SQLite file | Postgres in production |
+| `REDIS_URL` | *(empty)* | Empty means no broker: syncs run inline, and the API schedules |
+| `SCHEDULER_MODE` | `auto` | `auto` · `inprocess` · `celery` · `off` |
+| `SCHEDULER_TICK_SECONDS` | 60 | How often the loop wakes, not the sync frequency |
+| `SCHEDULER_CONCURRENCY` | 4 | Accounts synced at once |
+| `MASTER_ENCRYPTION_KEY` | dev value | **Back this up.** Rotating it invalidates every stored credential |
+| `JWT_SECRET` | dev value | |
+| `FETCH_OVERLAP_MINUTES` | 15 | How far before the cursor to re-read |
+| `ALLOW_PRIVATE_NETWORK_TARGETS` | true | Set false in a public deployment |
+| `CORS_ORIGINS` | *(empty)* | Empty = same-origin only |
+
+The app refuses to boot when `ENVIRONMENT=production` and any of the secrets are
+still the development defaults, or `CORS_ORIGINS` is `*`.
+
+## Not in this pass
+
+Deliberately scoped out, each additive: Stripe billing and plan limits, alert
+rules and notifications, and the staff/platform console. The seams for all of
+them are in place — the audit log and the role model.
+
+Two items formerly listed here are done: a second provider (ZKTeco standalone
+terminals — see `app/integrations/providers/zkteco.py`) and the reverse
+mapping direction, provisioning Odoo's roster onto a provider — see
+"Employee mapping" below.
+
+
+## Connection kinds
+
+Each provider declares the kinds it can be added under (`AttendanceProvider.kinds`),
+and the wizard and `POST /api/v1/sources` both enforce it:
+
+- **Platform server** — BioTime, BioStar 2, HikCentral Professional, Hik-Connect for Teams, COSEC CENTRA, CrossChex Cloud.
+- **Standalone device** — ZKTeco protocol, Hikvision ISAPI, Dahua, Matrix COSEC, Cams gateway (plus
+  the ZKTeco cloud-push card).
+
+BioTime used to be offered under both, from before there were real device
+protocols. Connections saved that way keep working. To re-file them as
+platform connections after upgrading:
+
+    python3 tools/fix_connection_kinds.py            # report
+    python3 tools/fix_connection_kinds.py --apply    # fix
+
+
+## Registration from the website
+
+The marketing site (separate folder, see its README) is where customers sign
+up. Set `SITE_URL` to its address and add that origin to `CORS_ORIGINS`.
+
+- `GET /api/v1/public/plans` — active plans, with `can_buy_online`.
+- `POST /api/v1/public/register` — `mode: "trial"` creates the account now
+  (trialing, no card); `mode: "buy"` returns a Stripe Checkout URL and creates
+  the account only when the `checkout.session.completed` webhook confirms
+  payment (a `pending_signup` row carries the details until then).
+- Either way the owner has **no password** until they confirm their email.
+  `POST /api/v1/auth/verify-email` then generates one and emails the login
+  details (address + password). Signing in before that says "confirm your
+  email first".
+- The first sign-in with the emailed password must set a new one
+  (`POST /api/v1/auth/change-password`); workspace routes refuse until then.
+  Customers can change it any time under Settings → Password.
+- `POST /api/v1/public/resend` — "didn't get the email": a new confirmation
+  link, or new login details if the emailed password was never used. Same
+  answer whether or not the address exists.
+- Registration and resend are rate limited per IP
+  (`REGISTRATION_RATE_PER_HOUR`) and the form has a hidden honeypot field.
+- Mail goes out through the server set in the staff console under
+  **Platform → Email server** (stored in `platform_setting`, password
+  encrypted). With nothing saved there, `SMTP_*` from `.env` is used; with
+  neither, emails are only logged. The page has a Gmail preset and a
+  "Send test email" button. On Gmail / Workspace use an App Password on
+  `smtp.gmail.com:587` (STARTTLS), and a From address that is the account or a
+  verified "Send mail as" alias. In production run `python3 tools/init_db.py`
+  once after upgrading so the `platform_setting` table exists.
+
+Run `python3 tools/migrate.py --apply` to add the `pending_signup` table and
+the two new `app_user` columns.
+
+
+## Cloud push devices (ZKTeco ADMS)
+
+A third kind of biometric connection, beside BioTime and standalone ZKTeco:
+the terminal sends its punches to BioBridge itself, through its **Cloud Server
+Setting** (called ADMS on some models). Works for ZKTeco and ZKTeco-built
+terminals (eSSL, Realtime, Biomax, newer FingerTec), and needs nothing opened
+on the customer's network.
+
+**Customer setup:** Settings → Biometric → + Add connection → *Cloud push
+device*: name, location, the device's serial number and its timezone. On the
+device: Comm. → Cloud Server Setting → server address and port as shown in
+the form (`ADMS_SERVER_HOST` / `ADMS_SERVER_PORT`), HTTPS off. Test connection
+turns green once the device has called in.
+
+**How it works** (`app/api/adms.py`, `app/services/adms.py`,
+`app/integrations/providers/zkteco_adms.py`):
+
+- Terminals call `/iclock/cdata` (handshake, then `table=ATTLOG` punch uploads),
+  `/iclock/getrequest` (heartbeat every 30 s; replies carry queued commands) and
+  `/iclock/devicecmd` (command results). `.aspx` variants are served too.
+- Punches are written to the punch ledger as they arrive (deduplicated on
+  serial + PIN + time, so re-sends are harmless). The next sync run claims
+  them, pairs them and writes attendance to Odoo — no fetch needed.
+- A serial is claimed by one account platform-wide (`adms_device`). Uploads
+  from an unclaimed serial are refused, so the terminal keeps them and re-sends
+  once it's added. Removing the connection releases the serial.
+- An offline terminal marks the connection failed ("last called in …") but
+  never stops punches that already arrived from reaching Odoo.
+- On adding, BioBridge queues `DATA QUERY USERINFO` and `INFO`, so it learns
+  who is enrolled and the model. "Provision Odoo employees onto the device"
+  queues `DATA UPDATE USERINFO` commands the terminal picks up on its next
+  heartbeat (identity only — fingerprints and faces are enrolled on the device).
+
+**Deployment:** `/iclock/` must be reachable over plain HTTP on the advertised
+host and port (many terminals can't do HTTPS). If a reverse proxy forces
+HTTPS, exempt `/iclock/`. Run `python3 tools/migrate.py --apply` for the
+`adms_device` and `adms_command` tables.
+
+**Not tested against physical hardware here** — the protocol is implemented
+from ZKTeco's published "Attendance PUSH Communication Protocol" and tested
+against a simulated terminal (`tests/test_adms_push.py`). Pilot one real
+terminal before relying on it.
+
+
+## Hikvision terminals (ISAPI)
+
+Provider `hik_isapi` ("Hikvision terminal (ISAPI)"), offered under *Standalone
+device* → Protocol. BioBridge reaches the terminal directly over HTTP(S) with
+Digest auth, using its admin (or an access-control operator) account — like a
+standalone ZKTeco terminal, the device must be reachable from the server.
+
+- **Test / terminal:** `GET /ISAPI/System/deviceInfo` (model, serial, name).
+- **Punches:** `POST /ISAPI/AccessControl/AcsEvent?format=json`, major 5 over
+  the sync window, 30 per page with one searchID. Kept: events naming an
+  employee (door, alarm and stranger events carry none). A terminal that
+  rejects minor 0 is asked per success code (face 75, fingerprint 38/113,
+  card 1, 104). `attendanceStatus` (checkIn/checkOut/break/overtime) gives
+  direction when the terminal's attendance mode is on. De-duplicated on
+  device serial + the event's serialNo. Times carry the device's offset.
+- **Employees:** `UserInfo/Search` to read, `UserInfo/Record` to create
+  (identity only), so provisioning Odoo employees onto the device works.
+- Errors are specific: unreachable, wrong password (five tries lock the device
+  account for 30 minutes), no access-control rights, not an access terminal.
+
+Code `app/integrations/providers/hikvision.py`; tests `tests/test_hikvision.py`
+use a simulated terminal with real Digest auth. **Not yet run against a
+physical terminal** — pilot one before relying on it. HikCentral / Hik-Connect
+(cloud) are separate integrations, not built.
+
+
+## Suprema BioStar 2
+
+Provider `biostar2` ("Suprema BioStar 2"), offered under *Platform server* →
+Platform, beside BioTime. One connection is the customer's BioStar 2 server;
+its terminals come in through **Import terminals**.
+
+- **Login:** `POST /api/login` with a BioStar 2 operator; the `bs-session-id`
+  header is reused (and cached between runs); a 401 logs in again once.
+- **Punches:** `POST /api/events/search`, datetime *between* the sync window
+  (UTC), ordered by time, re-issued from the last row's time and de-duplicated
+  on the event id (no offset support assumed). Kept: successful
+  authentications — codes 0x1000–0x10FF (1:1), 0x1300–0x13FF (1:N),
+  0x1500–0x15FF (dual). `tna_key` gives direction (1 in, 2 out, 3/5 break or
+  meal start = out, 4/6 end = in).
+- **Terminals:** `GET /api/devices` (device id as serial, name, type, IP, group).
+- **Employees:** `GET/POST /api/users` — provisioning works for numeric user
+  ids (BioStar 2's default); new users go into group 1 (All Users).
+- **HTTPS:** BioStar 2 ships with a self-signed certificate; the form's
+  "HTTPS certificate" option defaults to accepting it.
+
+Code `app/integrations/providers/biostar2.py`; tests `tests/test_biostar2.py`
+use a simulated server. **Not yet run against a live BioStar 2** — pilot one.
+
+
+## Matrix COSEC terminals
+
+Provider `cosec` ("Matrix COSEC terminal"), under *Standalone device* →
+Protocol. BioBridge calls the device's own API (`/device.cgi/…`, HTTP Basic,
+factory login admin / 1234), so the device must be reachable from the server.
+
+- **Test:** `device-basic-config?action=get` (device name). The API reports
+  no serial number, so the terminal is identified by its address.
+- **Punches:** `events?action=getevent&roll-over-count=&seq-number=&no-of-events=100`.
+  The log is addressed by (roll-over, sequence), not time, so the provider
+  keeps a cursor in the connection's config (`cosec_cursor`), saved by the
+  sync engine only after the punches are stored (a generic `config_updates`
+  hook any provider can use). The first sync reads from the start of the log,
+  up to 400 requests per run, continuing next run. When a roll-over's
+  sequence runs out, the next roll-over is read. Kept: event-id 101–110
+  (user allowed) with a user in detail-1; detail-3 0 = entry, 1 = exit.
+  Changing the device address resets the cursor.
+- **Employees:** `users?action=get|set` one at a time — provisioning checks
+  each id and creates numeric ids (up to 8 digits). There's no list call, so
+  "already on the device" can't be counted up front.
+
+Code `app/integrations/providers/cosec.py`; tests `tests/test_cosec.py` with a
+simulated device (Basic auth, ring buffer that rolls over). **Not yet run
+against a physical COSEC device** — pilot one. For a site that runs COSEC
+CENTRA, connect the server instead (next section). The COSEC Devices PUSH API
+is not built.
+
+
+## Matrix COSEC CENTRA
+
+Provider `cosec_centra` ("Matrix COSEC CENTRA"), under *Platform server* →
+Platform. One connection = one COSEC CENTRA (or older COSEC server)
+installation, which already collects punches from all its panels and
+terminals: server URL (`http://<server>/cosec`), the `sa` login (the API
+accepts only the System Administrator account), password, server timezone.
+
+- The API is a WCF service at `<server>/cosec/api.svc/<module>` with
+  **semicolon**-separated parameters, so URLs are built by hand, not by the
+  HTTP client: `event-ta-date?action=get;daterange=DDMMYYYYHHMMSS-DDMMYYYYHHMMSS;format=xml`.
+  HTTP Basic auth.
+- Read one day per request (a 30-day first backfill is 30 small requests),
+  at most 45 days per run.
+- The reply's columns come from the customer's **API template** (COSEC:
+  Admin → Utility → API Configuration → T&A events), so fields are recognised
+  by name rather than fixed tags: user id (`UserID`, `EmpCode`, `ReferenceCode`…),
+  date-time (one `EventDateTime`, or `EDate` + `ETime`), and optionally
+  index, entry/exit (0/IN/Entry, 1/OUT/Exit) and device. The connection test
+  fails with instructions if the template lacks a user id or date/time. A
+  flat `<Response-Code>` reply other than 0 is shown as an error.
+- De-duplicated on server + index number when the template includes it,
+  otherwise server + user + time + device. Panels are learnt from the punches
+  (the device column is the terminal), so there is no Import terminals.
+  Read punches only — no employee provisioning.
+
+Code `app/integrations/providers/cosec_centra.py`; tests
+`tests/test_cosec_centra.py` against a simulated server with two different
+templates. Built from Matrix's technical mailers MTSM-11 and MTSM-18. **Not yet
+run against a live CENTRA** — pilot one, and check its template's tag names
+against the recognised ones.
+
+
+## HikCentral Professional
+
+Provider `hikcentral` ("HikCentral Professional"), under *Platform server* →
+Platform. One connection = one HCP server with the **OpenAPI** add-on installed
+(matched to the HCP version): server URL (`https://<server>`, default 443),
+partner key (AK) and secret (SK), server timezone, and whether to accept HCP's
+self-signed certificate. BioBridge must reach the server (VPN / forwarded port),
+like BioTime.
+
+- Every call is a JSON `POST` to `/artemis/api/…`, signed per request (no
+  session): `X-Ca-Signature = base64(HMAC-SHA256(SK, "POST\n*/*\napplication/json\n"
+  "x-ca-key:…\nx-ca-nonce:…\nx-ca-timestamp:…\n<path>"))`, with `X-Ca-Key`,
+  `X-Ca-Nonce`, `X-Ca-Timestamp`, `X-Ca-Signature-Headers`. Replies `{"code": "0", "data": …}`.
+  A wrong server clock makes signatures fail — the error says so.
+- `acs/v1/door/events` with `startTime`/`endTime` (ISO with offset), 100 per
+  page, at most 31 days per run. Events without a person (door/alarm) are
+  skipped. `inAndOutType` 1 = in, 0 = out. If the server refuses a search
+  without `eventType`, the access-granted types 198914 (card) and 196893 (face)
+  are asked for one at a time and merged.
+- Events name HCP's internal `personId`; `resource/v1/person/personList` is read
+  once per run (only when there are events) to get each person's `personCode` —
+  HCP's **Employee ID**, which is what matches Odoo. People without one are
+  skipped and logged.
+- De-duplicated on server + `eventId`. Each door becomes a terminal
+  (`<host>:door<index>`, named after the door) — no Import terminals. Read
+  punches only.
+
+Code `app/integrations/providers/hikcentral.py`; tests `tests/test_hikcentral.py`
+against a simulated OpenAPI server that verifies every signature. **Not yet run
+against a live HCP** — pilot one; confirm the event types and the `personList`
+fields on the customer's HCP version.
+
+
+## Dahua terminals
+
+Provider `dahua` ("Dahua terminal"), under *Standalone device* → Protocol. BioBridge
+calls the terminal's own HTTP API (`/cgi-bin/…`, admin login), so the device must
+be reachable from the server (VPN / forwarded port), like standalone Hikvision.
+
+- Auth: HTTP Digest; if a device answers only a Basic challenge (older firmware)
+  the provider switches to Basic. Replies are plain `key=value` lines.
+- **Test / terminal:** `magicBox.cgi?action=getSystemInfo` → `serialNumber`,
+  `deviceType` (falls back to `getSerialNo`). The terminal's serial is the device's.
+- **Punches:** `recordFinder.cgi?action=find&name=AccessControlCardRec&StartTime=&EndTime=&count=500`,
+  a day at a time, ≤45 days per run. `CreateTime` is UTC epoch seconds. Kept:
+  `Status=1` records with a `UserID` (the device's person id — matches the Odoo
+  employee). Direction from `AttendanceState` (CheckIn/CheckOut/Break…/Overtime…),
+  else `Type` (Entry/Exit), else left to pairing. `Method` 15 face / 6 fingerprint /
+  1 card / 0 password is recorded as the verify type.
+- **Paging:** when `totalCount` exceeds `found`, the next query starts at the last
+  record's `CreateTime` and the overlap is dropped by `RecNo`.
+- **Times:** StartTime/EndTime go out as epoch seconds; a firmware that answers
+  `Error` to that is asked again with the device's local `YYYY-MM-DD HH:MM:SS`
+  (remembered for the run). Set the device timezone correctly either way.
+- Read punches only. Employee provisioning isn't built — Dahua's user-write
+  calls aren't public enough to build blind.
+
+Code `app/integrations/providers/dahua.py`; tests `tests/test_dahua.py` against a
+simulated terminal doing real Digest and Basic auth, paging and both time styles.
+**Not yet run against a physical Dahua terminal** — pilot one. Points to check: the
+CreateTime zone on that firmware, `AttendanceState` presence, the Digest/Basic choice.
+
+
+## Cams Biometrics (cloud gateway)
+
+Provider `cams` ("Cams Biometrics (cloud gateway)"), under *Standalone device* →
+Protocol. Cams makes its own terminals and, through its Biometric Gateway, fronts
+100+ other brands; the device talks to the Cams cloud and applications use one
+JSON Web API (3.0). Each registered device has its own **Service Tag ID**
+(`stgid`) and **AuthToken** in the customer's *API Monitor* account, so one
+connection = one device: endpoint URL, Service Tag ID, AuthToken, device timezone.
+
+- BioBridge uses the RESTful side (BioBridge → Cams), not the real-time callback:
+  `POST <endpoint>?stgid=…` with `AuthToken`, `OperationID`, `Time`
+  (`YYYY-MM-DD HH:mm:ss GMT +0530`) in the body.
+- Punches: `Load.PunchLog.Filter {StartTime, EndTime}` a week at a time (Cams
+  recommends ≤30 days), at most 31 days per run. `Type` CheckIn / BreakIn /
+  OverTimeIn / MealIn are entries; the *Out* kinds are exits. `LogTime` carries
+  its own offset and is converted to the device timezone.
+- Terminal: `Load.DeviceInformation "All"` names the model; the terminal's serial
+  is the Service Tag ID. De-duplicated on stgid + user + UTC time.
+- Customer must add BioBridge's server address as an allowed origin in API
+  Monitor (status 3, "invalid origin", otherwise). Each status code is explained
+  in the test result. A REST call takes ~15 s at Cams, so space syncs 5+ minutes.
+- Read punches only; the real-time callback (device → BioBridge) is not built.
+- Duplicate check is by Service Tag ID.
+
+Code `app/integrations/providers/cams.py`; tests `tests/test_cams.py` against a
+simulated gateway. **Not yet run against a live Cams account** (a free sandbox
+API key is available from Cams) — pilot one.
+
+
+## Hik-Connect for Teams
+
+Provider `hikconnect` ("Hik-Connect for Teams"), under *Platform server* →
+Platform. One connection = one Hik-Connect **for Teams** account (formerly
+HikCentral Connect): region (Europe `ieu.` / North America `ius.hikcentralconnect.com`),
+app key and secret key from Team Management → API Integration. Hikvision
+terminals in the team reach the cloud over P2P, so nothing on the customer's
+network is involved. The free consumer Hik-Connect app has no API.
+
+- All calls are JSON `POST`s under `<region>/api/hccgw/`; replies are
+  `{"errorCode": "0", "data": …}`.
+- `platform/v1/token/get` with `appKey` / `secretKey` → `accessToken`, sent as a
+  `Token:` header. Cached between runs; renewed once if refused. If the reply
+  names an `areaDomain` it is used — only if it is a `*.hikcentralconnect.com`
+  host, so the token is never sent elsewhere.
+- `attendance/v1/records/get` with `startTime`/`endTime` (ISO with offset),
+  `pageNo`/`pageSize` 100, at most 31 days per run.
+- Record fields are recognised by name (person code, time, device serial/name,
+  in/out status — also inside a nested `personInfo`/`deviceInfo`), because
+  Hikvision's partner guide isn't public. The connection test fails and lists
+  the fields it saw if a record has no person code or time.
+- De-duplicated on the record id when present, otherwise device + person + UTC
+  time. Terminals learnt from punches; no Import terminals; read punches only.
+  Duplicate check is by app key (every team in a region shares the host).
+
+Code `app/integrations/providers/hikconnect.py`; tests `tests/test_hikconnect.py`
+against a simulated cloud with two record shapes. **Not yet run against a live
+team** — the token call is confirmed by public examples; the attendance
+endpoint and record fields need checking against a real account or the partner
+guide (tpp.hikvision.com).
+
+
+## Anviz CrossChex Cloud
+
+Provider `crosschex` ("Anviz CrossChex Cloud"), under *Platform server* →
+Platform. One connection = one CrossChex Cloud account: region (US / EU /
+Asia-Pacific API root), API key and API secret. Nothing on the customer's
+network is involved — Anviz terminals report to CrossChex Cloud themselves.
+
+- Every call is one `POST` to the region root with `header` (nameSpace,
+  nameAction, version, requestId, timestamp), `authorize` (token) and `payload`.
+- `authorize.token/token` → token (cached between runs; renewed once if refused).
+- `attendance.record/getrecord` with begin/end time (ISO with offset), ascending,
+  1000 per page, following `pageCount`. `checktype` 0 = in, 1 = out, others
+  (e.g. 128) left to pairing. De-duplicated on device serial + workno + UTC time.
+- Terminals are learnt from the punches (each carries its device), so the card
+  has no Import terminals button. No employee provisioning (read punches only).
+- Duplicate check is by API key, not address — every account in a region shares
+  the same host.
+
+Code `app/integrations/providers/crosschex.py`; tests `tests/test_crosschex.py`
+use a simulated service. **Not yet run against a live CrossChex Cloud account.**
+
+
+## Lead pipeline
+
+Website enquiries (`contact_request`) are worked as a pipeline in the staff
+console (Platform → Leads): **New → Contacted → Qualified → Won / Lost**.
+A board (drag a card to a column) and a list (with a filter menu: stage, demo
+status, clear all) share one API. Clicking a lead opens a wizard with a status bar.
+
+- `contact_request.status` holds the stage (`PIPELINE_STAGES` in
+  `app/models/contact.py`); `stage_changed_at` says how long a lead has sat
+  there, `lost_reason` why one was lost (cleared if the lead is revived).
+  Movement is free in both directions.
+- `contact_event` is the history: an opening "came in as New" entry (written
+  by `POST /public/contact`), one `stage` entry per move, and `note` entries
+  staff add. Saving without changing the stage writes nothing.
+- API (all staff-only): `GET /admin/contact-requests[?status=open|<stage>]`,
+  `GET /admin/contact-requests/pipeline` (count per stage, open, won, lost,
+  conversion = won ÷ (won + lost), average days new → won),
+  `PATCH /admin/contact-requests/{id}` (`status`, `demo_status`, `notes`, `lost_reason`),
+  `GET|POST /admin/contact-requests/{id}/events`.
+- Migration `0004` renames the old statuses (`demo_booked` → `demo`,
+  `closed` → `lost`) and gives every existing lead an opening history entry.
+- **Demo is a sub-stage of Contacted**, not a stage: `contact_request.demo_status`
+  is `pending`, `scheduled` or `completed` (or null). A lead that asked for a
+  demo (topic Demo, or a preferred date) gets `pending` automatically when it
+  is first moved to Contacted; staff change it in the wizard (click the active
+  choice to clear it). It cannot be set while the lead is still New, and it
+  stays on the lead after it moves on. Each change is a `demo` entry in the
+  history. It shows as a pill on board cards and in the list.
+- Migration `0006` gives already-contacted/qualified demo leads a `pending` demo.
+- Migration `0005` adds `demo_status` and turns leads that sat in the old
+  `demo` stage into Contacted with `demo_status = scheduled`.

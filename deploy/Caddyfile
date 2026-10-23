@@ -1,0 +1,43 @@
+# OdooBridger's front door. {$VAR} values come from docker-compose.prod.yml.
+{
+	email {$ACME_EMAIL}
+}
+
+(secure) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+# The website (odoobridger.com): served by the core.
+{$SITE_DOMAIN} {
+	import secure
+	@app path /app /app/* /staff /staff/* /api/* /.well-known/*
+	redir @app https://{$CORE_DOMAIN}{uri}
+	reverse_proxy core:8000
+}
+
+# The core: portal (/app), staff console (/staff), API, SSO, Stripe webhook.
+{$CORE_DOMAIN} {
+	import secure
+	reverse_proxy core:8000
+}
+
+# The biometric service (BioBridge).
+{$BIOMETRIC_DOMAIN} {
+	import secure
+	reverse_proxy biobridge:8000
+}
+
+# ZKTeco ADMS push terminals speak plain HTTP to /iclock/ only.
+http://:{$ADMS_PORT} {
+	@iclock path /iclock /iclock/*
+	handle @iclock {
+		reverse_proxy biobridge:8000
+	}
+	respond 404
+}
