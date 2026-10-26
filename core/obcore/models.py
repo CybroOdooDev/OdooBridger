@@ -393,8 +393,13 @@ class RelayAgent(Base, UUIDPk, Timestamped):
     #: What the agent last said about itself.
     version: Mapped[str | None] = mapped_column(String(20))
     hostname: Mapped[str | None] = mapped_column(String(120))
-    #: The origins its configuration lets it forward to ("http://192.168.1.20:8069").
+    #: The limit set on the agent's own computer (OB_ALLOW), as it last reported.
+    #: Empty for agents installed with only their key (the usual case).
     allowed: Mapped[list | None] = mapped_column(JSON)
+    #: What it may reach, managed here ("192.168.1.20:8069", "10.0.11.43:4370",
+    #: "192.168.1.0/24@80+443"): added when an Odoo or a device is connected
+    #: through it, or by hand in the portal, and sent to the running agent.
+    managed_allowed: Mapped[list | None] = mapped_column(JSON)
     last_ip: Mapped[str | None] = mapped_column(String(64))
     connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -199,7 +199,7 @@ class CosecCentraProvider(AttendanceProvider):
         if self._client is None:
             self._client = httpx.Client(auth=(self.config.username or "sa", self.config.password or ""),
                                         verify=self.config.verify_ssl,
-                                        timeout=settings.http_timeout_seconds, transport=TRANSPORT)
+                                        timeout=settings.http_timeout_seconds, transport=self.config.transport or TRANSPORT)
         return self._client
 
     def close(self) -> None:

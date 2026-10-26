@@ -187,7 +187,7 @@ class DahuaProvider(AttendanceProvider):
     def _http(self) -> httpx.Client:
         if self._client is None:
             self._client = httpx.Client(base_url=self.base, verify=self.config.verify_ssl,
-                                        timeout=settings.http_timeout_seconds, transport=TRANSPORT)
+                                        timeout=settings.http_timeout_seconds, transport=self.config.transport or TRANSPORT)
         return self._client
 
     def close(self) -> None:

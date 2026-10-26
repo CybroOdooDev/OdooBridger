@@ -150,7 +150,7 @@ class CosecProvider(AttendanceProvider):
         if self._client is None:
             self._client = httpx.Client(
                 base_url=self.base, auth=(self.config.username or "", self.config.password or ""),
-                verify=self.config.verify_ssl, timeout=settings.http_timeout_seconds, transport=TRANSPORT)
+                verify=self.config.verify_ssl, timeout=settings.http_timeout_seconds, transport=self.config.transport or TRANSPORT)
         return self._client
 
     def close(self) -> None:

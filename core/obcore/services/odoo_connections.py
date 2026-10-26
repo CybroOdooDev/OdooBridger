@@ -88,6 +88,18 @@ def _keys(url: str, db_name: str, agent_id: str | None) -> tuple[str, str]:
     return (f"agent:{agent_id}/{ukey}" if agent_id else ukey), odoo_probe.db_key(db_name)
 
 
+def _reach(db: Session, agent, url: str) -> None:
+    """Through an agent: make sure it may reach this Odoo (sent to it live)."""
+    if agent is None:
+        return
+    from obcore.services import agent_addresses
+
+    try:
+        agent_addresses.add(db, agent, url)
+    except agent_addresses.AddressError as exc:
+        raise OdooConnectionError(str(exc)) from exc
+
+
 def _probe(url: str, db_name: str, login: str, key: str, agent_id: str | None):
     try:
         return odoo_probe.probe(url, db_name, login, key, agent_id=agent_id)
@@ -148,6 +160,7 @@ def test(db: Session, conn: OdooConnection) -> bool:
     """Run the core's test on a saved connection. Records the outcome; never raises."""
     before = (conn.status, conn.odoo_version, conn.api, conn.companies)
     try:
+        _reach(db, conn.relay_agent, conn.url)
         result = odoo_probe.probe(conn.url, conn.db_name, conn.login, api_key(conn), agent_id=conn.relay_agent_id)
         if result.db_uuid and result.db_uuid != conn.db_uuid:
             _check_free(db, conn.account, conn.url_key, conn.db_key, result.db_uuid, exclude_id=conn.id)
@@ -193,6 +206,7 @@ def create(db: Session, account: Account, *, url: str, db_name: str, login: str,
         raise OdooConnectionError("Enter the database name.")
     ukey, dkey = _keys(url, db_name, agent_id)
     _check_free(db, account, ukey, dkey, None)
+    _reach(db, agent, url)
     result = _probe(url, db_name, login, api_key_value, agent_id)
     _check_free(db, account, ukey, dkey, result.db_uuid)
     conn = OdooConnection(account_id=account.id, name=(name or "").strip() or "Odoo", url=url, db_name=db_name,
@@ -228,6 +242,7 @@ def update(db: Session, conn: OdooConnection, *, url: str | None = None, db_name
     if credentials_changed:
         ukey, dkey = _keys(new_url, new_db, new_agent_id)
         _check_free(db, conn.account, ukey, dkey, None, exclude_id=conn.id)
+        _reach(db, agent, new_url)
         result = _probe(new_url, new_db, new_login, new_key, new_agent_id)
         if (ukey, dkey) != (conn.url_key, conn.db_key) and result.db_uuid != conn.db_uuid and conn.db_uuid:
             # Pointing the connection at another database: the services' data
@@ -305,6 +320,29 @@ def refresh_readiness(db: Session, conn: OdooConnection, *, live: bool = False) 
             continue
         record_readiness(db, row, (usage or {}).get("odoo"))
     db.flush()
+
+
+def recheck_through_agent(agent_id: str) -> None:
+    """An agent just came online: test the Odoo connections that go through it
+    and have each bound service check again, so nothing has to be re-saved or
+    restarted for them to start working. Runs in a worker thread."""
+    from sqlalchemy import select
+
+    from obcore.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        conns = db.scalars(select(OdooConnection).where(OdooConnection.relay_agent_id == agent_id)).all()
+        for conn in conns:
+            test(db, conn)
+            db.commit()
+            refresh_readiness(db, conn, live=True)
+            db.commit()
+    except Exception:  # noqa: BLE001 — best effort; the regular sweep tries again
+        log.exception("Recheck through agent %s failed", agent_id)
+        db.rollback()
+    finally:
+        db.close()
 
 
 def notify_failures(db: Session, *, now: datetime | None = None) -> int:

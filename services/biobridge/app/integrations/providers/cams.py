@@ -157,7 +157,7 @@ class CamsProvider(AttendanceProvider):
     def _http(self) -> httpx.Client:
         if self._client is None:
             self._client = httpx.Client(timeout=max(settings.http_timeout_seconds, 45),
-                                        verify=self.config.verify_ssl, transport=TRANSPORT)
+                                        verify=self.config.verify_ssl, transport=self.config.transport or TRANSPORT)
         return self._client
 
     def close(self) -> None:

@@ -35,6 +35,7 @@ from app.integrations.base import (
     Capability, EmployeeRecord, IdFilterUnsupported, ProviderError, UnsupportedCapability,
 )
 from app.integrations.odoo import OdooAuthError, OdooClient, OdooError, parse_dt
+from app.integrations.relay import explain
 from app.models import (
     AttendanceRecord,
     ConnectionStatus,
@@ -225,10 +226,10 @@ class SyncEngine:
                     reachable += 1
                 except (ProviderError, UnsafeTargetError) as exc:
                     source.status = ConnectionStatus.failed.value
-                    source.status_message = str(exc)[:500]
+                    source.status_message = explain(exc)[:500]
                     source.last_checked_at = datetime.now(timezone.utc)
                     self.run.error_count += 1
-                    self._log(f"'{source.name}' unreachable: {exc}", "error")
+                    self._log(f"'{source.name}' unreachable: {explain(exc)}", "error")
 
             if reachable == 0:
                 # The run list shows this message and nothing else, so it has to
@@ -320,8 +321,8 @@ class SyncEngine:
             # handler below would swallow it and skip the streak.
             self.tenant.consecutive_failures += 1
             self.run.status = SyncStatus.failed.value
-            self.run.error_message = str(exc)
-            self._log(str(exc), "error")
+            self.run.error_message = explain(exc)
+            self._log(explain(exc), "error")
             self._mark_degraded_if_needed()
         except SyncAborted as exc:
             self.run.status = SyncStatus.failed.value

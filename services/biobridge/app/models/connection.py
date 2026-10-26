@@ -183,6 +183,11 @@ class DeviceSource(Base, UUIDPk, Timestamped):
         return (self.config or {}).get("company_id")
 
     @property
+    def relay_agent_id(self) -> str | None:
+        """The customer's OdooBridger Agent this device is reached through (platform mode)."""
+        return (self.config or {}).get("relay_agent_id") or None
+
+    @property
     def default_company_name(self) -> str | None:
         return (self.config or {}).get("company_name")
 

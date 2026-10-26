@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from app.core.config import settings
 from app.core.crypto import decrypt
 from app.integrations import providers as _providers  # noqa: F401 — registers the catalogue
-from app.integrations.base import AttendanceProvider, SourceConfig, build_provider
+from app.integrations.base import AttendanceProvider, SourceConfig, build_provider, get_provider_class
 from app.integrations.odoo import OdooClient, OdooCredentials
 from app.models import DeviceSource, OdooConnection, Tenant
 
@@ -84,6 +84,8 @@ def build_source_provider(tenant: Tenant, source: DeviceSource, db=None) -> Atte
     run BioTime at one site and something else at another.
     """
     options = dict(source.config or {})
+    transport = None
+    tcp_connect = None
     if (source.provider or "") == "zk_adms":
         # A push device is never dialled — nothing to guard — but reads its
         # traffic from the database, so it gets this source's session.
@@ -92,6 +94,20 @@ def build_source_provider(tenant: Tenant, source: DeviceSource, db=None) -> Atte
         options["_db"] = db or object_session(source) or object_session(tenant)
         options["_source_id"] = source.id
         options["_tenant_id"] = tenant.id
+    elif options.get("relay_agent_id") and settings.platform_mode and tenant.platform_account_id:
+        # A device on the customer's own network, reached through their agent:
+        # its address is private on purpose and is only ever dialled there.
+        from app.integrations.relay import PlatformRelayTcp, PlatformRelayTransport
+
+        provider_cls = get_provider_class(source.provider or "biotime")
+        if not provider_cls.relay_capable:
+            raise UnsafeTargetError(
+                f"{provider_cls.label} can't be reached through the OdooBridger Agent yet. "
+                "Use a device that offers a web (HTTP) interface, or connect it another way.")
+        if provider_cls.relay_kind == "tcp":
+            tcp_connect = PlatformRelayTcp(tenant.platform_account_id, options["relay_agent_id"])
+        else:
+            transport = PlatformRelayTransport(tenant.platform_account_id, agent_id=options["relay_agent_id"])
     else:
         assert_safe_url(source.base_url)
 
@@ -109,6 +125,8 @@ def build_source_provider(tenant: Tenant, source: DeviceSource, db=None) -> Atte
             verify_ssl=source.verify_ssl,
             timezone=source.server_timezone,
             options=options,
+            transport=transport,
+            tcp_connect=tcp_connect,
         ),
     )
 

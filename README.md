@@ -86,15 +86,19 @@ it writes).
 * In production the core refuses Odoo addresses in private networks
   (`ODOO_ALLOW_PRIVATE_TARGETS`), so a customer can't make it call internal hosts.
   BioBridge in platform mode does the same by default (`ALLOW_PRIVATE_NETWORK_TARGETS`).
-* **A private Odoo** (on-premise, behind NAT) is reached through the
-  **OdooBridger Agent** (`agent/`): the customer runs it in their network, it
-  dials out to the core's relay hub (`wss://<core>/relay/v1/agent`) and only
-  ever forwards to the addresses in its `OB_ALLOW`. The connection is saved with
-  the agent as its route and its private address; the core tests it through
-  the agent, and services get `"relay": {"agent_id"}` in the `odoo` block and
-  send their Odoo calls through `POST /api/v1/relay/forward` (client id +
-  secret; only for the connection their account bound them to). Portal: Odoo →
-  OdooBridger Agents (add, key shown once, new key, remove). See `agent/README.md`.
+* **A private Odoo or biometric devices** (on-premise, behind NAT) are reached
+  through the **OdooBridger Agent** (`agent/`). The customer runs it once with
+  only its key; it dials out to the core's relay hub (`/relay/v1/agent`). What
+  it may reach is managed in the core (`RelayAgent.managed_allowed`, `host:port`
+  or `network@ports`) and pushed to the running agent live: connecting an Odoo
+  through it adds the Odoo's address, BioBridge adds a device's address when it
+  is tested or saved (`POST /api/v1/relay/agents/{id}/addresses`), and the
+  portal can add or remove addresses. The agent itself still keeps to private
+  addresses (and to `OB_ALLOW` if set on its computer). When an agent comes
+  online the core re-tests its Odoo connections and asks services to re-check.
+  Services send web calls with `POST /api/v1/relay/forward` (Odoo `connection_id`
+  or the account's `agent_id`) and a terminal's raw TCP over
+  `WS /api/v1/relay/stream?account_id&agent_id&host&port`. See `agent/README.md`.
 
 **SSO** — the portal's "Open" button, or a service sending a signed-out visitor
 to `/app/#/open/<slug>?redirect_uri=…&state=…`:

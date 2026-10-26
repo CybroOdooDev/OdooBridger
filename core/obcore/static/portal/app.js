@@ -459,12 +459,14 @@ function routeField(agents, conn = null) {
     help: agents.length ? '' : 'For an Odoo on a private network, add an OdooBridger Agent below first.' });
 }
 
-function odooFields(conn = null, agents = []) {
+function odooFields(conn = null, agents = [], route = true, mode = null) {
+  const urlHelp = mode === 'public' ? 'The address you open Odoo at, e.g. https://yourcompany.odoo.com.'
+    : mode === 'private' ? 'The address as your own network sees it, e.g. http://192.168.1.20:8069.'
+      : 'Through an agent, use the address as your own network sees it, e.g. http://192.168.1.20:8069.';
   return `
-    ${routeField(agents, conn)}
+    ${route ? routeField(agents, conn) : ''}
     ${field({ name: 'url', label: 'Odoo address', required: true, value: conn?.url || '',
-      placeholder: 'https://yourcompany.odoo.com',
-      help: 'Through an agent, use the address as your own network sees it, e.g. http://192.168.1.20:8069.' })}
+      placeholder: mode === 'private' ? 'http://192.168.1.20:8069' : 'https://yourcompany.odoo.com', help: urlHelp })}
     ${field({ name: 'db', label: 'Database', value: conn?.db || '',
       help: conn ? '' : 'Leave blank on Odoo Online: it is the name before .odoo.com.' })}
     ${field({ name: 'login', label: 'Login', required: true, value: conn?.login || '',
@@ -520,37 +522,136 @@ function odooCard(conn) {
 }
 
 
+/* --- Guided setup for an Odoo on a private network (all in the portal) ------- */
+function agentCommands(key, relayUrl) {
+  const base = window.location.origin;
+  const docker = `docker run -d --name odoobridger-agent --restart unless-stopped --network host \\\n  -e OB_AGENT_KEY=${key} \\\n  -e OB_RELAY_URL=${relayUrl} \\\n  python:3.12-slim sh -c "pip install -q websockets httpx && python -c \\"import urllib.request as u; u.urlretrieve('${base}/downloads/odoobridger_agent.py','/a.py')\\" && python /a.py"`;
+  const python = `pip install websockets httpx\ncurl -O ${base}/downloads/odoobridger_agent.py\nexport OB_AGENT_KEY=${key}\nexport OB_RELAY_URL=${relayUrl}\npython3 odoobridger_agent.py`;
+  return { docker, python };
+}
+
+/** Three steps without leaving the page: your Odoo's details, run the agent
+ * (we watch for it to come online), then the connection is tested and saved. */
+function privateWizard(box, agents, onDone) {
+  const state = { values: null, agent: null, created: null };
+  const alive = () => document.body.contains(box);
+
+  const stepDetails = () => {
+    box.innerHTML = `
+      <p class="muted" style="margin-top:0">Your Odoo is only reachable inside your own network. You will run a small program there that opens one outgoing connection to OdooBridger. Nothing is opened inbound.</p>
+      <form id="privForm">${odooFields(null, [], false, 'private')}
+        <p class="err" id="privErr"></p>
+        <button class="primary" id="privGo">Continue</button></form>`;
+    $('#privForm', box).addEventListener('submit', (e) => {
+      e.preventDefault();
+      const values = odooValues(e.target, null);
+      const err = $('#privErr', box);
+      let origin;
+      try { origin = new URL(/^https?:\/\//.test(values.url) ? values.url : `http://${values.url}`); } catch { origin = null; }
+      if (!origin || !values.url) { err.textContent = 'Enter your Odoo address, for example http://192.168.1.20:8069.'; return; }
+      values.url = `${origin.protocol}//${origin.host}`;
+      state.values = values;
+      submitting($('#privGo', box), async () => {
+        try {
+          const ready = agents.find((a) => a.online && !a.outdated);
+          if (ready) { state.agent = ready; await stepConnect(); return; }
+          const created = await api.post('/portal/agents', { name: `${origin.hostname} agent` });
+          state.created = created; state.agent = created.agent;
+          stepRun();
+        } catch (error) { err.textContent = error.message; }
+      });
+    });
+  };
+
+  const stepRun = () => {
+    const { key, relay_url: relayUrl } = state.created;
+    const cmds = agentCommands(key, relayUrl);
+    box.innerHTML = `
+      <div class="section-title" style="margin-top:0">Run The Agent On Your Network</div>
+      <p>Run this on any computer in the same network as your Odoo, such as the Odoo server itself. It only needs its key: we add your Odoo's address to it for you.</p>
+      <div class="section-title">With Docker</div><pre class="code">${esc(cmds.docker)}</pre>
+      <p class="hint">On Docker Desktop (Windows or Mac) remove <code>--network host</code>.</p>
+      <div class="section-title">With Python</div><pre class="code">${esc(cmds.python)}</pre>
+      <p class="hint">That is the only thing to run. What the agent can reach is managed here: connecting your Odoo or a biometric device adds its address, and changes reach the running agent straight away.</p>
+      <div class="banner" id="waitBox" style="margin-top:14px"><span id="waitText">Waiting for the agent to connect…</span></div>
+      <p class="err" id="privErr"></p>
+      <div class="row" style="gap:8px;margin-top:10px"><button id="privBack">Back</button></div>`;
+    $('#privBack', box).addEventListener('click', () => { state.stop = true; stepDetails(); });
+    state.stop = false;
+    const poll = async () => {
+      if (!alive() || state.stop || !box.querySelector('#waitBox')) return;
+      try {
+        const { agents: list } = await api.get('/portal/agents');
+        const me = list.find((a) => a.id === state.agent.id);
+        if (me?.online) {
+          if (me.outdated) {
+            $('#waitText', box).textContent = 'The agent is online but is an older version. Restart it so it downloads the latest; this page carries on by itself.';
+          } else { state.agent = me; await stepConnect(); return; }
+        }
+      } catch { /* try again */ }
+      setTimeout(poll, 3000);
+    };
+    setTimeout(poll, 3000);
+  };
+
+  const stepConnect = async () => {
+    box.innerHTML = `<p>Agent online. Testing your Odoo through it…</p>${loading()}`;
+    try {
+      await api.post('/portal/odoo', { ...state.values, agent_id: state.agent.id });
+    } catch (error) {
+      box.innerHTML = `${banner('The Connection Test Failed', error.message, 'bad')}
+        <div class="row" style="gap:8px;margin-top:10px"><button class="primary" id="privRetry">Try Again</button>
+        <button id="privBack">Change Details</button></div>`;
+      $('#privRetry', box).addEventListener('click', stepConnect);
+      $('#privBack', box).addEventListener('click', stepDetails);
+      return;
+    }
+    toast('Odoo connected.', 'ok');
+    onDone();
+  };
+
+  stepDetails();
+}
+
 /* --- OdooBridger Agents: reaching an Odoo on a private network ------------- */
-function agentSetup(key, relayUrl, allow = 'http://192.168.1.20:8069') {
-  const env = `OB_AGENT_KEY=${key}\nOB_RELAY_URL=${relayUrl}\nOB_ALLOW=${allow}`;
-  const docker = `docker run -d --name odoobridger-agent --restart unless-stopped \\\n  -e OB_AGENT_KEY=${key} \\\n  -e OB_RELAY_URL=${relayUrl} \\\n  -e OB_ALLOW=${allow} \\\n  odoobridger-agent`;
-  const python = `pip install websockets httpx\ncurl -O ${window.location.origin}/downloads/odoobridger_agent.py\n${env.split('\n').map((l) => `export ${l}`).join('\n')}\npython3 odoobridger_agent.py`;
+function agentSetup(key, relayUrl) {
+  const cmds = agentCommands(key, relayUrl);
   return `
     <p>Copy the key now. It is shown only once.</p>
     <div class="secret-box">${esc(key)}</div>
-    <p style="margin-top:14px">Run the agent on any machine in the same network as your Odoo. Set <code>OB_ALLOW</code> to your Odoo's address on that network; the agent reaches nothing else.</p>
-    <div class="section-title">With Docker</div><pre class="code">${esc(docker)}</pre>
-    <div class="section-title">With Python</div><pre class="code">${esc(python)}</pre>
-    <p class="hint">It connects out to OdooBridger over an encrypted connection. Nothing needs to be opened inbound.</p>`;
+    <p style="margin-top:14px">Run the agent on any computer in the same network as your Odoo or your biometric devices.</p>
+    <div class="section-title">With Docker</div><pre class="code">${esc(cmds.docker)}</pre>
+    <p class="hint">On Docker Desktop (Windows or Mac) remove <code>--network host</code>.</p>
+    <div class="section-title">With Python</div><pre class="code">${esc(cmds.python)}</pre>
+    <p class="hint">It connects out to OdooBridger over an encrypted connection. Nothing needs to be opened inbound.</p>
+    <p class="hint">That is the only thing to run. What the agent can reach is managed here: connecting your Odoo or a biometric device adds its address, and changes reach the running agent straight away.</p>`;
+}
+
+function agentAddresses(a) {
+  const list = (a.allowed || []).map((x) => `<span class="addr"><code>${esc(x)}</code>${canManage()
+    ? `<button class="link sm" data-addr-remove="${esc(a.id)}" data-addr="${esc(x)}" aria-label="Remove ${esc(x)}">×</button>` : ''}</span>`).join(' ');
+  return `${list || '<span class="muted">None yet: added when you connect Odoo or a device</span>'}
+    ${(a.limited_to || []).length ? `<div class="hint">Limited on its computer to ${a.limited_to.map((x) => `<code>${esc(x)}</code>`).join(', ')}</div>` : ''}`;
 }
 
 function agentsCard(data) {
   const rows = data.agents.map((a) => `<tr>
       <td><strong>${esc(a.name)}</strong><div class="hint">key …${esc(a.key_hint)}${a.hostname ? ` · on ${esc(a.hostname)}` : ''}${a.version ? ` · v${esc(a.version)}` : ''}</div></td>
-      <td>${a.online ? '<span class="pill ok">Online</span>' : '<span class="pill bad">Offline</span>'}
-        <div class="hint">${a.online ? `since ${esc(fmtDate(a.connected_at))}` : a.last_seen_at ? `last seen ${esc(fmtDate(a.last_seen_at))}` : 'never connected'}</div></td>
-      <td>${(a.allowed || []).map((x) => `<code>${esc(x)}</code>`).join('<br>') || '<span class="muted">—</span>'}</td>
-      <td class="right nowrap">${canManage() ? `<button class="sm" data-agent-key="${esc(a.id)}">New Key</button>
+      <td>${a.online ? (a.outdated ? '<span class="pill warn">Update Needed</span>' : '<span class="pill ok">Online</span>') : '<span class="pill bad">Offline</span>'}
+        <div class="hint">${a.outdated ? 'Restart it to get the latest version.' : a.online ? `since ${esc(fmtDate(a.connected_at))}` : a.last_seen_at ? `last seen ${esc(fmtDate(a.last_seen_at))}` : 'never connected'}</div></td>
+      <td>${agentAddresses(a)}</td>
+      <td class="right nowrap">${canManage() ? `<button class="sm" data-addr-add="${esc(a.id)}">Add Address</button>
+        <button class="sm" data-agent-key="${esc(a.id)}">New Key</button>
         <button class="sm danger-outline" data-agent-remove="${esc(a.id)}">Remove</button>` : ''}</td>
     </tr>`).join('');
   return `
     <div class="section-title">OdooBridger Agents</div>
     <div class="card">
-      <div class="card-head"><h2>For An Odoo On A Private Network</h2>
+      <div class="card-head"><h2>Reach Your Private Network</h2>
         ${canManage() ? '<button class="primary sm" id="agentAdd">Add Agent</button>' : ''}</div>
-      <p class="muted" style="margin-top:0">An agent runs inside your network and opens one outgoing connection to OdooBridger, so we can reach an Odoo that isn't on the internet. No port forwarding or VPN needed.</p>
+      <p class="muted" style="margin-top:0">An agent runs inside your network and opens one outgoing connection to OdooBridger, so we can reach your Odoo and biometric devices there. No port forwarding or VPN. It only ever reaches the addresses listed here, inside your own network.</p>
       ${data.agents.length ? `<div class="table-wrap"><table><thead><tr><th>Agent</th><th>Status</th><th>Can reach</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
-        : empty('No Agents Yet', 'Add one if your Odoo is only reachable inside your own network.')}
+        : empty('No Agents Yet', 'Add one if your Odoo or devices are only reachable inside your own network.')}
     </div>`;
 }
 
@@ -578,8 +679,25 @@ function wireAgents(mount, data, refresh) {
           onSubmit: () => api.post(`/portal/agents/${b.dataset.agentKey}/key`),
         });
         if (!done) return;
-        await dialog({ title: 'The New Key', wide: true, submitLabel: 'Done',
-          body: agentSetup(done.key, done.relay_url, (done.agent.allowed || [])[0] || undefined) });
+        await dialog({ title: 'The New Key', wide: true, submitLabel: 'Done', body: agentSetup(done.key, done.relay_url) });
+        refresh();
+      });
+    }
+    if (b.dataset.addrAdd) {
+      guard(async () => {
+        const done = await dialog({
+          title: 'Add An Address', submitLabel: 'Add',
+          body: field({ name: 'address', label: 'Address', required: true, placeholder: '192.168.1.50:80',
+            help: 'An address on your network with its port, such as 192.168.1.50:80 for a web terminal or 10.0.11.43:4370 for a ZKTeco terminal. A range works too: 192.168.1.0/24@80+443.' }),
+          onSubmit: (form) => api.post(`/portal/agents/${b.dataset.addrAdd}/addresses`, readForm(form)),
+        });
+        if (done) { toast('Address added. The agent has it now.', 'ok'); refresh(); }
+      });
+    }
+    if (b.dataset.addrRemove) {
+      guard(async () => {
+        await api.del(`/portal/agents/${b.dataset.addrRemove}/addresses?address=${encodeURIComponent(b.dataset.addr)}`);
+        toast('Address removed.', 'ok');
         refresh();
       });
     }
@@ -608,27 +726,40 @@ async function renderOdoo(mount) {
       ${waiting ? banner('Connect Your Odoo', `${waiting} ${data.services_without.length > 1 ? 'need' : 'needs'} it to work.`, 'warn') : ''}
       <div class="card">
         <div class="card-head"><h2>Connect Your Odoo</h2></div>
-        ${canManage() ? `<form id="odooForm">${odooFields(null, agents)}
-          <p class="err" id="odooErr"></p>
-          <button class="primary" id="odooGo">Test And Connect</button></form>`
+        ${canManage() ? `<div class="row" style="gap:8px;margin-bottom:14px">
+            <button class="primary" data-route="public">Public Address</button>
+            <button data-route="private">Private Network</button></div>
+          <div id="routeBox"></div>`
           : '<p class="muted">Ask your account owner or an admin to connect Odoo.</p>'}
       </div>
       ${agentsCard(relay)}`;
     mount.onclick = wireAgents(mount, relay, refresh);
-    $('#odooForm', mount)?.addEventListener('submit', (e) => {
-      e.preventDefault();
-      $('#odooErr', mount).textContent = '';
-      submitting($('#odooGo', mount), async () => {
-        try {
-          await api.post('/portal/odoo', odooValues(e.target, null));
-        } catch (error) {
-          $('#odooErr', mount).textContent = error.message;
-          return;
-        }
-        toast('Odoo connected.', 'ok');
-        renderOdoo(mount);
+    const box = $('#routeBox', mount);
+    const showPublic = () => {
+      box.innerHTML = `<form id="odooForm">${odooFields(null, [], false, 'public')}
+        <p class="err" id="odooErr"></p>
+        <button class="primary" id="odooGo">Test And Connect</button></form>`;
+      $('#odooForm', box).addEventListener('submit', (e) => {
+        e.preventDefault();
+        $('#odooErr', box).textContent = '';
+        submitting($('#odooGo', box), async () => {
+          try {
+            await api.post('/portal/odoo', odooValues(e.target, null));
+          } catch (error) {
+            $('#odooErr', box).textContent = error.message;
+            return;
+          }
+          toast('Odoo connected.', 'ok');
+          renderOdoo(mount);
+        });
       });
-    });
+    };
+    const choose = (route) => {
+      mount.querySelectorAll('[data-route]').forEach((b) => b.classList.toggle('primary', b.dataset.route === route));
+      if (route === 'private') privateWizard(box, agents, refresh); else showPublic();
+    };
+    mount.querySelectorAll('[data-route]').forEach((b) => b.addEventListener('click', () => choose(b.dataset.route)));
+    if (box) choose('public');
     return;
   }
   mount.innerHTML = odooCard(conn) + agentsCard(relay);

@@ -116,7 +116,7 @@ class CrossChexProvider(AttendanceProvider):
     def _http(self) -> httpx.Client:
         if self._client is None:
             self._client = httpx.Client(timeout=settings.http_timeout_seconds, verify=self.config.verify_ssl,
-                                        transport=TRANSPORT)
+                                        transport=self.config.transport or TRANSPORT)
         return self._client
 
     def close(self) -> None:

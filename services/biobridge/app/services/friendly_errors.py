@@ -9,11 +9,16 @@ detail goes to the server log.
 from __future__ import annotations
 
 from app.integrations.odoo import OdooAuthError, OdooError
+from app.services.connections import UnsafeTargetError
 
 
 def friendly_odoo_message(exc: Exception) -> str:
     text = str(exc)
     low = text.lower()
+
+    if isinstance(exc, UnsafeTargetError):
+        return ("Connection failed. This address is on a private network and BioBridge has no agent route for it. "
+                "In OdooBridger, open Odoo and save the connection again.")
 
     if isinstance(exc, OdooAuthError) or "rejected the credentials" in low or "refused the authentication" in low:
         if "no database named" in low:

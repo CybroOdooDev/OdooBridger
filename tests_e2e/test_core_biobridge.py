@@ -274,3 +274,96 @@ def _FullOdoo():
             return super().handler(request)
 
     return Full()
+
+
+def test_a_zkteco_terminal_is_read_through_a_real_agent(world, monkeypatch):
+    """The whole path, on real sockets: a real agent process dials the core over a
+    WebSocket, BioBridge's ZKTeco client opens a stream through the core, and the
+    agent reaches a (fake) terminal on 'the customer's network'."""
+    import importlib.util
+    import os
+    import socket
+    import subprocess
+    import sys
+    import threading
+    import time
+    from pathlib import Path
+
+    import uvicorn
+    from app.core.config import settings as bb_settings
+    from app.integrations.base import SourceConfig
+    from app.integrations.providers.zkteco import ZKDeviceProvider
+    from app.integrations.relay import PlatformRelayTcp
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "bb_zk_fake", root / "services" / "biobridge" / "tests" / "test_zkteco_protocol.py")
+    zk_tests = importlib.util.module_from_spec(spec)
+    sys.modules["bb_zk_fake"] = zk_tests
+    try:
+        spec.loader.exec_module(zk_tests)
+    except Exception:  # the fake device module imports BioBridge's own test helpers
+        sys.path.insert(0, str(root / "services" / "biobridge"))
+        spec.loader.exec_module(zk_tests)
+
+    core, _bb = world
+    catalog = core.get("/api/v1/public/catalog").json()
+    service = next(s for s in catalog["services"] if s["slug"] == "biometric")
+    core.post("/api/v1/public/signup", json={
+        "company": "Zed Ltd", "full_name": "Zoe", "email": "zoe@zed.io",
+        "services": [{"service": "biometric", "package_id": service["packages"][0]["id"]}]})
+    tokens = core.post("/api/v1/auth/link/use", json={"token": _link("zoe@zed.io"), "password": "Secret-Pass-1"}).json()
+    customer = {"Authorization": f"Bearer {tokens['access_token']}"}
+    account_id = core.get("/api/v1/portal/account", headers=customer).json()["account"]["id"]
+    created = core.post("/api/v1/portal/agents", headers=customer, json={"name": "Zed office"}).json()
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(core_main.app, host="127.0.0.1", port=port, log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.1)
+    assert server.started
+
+    with zk_tests.FakeZKDevice(params={"~SerialNumber": "REALAGENT1"}, attlog_count=3) as device:
+        # Installed the way customers do: only its key and where to connect.
+        env = {**os.environ, "OB_AGENT_KEY": created["key"], "OB_RELAY_URL": f"ws://127.0.0.1:{port}/relay/v1/agent",
+               "OB_LOG_LEVEL": "DEBUG"}
+        env.pop("OB_ALLOW", None)
+        agent = subprocess.Popen([sys.executable, str(root / "agent" / "odoobridger_agent.py")], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            from obcore.services.relay import hub
+
+            for _ in range(100):
+                if hub.online(created["agent"]["id"]):
+                    break
+                time.sleep(0.1)
+            assert hub.online(created["agent"]["id"]), "the agent never connected"
+
+            monkeypatch.setattr(bb_settings, "platform_core_url", f"http://127.0.0.1:{port}")
+            from app.integrations.relay import allow_on_agent
+
+            # BioBridge hands the device's address to the agent (what adding a device does); the
+            # running agent has it at once.
+            assert allow_on_agent(account_id, created["agent"]["id"], f"zk://127.0.0.1:{device.port}") is None
+            connect = PlatformRelayTcp(account_id, created["agent"]["id"])
+            provider = ZKDeviceProvider(SourceConfig(base_url=f"zk://127.0.0.1:{device.port}", timezone="UTC",
+                                                     tcp_connect=connect))
+            result = provider.test_connection()
+            assert result.ok and "REALAGENT1" in result.message, result.message
+
+            # A port the agent was not told it may reach is refused on the customer's side of things too.
+            other = ZKDeviceProvider(SourceConfig(base_url="zk://127.0.0.1:22", timezone="UTC", tcp_connect=connect))
+            refused = other.test_connection()
+            assert not refused.ok and "not one of the agent's addresses" in refused.message, refused.message
+        finally:
+            agent.terminate()
+            try:
+                agent.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                agent.kill()
+            server.should_exit = True
