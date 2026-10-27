@@ -5,14 +5,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from obcore.api.deps import Customer, get_customer, require_manager, require_owner, stripe_config
-from obcore.api.out import account_out, user_out
+from obcore.api.out import account_out, odoo_out, user_out
 from obcore.db import get_db
-from obcore.models import AccountService, Service, ServicePackage, ServiceStatus, User, UserRole
+from obcore.models import AccountService, OdooConnection, Service, ServicePackage, ServiceStatus, User, UserRole
 from obcore.services import accounts as acc
 from obcore.services import billing, closing, provisioning
+from obcore.services import odoo_connections as odoo
 from obcore.services import stripe_api as stripe
 from obcore.api.public import public_services
 
@@ -320,3 +322,113 @@ def delete_account(payload: DeleteIn, customer: Customer = Depends(require_owner
         raise _fail(exc, status.HTTP_502_BAD_GATEWAY) from exc
     db.commit()
     return {"message": f"{account.name} and its data were deleted."}
+
+
+# --- Odoo -----------------------------------------------------------------------
+
+
+def _connection(customer: Customer, conn_id: str) -> OdooConnection:
+    conn = next((c for c in customer.account.odoo_connections if c.id == conn_id), None)
+    if conn is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That Odoo connection is not on this account.")
+    return conn
+
+
+def _odoo_view(customer: Customer) -> dict:
+    account = customer.account
+    return {
+        "connections": [odoo_out(c) for c in account.odoo_connections],
+        "max": odoo.MAX_PER_ACCOUNT,
+        "services_without": [{"slug": r.service.slug, "name": r.service.name} for r in account.services
+                             if r.service.uses_odoo and r.status != ServiceStatus.cancelled.value
+                             and r.odoo_connection is None],
+    }
+
+
+@router.get("/odoo")
+def get_odoo(customer: Customer = Depends(get_customer)) -> dict:
+    return _odoo_view(customer)
+
+
+class OdooIn(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    url: str = Field(min_length=3, max_length=500)
+    db: str | None = Field(default=None, max_length=120)
+    login: str = Field(min_length=1, max_length=255)
+    api_key: str = Field(min_length=8, max_length=200)
+    key_expires_at: str | None = Field(default=None, max_length=32)
+
+
+@router.post("/odoo", status_code=status.HTTP_201_CREATED)
+def add_odoo(payload: OdooIn, request: Request, customer: Customer = Depends(require_manager),
+             db: Session = Depends(get_db)) -> dict:
+    try:
+        conn = odoo.create(db, customer.account, url=payload.url, db_name=payload.db or "", login=payload.login,
+                           api_key_value=payload.api_key, name=payload.name, key_expires_at=payload.key_expires_at)
+    except odoo.OdooConnectionError as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    except IntegrityError as exc:
+        # Two accounts connecting the same database at the same moment.
+        db.rollback()
+        raise _fail(odoo.OdooConnectionError(
+            "This Odoo database is already connected to another OdooBridger account.")) from exc
+    acc.audit(db, customer.actor, "odoo.connect", account_id=customer.account.id,
+              detail=f"{conn.url} / {conn.db_name}", request=request)
+    _sync(db, customer)
+    odoo.refresh_readiness(db, conn, live=True)
+    db.commit()
+    return _odoo_view(customer)
+
+
+class OdooPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    url: str | None = Field(default=None, max_length=500)
+    db: str | None = Field(default=None, max_length=120)
+    login: str | None = Field(default=None, max_length=255)
+    #: Blank keeps the current key.
+    api_key: str | None = Field(default=None, max_length=200)
+    key_expires_at: str | None = Field(default=None, max_length=32)
+
+
+@router.patch("/odoo/{conn_id}")
+def change_odoo(conn_id: str, payload: OdooPatch, request: Request, customer: Customer = Depends(require_manager),
+                db: Session = Depends(get_db)) -> dict:
+    conn = _connection(customer, conn_id)
+    data = payload.model_dump(exclude_unset=True)
+    try:
+        odoo.update(db, conn, url=data.get("url"), db_name=data.get("db"), login=data.get("login"),
+                    api_key_value=data.get("api_key"), name=data.get("name"),
+                    **({"key_expires_at": data["key_expires_at"]} if "key_expires_at" in data else {}))
+    except (odoo.OdooConnectionError, IntegrityError) as exc:
+        db.rollback()
+        raise _fail(exc if isinstance(exc, odoo.OdooConnectionError) else odoo.OdooConnectionError(
+            "This Odoo database is already connected to another OdooBridger account.")) from exc
+    acc.audit(db, customer.actor, "odoo.update", account_id=customer.account.id,
+              detail=", ".join(k for k in data if k != "api_key") + (", api key" if data.get("api_key") else ""),
+              request=request)
+    _sync(db, customer)
+    odoo.refresh_readiness(db, conn, live=True)
+    db.commit()
+    return _odoo_view(customer)
+
+
+@router.post("/odoo/{conn_id}/test")
+def test_odoo(conn_id: str, customer: Customer = Depends(get_customer), db: Session = Depends(get_db)) -> dict:
+    conn = _connection(customer, conn_id)
+    odoo.test(db, conn)
+    _sync(db, customer)
+    odoo.refresh_readiness(db, conn, live=True)
+    db.commit()
+    return _odoo_view(customer)
+
+
+@router.delete("/odoo/{conn_id}")
+def delete_odoo(conn_id: str, request: Request, customer: Customer = Depends(require_manager),
+                db: Session = Depends(get_db)) -> dict:
+    conn = _connection(customer, conn_id)
+    detail = f"{conn.url} / {conn.db_name}"
+    odoo.delete(db, conn)
+    acc.audit(db, customer.actor, "odoo.disconnect", account_id=customer.account.id, detail=detail, request=request)
+    _sync(db, customer)
+    return _odoo_view(customer)

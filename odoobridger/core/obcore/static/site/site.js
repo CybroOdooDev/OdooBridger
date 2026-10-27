@@ -2,7 +2,6 @@
 
 import { money } from '/assets/api.js';
 import { esc } from '/assets/ui.js';
-import { multiSelect } from '/site/multiselect.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -16,7 +15,6 @@ const COMING = [
 let catalog = { services: [] };
 let interval = 'month';
 let activeService = null;
-let contactServices = null;
 
 function paintServices() {
   const live = catalog.services.map((s) => `<div class="site-card"><h3>${esc(s.name)}</h3><p>${esc(s.tagline || s.description || '')}</p></div>`);
@@ -47,57 +45,11 @@ function paintPricing() {
           <div class="amt">${cents == null ? 'Custom' : `${money(cents, p.currency)}<span>/${interval === 'year' ? 'year' : 'month'}</span>`}</div>
           <div class="desc">${esc(p.description || '')}</div>
           <ul>${(p.features || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
-          <a class="btn-lg${p.is_default ? ' primary' : ''}" href="${cents == null ? '#contact' : href}">${cents == null ? 'Contact Us' : 'Start Free Trial'}</a>
+          <a class="btn-lg${p.is_default ? ' primary' : ''}" href="${cents == null ? '/site/contact.html' : href}">${cents == null ? 'Contact Us' : 'Start Free Trial'}</a>
         </div>`;
       }).join('')}</div>
     </div>`;
   $$('[data-svc-tab]', body).forEach((b) => b.addEventListener('click', () => { activeService = b.dataset.svcTab; paintPricing(); }));
-}
-
-function paintContactServices() {
-  const all = [...catalog.services, ...COMING.filter((c) => !catalog.services.some((s) => s.slug === c.slug))];
-  contactServices = multiSelect($('#c_services'), all.map((s) => ({ value: s.slug, label: s.name })),
-    { placeholder: 'Select one or more services' });
-}
-
-function wireContact() {
-  let topic = 'Demo';
-  const demoOnly = () => $$('.demo-only').forEach((el) => { el.style.display = topic === 'Demo' ? '' : 'none'; });
-  $$('[data-topic]').forEach((b) => b.addEventListener('click', () => {
-    topic = b.dataset.topic;
-    $$('[data-topic]').forEach((x) => x.classList.toggle('on', x === b));
-    demoOnly();
-  }));
-  demoOnly();
-  $('#contactForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const form = e.target;
-    const err = $('#contactErr');
-    err.textContent = '';
-    const data = Object.fromEntries(new FormData(form));
-    if (!data.name || !data.email || !data.company) { err.textContent = 'Please fill in your name, email and company.'; return; }
-    const button = $('#contactGo');
-    button.disabled = true;
-    try {
-      const response = await fetch('/api/v1/public/contact', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic, name: data.name, email: data.email, company: data.company, phone: data.phone || null,
-          message: data.message || null, website: data.website || null,
-          services: contactServices ? contactServices.values() : [],
-          preferred_date: topic === 'Demo' ? data.preferred_date || null : null,
-          preferred_window: topic === 'Demo' ? data.preferred_window || null : null,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : 'Please check the form and try again.');
-      $('#contactCard').innerHTML = `<div class="done"><h3>Thank You</h3><p>${esc(payload.message)}</p></div>`;
-    } catch (error) {
-      err.textContent = error.message;
-      button.disabled = false;
-    }
-  });
 }
 
 $$('[data-interval]').forEach((b) => b.addEventListener('click', () => {
@@ -112,6 +64,4 @@ $$('[data-interval]').forEach((b) => b.addEventListener('click', () => {
   } catch { /* the page still works without prices */ }
   paintServices();
   paintPricing();
-  paintContactServices();
 })();
-wireContact();

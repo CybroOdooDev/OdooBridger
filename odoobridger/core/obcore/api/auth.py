@@ -13,12 +13,13 @@ from obcore.api.deps import Customer, get_customer, get_staff
 from obcore.api.out import account_out, staff_out, user_out
 from obcore.config import settings
 from obcore.db import get_db
-from obcore.models import StaffUser, User, UserSession
+from obcore.models import PendingSignup, StaffUser, User, UserSession
 from obcore.security import (
     SCOPE_CUSTOMER, SCOPE_STAFF, aware, create_token, decode_token, hash_password, hash_token,
     utcnow, validate_password, verify_password,
 )
 from obcore.services import accounts as acc
+from obcore.services import billing, provisioning, signups, stripe_api
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -79,6 +80,10 @@ def _check(person, password: str) -> None:
 @router.post("/login")
 def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> dict:
     user = db.scalar(select(User).where(User.email == acc.normalise_email(payload.email)))
+    if user is None and db.scalar(select(PendingSignup.id).where(
+            PendingSignup.email == acc.normalise_email(payload.email))):
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Confirm your email first — open the link we sent you. Your account is created then.")
     if user is not None and user.is_active and not user.hashed_password:
         raise HTTPException(status.HTTP_403_FORBIDDEN,
                             "Confirm your email first — open the link we sent you to choose your password.")
@@ -160,6 +165,10 @@ def forgot_password(payload: EmailIn, request: Request, db: Session = Depends(ge
 def check_link(payload: LinkIn, db: Session = Depends(get_db)) -> dict:
     user = acc.user_for_link(db, payload.token)
     if user is None:
+        pending = signups.for_link(db, payload.token)
+        if pending is not None:
+            return {"email": pending.email, "account": pending.company, "purpose": acc.PURPOSE_VERIFY,
+                    "signup": True, "mode": pending.mode}
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "This link has expired or was already used. Ask for a new one.")
     return {"email": user.email, "account": user.account.name, "purpose": user.link_token_purpose}
@@ -169,6 +178,9 @@ def check_link(payload: LinkIn, db: Session = Depends(get_db)) -> dict:
 def use_link(payload: SetPasswordIn, request: Request, db: Session = Depends(get_db)) -> dict:
     user = acc.user_for_link(db, payload.token)
     if user is None:
+        pending = signups.for_link(db, payload.token)
+        if pending is not None:
+            return _confirm_signup(db, pending, payload.password, request)
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "This link has expired or was already used. Ask for a new one.")
     problem = validate_password(payload.password)
@@ -199,3 +211,32 @@ def change_password(payload: ChangePasswordIn, customer: Customer = Depends(get_
     customer.user.hashed_password = hash_password(payload.new_password)
     db.commit()
     return {"message": "Password changed."}
+
+
+def _confirm_signup(db: Session, pending, password: str, request: Request) -> dict:
+    """The signup's email is confirmed: only now is the account created."""
+    problem = validate_password(password)
+    if problem:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+    stripe_api.load_config(db)
+    buying = pending.mode == "buy"
+    try:
+        account, user = signups.complete(db, pending, password)
+    except signups.SignupError as exc:
+        db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    acc.audit(db, f"user:{user.email}", "account.signup", account_id=account.id, request=request,
+              detail=", ".join(r.service.slug for r in account.services) or None)
+    db.commit()
+    db.refresh(account)
+    provisioning.push_account(db, account)
+    db.commit()
+    out = issue(db, SCOPE_CUSTOMER, user.id, request)
+    if buying:
+        try:
+            out["checkout_url"] = billing.start_checkout(db, account, user.email, account.billing_interval)
+            db.commit()
+        except (billing.SubscriptionError, stripe_api.BillingError):
+            db.rollback()
+            out["notice"] = "Payment could not be started, so your free trial is running. You can pay from Billing."
+    return out

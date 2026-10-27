@@ -18,7 +18,7 @@ from app.db.session import engine as bb_engine
 from app.models import Tenant, User
 from app.services import platform_link
 from obcore.mailer import OUTBOX
-from obcore.services import provisioning
+from obcore.services import ops, provisioning
 
 
 @pytest.fixture()
@@ -28,6 +28,8 @@ def world(monkeypatch):
             TestClient(bb_main.app, base_url="http://biobridge.test") as bb:
         # core -> BioBridge
         monkeypatch.setattr(provisioning, "client_factory", lambda: TestClient(bb_main.app, base_url="http://biobridge.test"))
+        monkeypatch.setattr(ops, "client_factory", lambda: TestClient(bb_main.app, base_url="http://biobridge.test"))
+        ops.forget()
 
         # BioBridge -> core
         def to_core(method):
@@ -133,3 +135,77 @@ def test_biobridge_refuses_its_own_signup_in_platform_mode(world):
     assert bb.post("/api/v1/auth/login", json={"email": "a@b.io", "password": "x"}).status_code == 404
     mode = bb.get("/api/v1/auth/mode").json()
     assert mode["authorize_url"] == "http://core.test/app/#/open/biometric"
+
+
+def test_the_odoo_connection_is_set_in_the_core_and_used_by_biobridge(world, monkeypatch):
+    from app.core.crypto import decrypt
+    from app.models import OdooConnection
+    from obcore.services import odoo_probe
+
+    core, bb = world
+    r = core.post("/api/v1/public/signup", json={
+        "company": "Gulf Steel", "full_name": "Gus", "email": "gus@gulf.io", "services": [{"service": "biometric"}]})
+    assert r.status_code == 201, r.text
+    tokens = core.post("/api/v1/auth/link/use", json={"token": _link("gus@gulf.io"), "password": "Secret-Pass-1"}).json()
+    customer = {"Authorization": f"Bearer {tokens['access_token']}"}
+    account_id = core.get("/api/v1/portal/account", headers=customer).json()["account"]["id"]
+
+    # The core's test (reachability, login, companies) and BioBridge's own
+    # (can it write attendance) both pass against a stand-in Odoo.
+    monkeypatch.setattr(odoo_probe, "probe", lambda url, db, login, key, **_kw: odoo_probe.ProbeResult(
+        version="19.0", api="json2", uid=7, companies=[{"id": 1, "name": "Gulf HQ"}], db_uuid="uuid-gulf"))
+
+    class Odoo:
+        def ping(self):
+            return {"uid": 7, "server_version": "19.0", "can_create_attendance": True,
+                    "has_companion_addon": False, "has_device_tracking": True, "device_tracking_mode": "bootstrap"}
+
+    monkeypatch.setattr("app.services.connections.build_odoo_client", lambda tenant, conn: Odoo())
+
+    r = core.post("/api/v1/portal/odoo", headers=customer, json={
+        "url": "https://gulf.odoo.com", "login": "bot@gulf.io", "api_key": "first-key-123"})
+    assert r.status_code == 201, r.text
+    (conn,) = r.json()["connections"]
+    assert conn["db"] == "gulf"
+    (svc,) = conn["services"]
+    assert svc["slug"] == "biometric" and svc["ready"] is True, svc
+
+    def bb_conn():
+        db = BBSession()
+        try:
+            tenant = db.scalar(select(Tenant).where(Tenant.platform_account_id == account_id))
+            row = db.scalar(select(OdooConnection).where(OdooConnection.tenant_id == tenant.id))
+            return row, decrypt(row.api_key_enc, tenant.crypto_key)
+        finally:
+            db.close()
+
+    row, key = bb_conn()
+    assert row.managed and row.url == "https://gulf.odoo.com" and row.db_name == "gulf" and key == "first-key-123"
+    assert row.status == "connected"
+
+    # A new key in the portal reaches BioBridge.
+    r = core.patch(f"/api/v1/portal/odoo/{conn['id']}", headers=customer, json={"api_key": "second-key-456"})
+    assert r.status_code == 200, r.text
+    assert bb_conn()[1] == "second-key-456"
+
+    # Disconnecting in the portal stops BioBridge using it.
+    core.delete(f"/api/v1/portal/odoo/{conn['id']}", headers=customer)
+    row, _ = bb_conn()
+    assert not row.is_active
+
+
+def test_the_staff_overview_reads_biobridges_own_metrics(world):
+    core, _ = world
+    r = core.post("/api/v1/public/signup", json={
+        "company": "Metrics Co", "full_name": "M", "email": "m@metrics.io", "services": [{"service": "biometric"}]})
+    assert r.status_code == 201, r.text
+    core.post("/api/v1/auth/link/use", json={"token": _link("m@metrics.io"), "password": "Secret-Pass-1"})
+    staff = core.post("/api/v1/auth/staff/login", json={"email": "staff@odoobridger.io",
+                                                         "password": "Staff-Password-1"}).json()
+    o = core.get("/api/v1/staff/overview?fresh=true",
+                 headers={"Authorization": f"Bearer {staff['access_token']}"}).json()
+    bio = next(s for s in o["services"] if s["slug"] == "biometric")
+    # BioBridge answered both its health check and the signed metrics call.
+    assert bio["has_metrics"] is True and bio["status"] in ("operational", "degraded")
+    assert set(bio["integrations"]) == {"active", "failed"}
+    assert bio["customers"] >= 1

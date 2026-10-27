@@ -112,6 +112,10 @@ def add_service(db: Session, account: Account, service: Service,
             package.trial_days if package.trial_days is not None else settings.default_trial_days)
         row.trial_ends_at = utcnow() + timedelta(days=days)
         row.status = ServiceStatus.trialing.value if days > 0 else ServiceStatus.past_due.value
+    if service.uses_odoo:
+        from obcore.services.odoo_connections import bind_services
+
+        bind_services(account)
     mark_changed(row)
     db.flush()
     return row

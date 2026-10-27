@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -135,6 +135,16 @@ class Settings(BaseSettings):
     #: Customers legitimately run BioTime on a LAN, so this is a policy switch
     #: rather than a hard block. Public deployments set it false.
     allow_private_network_targets: bool = True
+
+    @model_validator(mode="after")
+    def _platform_is_hosted(self):
+        # As OdooBridger's service this runs hosted, next to other internal
+        # systems: a customer's address must not reach into that network.
+        # Customers expose their Odoo and devices on a public address.
+        # An explicit ALLOW_PRIVATE_NETWORK_TARGETS still wins.
+        if self.platform_mode and "allow_private_network_targets" not in self.model_fields_set:
+            object.__setattr__(self, "allow_private_network_targets", False)
+        return self
     cors_origins: str = ""
 
     # --- email genuineness -----------------------------------------------------

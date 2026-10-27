@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -19,7 +18,7 @@ from obcore.models import (
     DEMO_STATUSES, LEAD_STAGES, OPEN_STAGES, Account, AccountClosure, AccountService, AccountStatus,
     AuditLog, Lead, LeadEvent, Service, ServicePackage, ServiceStatus, StaffUser, User,
 )
-from obcore.security import aware, hash_password, utcnow, validate_password
+from obcore.security import aware, hash_password, utcnow, validate_password, verify_password
 from obcore.services import accounts as acc
 from obcore.services import billing, closing, leads, provisioning, sso
 from obcore.services import stripe_api as stripe
@@ -49,39 +48,25 @@ def _sync(db: Session, account: Account) -> None:
 # Overview
 # =============================================================================
 @router.get("/overview")
-def overview(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
-    accounts = db.scalars(select(Account)).all()
-    by_status = Counter(a.status for a in accounts)
-    rows = db.scalars(select(AccountService)).all()
-    per_service: dict[str, Counter] = {}
-    for row in rows:
-        per_service.setdefault(row.service.name, Counter())[row.status] += 1
-    mrr = sum(billing.monthly_total_cents(a) for a in accounts
-              if a.stripe_subscription_id and a.status == AccountStatus.active.value)
-    lead_rows = db.scalars(select(Lead)).all()
-    leads_by_stage = Counter(lead.stage for lead in lead_rows)
-    pipeline_value = sum(lead.value_cents or 0 for lead in lead_rows if lead.stage in OPEN_STAGES)
-    out_of_sync = [{"account_id": r.account_id, "account": r.account.name, "service": r.service.name,
-                    "error": r.provision_error}
-                   for r in rows if r.provisioned_revision < r.revision][:20]
-    trials_ending = sorted(
-        [{"account_id": r.account_id, "account": r.account.name, "service": r.service.name,
-          "trial_ends_at": iso(r.trial_ends_at)}
-         for r in rows if r.status == ServiceStatus.trialing.value and r.trial_ends_at],
-        key=lambda x: x["trial_ends_at"])[:10]
-    recent = sorted(accounts, key=lambda a: a.created_at, reverse=True)[:8]
-    return {
-        "accounts": {"total": len(accounts), **by_status},
-        "services": {name: dict(c) for name, c in per_service.items()},
-        "mrr_cents": mrr,
-        "leads": {"open": sum(leads_by_stage[s] for s in OPEN_STAGES), **leads_by_stage,
-                  "pipeline_value_cents": pipeline_value},
-        "out_of_sync": out_of_sync,
-        "trials_ending": trials_ending,
-        "recent_accounts": [{"id": a.id, "name": a.name, "created_at": iso(a.created_at),
-                             "services": [r.service.name for r in a.services]} for a in recent],
-        "stripe": stripe.config_summary(db),
-    }
+def overview(period: str = "30d", fresh: bool = False, _: StaffUser = Depends(get_staff),
+             db: Session = Depends(get_db)) -> dict:
+    from obcore.services import dashboard
+
+    out = dashboard.overview(db, period, fresh=fresh)
+    out["stripe"] = stripe.config_summary(db)
+    db.commit()
+    return out
+
+
+@router.get("/services/{slug}/dashboard")
+def service_dashboard(slug: str, fresh: bool = False, _: StaffUser = Depends(get_staff),
+                      db: Session = Depends(get_db)) -> dict:
+    from obcore.services import dashboard
+
+    out = dashboard.service_dashboard(db, slug, fresh=fresh)
+    if out is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such service.")
+    return out
 
 
 # =============================================================================
@@ -448,6 +433,7 @@ class ServiceIn(BaseModel):
     sso_callback_path: str | None = Field(default=None, max_length=120)
     is_active: bool | None = None
     is_public: bool | None = None
+    uses_odoo: bool | None = None
     sort_order: int | None = None
 
 
@@ -472,6 +458,22 @@ def _catalog_service(db: Session, service_id: str) -> Service:
     return service
 
 
+def _rebind_odoo(db: Session, service: Service, uses_odoo: bool) -> None:
+    """A service starting or stopping work on Odoo: bind or unbind every account's
+    connection; the sweep then sends each account's new state."""
+    from obcore.services.odoo_connections import bind_services
+    from obcore.services.provisioning import mark_changed
+
+    service.uses_odoo = uses_odoo
+    for row in db.scalars(select(AccountService).where(AccountService.service_id == service.id)):
+        if uses_odoo:
+            bind_services(row.account)
+        else:
+            row.odoo_connection = None
+            row.odoo_readiness = None
+        mark_changed(row)
+
+
 @router.patch("/services/{service_id}")
 def update_service(service_id: str, payload: ServiceIn, staff: StaffUser = Depends(get_staff),
                    db: Session = Depends(get_db)) -> dict:
@@ -479,6 +481,8 @@ def update_service(service_id: str, payload: ServiceIn, staff: StaffUser = Depen
     for key, value in payload.model_dump(exclude_unset=True).items():
         if key == "slug" and value != service.slug:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "A service's slug can't change.")
+        if key == "uses_odoo" and value != service.uses_odoo:
+            _rebind_odoo(db, service, bool(value))
         setattr(service, key, value)
     acc.audit(db, actor(staff), "catalog.service_update", detail=service.slug)
     db.commit()
@@ -647,6 +651,9 @@ def update_lead(lead_id: str, payload: LeadPatch, staff: StaffUser = Depends(get
                 db: Session = Depends(get_db)) -> dict:
     lead = _lead(db, lead_id)
     data = payload.model_dump(exclude_unset=True)
+    if lead.stage == "won" and any(k != "stage" or v != "won" for k, v in data.items()):
+        # A won lead is closed: only notes can still be added to its history.
+        raise HTTPException(status.HTTP_409_CONFLICT, "This lead is won and closed. Only notes can be added.")
     try:
         if "stage" in data:
             leads.move(db, lead, payload.stage, staff.email, lost_reason=payload.lost_reason)
@@ -727,7 +734,11 @@ def add_staff(payload: StaffIn, staff: StaffUser = Depends(get_staff), db: Sessi
 
 
 class StaffPatch(BaseModel):
-    is_active: bool
+    is_active: bool | None = None
+    full_name: str | None = Field(default=None, max_length=120)
+    password: str | None = Field(default=None, max_length=200)
+    #: Needed when you change your own password.
+    current_password: str | None = Field(default=None, max_length=200)
 
 
 @router.patch("/team/{staff_id}")
@@ -736,9 +747,34 @@ def update_staff(staff_id: str, payload: StaffPatch, staff: StaffUser = Depends(
     member = db.get(StaffUser, staff_id)
     if member is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Staff user not found.")
-    if member.id == staff.id:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You can't disable yourself.")
-    member.is_active = payload.is_active
-    acc.audit(db, actor(staff), "staff.update", detail=f"{member.email} active={payload.is_active}")
+    data = payload.model_dump(exclude_unset=True)
+    changed = []
+    if "is_active" in data and data["is_active"] is not None and data["is_active"] != member.is_active:
+        if member.id == staff.id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "You can't disable yourself.")
+        member.is_active = data["is_active"]
+        changed.append(f"active={member.is_active}")
+    if "full_name" in data and data["full_name"] is not None:
+        name = data["full_name"].strip()
+        if not name:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter a name.")
+        if name != member.full_name:
+            member.full_name = name
+            changed.append("name")
+    if data.get("password"):
+        if member.is_static:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                "This login comes from STAFF_EMAIL / STAFF_PASSWORD; change its password there.")
+        if member.id == staff.id and not verify_password(data.get("current_password") or "", member.hashed_password):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Your current password is not right.")
+        problem = validate_password(data["password"])
+        if problem:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+        member.hashed_password = hash_password(data["password"])
+        member.failed_login_count = 0
+        member.locked_until = None
+        changed.append("password")
+    if changed:
+        acc.audit(db, actor(staff), "staff.update", detail=f"{member.email}: {', '.join(changed)}")
     db.commit()
     return staff_out(member)

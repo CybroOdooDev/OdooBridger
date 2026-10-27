@@ -45,6 +45,8 @@ def move(db: Session, lead: Lead, stage: str, actor: str, *, lost_reason: str | 
         raise LeadError("Unknown stage.")
     if stage == lead.stage:
         return
+    if lead.stage == "won":
+        raise LeadError("This lead is won and closed. It can't be moved to another stage.")
     record(db, lead, "stage", actor, from_value=lead.stage, to_value=stage,
            note=lost_reason if stage == "lost" else None)
     lead.stage = stage
@@ -59,6 +61,8 @@ def move(db: Session, lead: Lead, stage: str, actor: str, *, lost_reason: str | 
 
 
 def set_demo(db: Session, lead: Lead, status: str | None, actor: str, demo_at=None) -> None:
+    if lead.stage == "won":
+        raise LeadError("This lead is won and closed; its demo can't be changed.")
     if status is not None and status not in DEMO_STATUSES:
         raise LeadError("Unknown demo status.")
     if status and lead.stage not in ("contacted", "qualified", "won"):

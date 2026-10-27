@@ -12,6 +12,7 @@ const ICONS = {
   accounts: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
   mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 6.5l8.5 6.5 8.5-6.5"/>',
   tag: '<path d="M3.5 12.2V4.5a1 1 0 0 1 1-1h7.7l8.3 8.3a1.4 1.4 0 0 1 0 2l-6.7 6.7a1.4 1.4 0 0 1-2 0z"/><circle cx="8" cy="8" r="1.5"/>',
+  odoo: '<ellipse cx="12" cy="6" rx="7.5" ry="2.8"/><path d="M4.5 6v12c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V6M4.5 12c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8"/>',
   closed: '<rect x="3" y="4" width="18" height="5" rx="1.2"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/>',
 };
 export const icon = (name) => `<svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" fill="none"
@@ -21,7 +22,6 @@ export const BRAND = `<div class="brand"><span class="brand-mark">O</span>
   <span class="brand-word"><b>Odoo</b><span>Bridger</span></span></div>`;
 
 /* ---- theme ------------------------------------------------------------- */
-const THEMES = [['system', 'Auto'], ['light', 'Light'], ['dark', 'Dark']];
 function currentTheme() { return document.documentElement.getAttribute('data-theme') || 'system'; }
 function setTheme(value) {
   if (value === 'light' || value === 'dark') document.documentElement.setAttribute('data-theme', value);
@@ -32,11 +32,21 @@ function setTheme(value) {
   } catch { /* lasts until the tab closes */ }
   paintTheme();
 }
+/** Dark now: chosen explicitly, or the device's own setting when left on auto. */
+function isDark() {
+  const t = currentTheme();
+  if (t === 'dark') return true;
+  if (t === 'light') return false;
+  return !!window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+}
+const SUN = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></svg>';
+const MOON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>';
 function paintTheme() {
   const holder = $('#themeSwitch');
   if (!holder) return;
-  holder.innerHTML = THEMES.map(([v, l]) => `<button type="button" data-theme-choice="${v}"
-    aria-pressed="${v === currentTheme()}">${l}</button>`).join('');
+  const dark = isDark();
+  holder.innerHTML = `<button type="button" class="switch" role="switch" aria-checked="${dark}" aria-label="Dark mode" data-theme-flip>
+      <span class="knob">${dark ? MOON : SUN}</span></button>`;
 }
 
 /* ---- sign-in card -------------------------------------------------------- */
@@ -86,7 +96,7 @@ export function mountShell({ nav, user, pill = '', onSignOut }) {
           <nav id="sidenav"></nav>
           <div class="side-foot">
             <div class="side-user" id="sideUser"></div>
-            <div class="theme-toggle" id="themeSwitch" role="group" aria-label="Theme"></div>
+            <div class="theme-toggle" id="themeSwitch"></div>
             <button class="link" id="signOut" style="padding-left:0">Sign Out</button>
           </div>
         </aside>
@@ -104,8 +114,7 @@ export function mountShell({ nav, user, pill = '', onSignOut }) {
     $('#signOut', root).addEventListener('click', onSignOut);
     $('#menuToggle', root).addEventListener('click', () => $('#sidebar', root).classList.toggle('open'));
     $('#themeSwitch', root).addEventListener('click', (e) => {
-      const b = e.target.closest('[data-theme-choice]');
-      if (b) setTheme(b.dataset.themeChoice);
+      if (e.target.closest('[data-theme-flip]')) setTheme(isDark() ? 'light' : 'dark');
     });
     paintTheme();
   }
@@ -113,7 +122,7 @@ export function mountShell({ nav, user, pill = '', onSignOut }) {
   $('#sidenav').innerHTML = nav.map((group) => `
     ${group.label ? `<div class="nav-group"><div class="nav-group-label">${esc(group.label)}</div></div>` : ''}
     ${group.items.map((item) => {
-      const active = item.path === path || (item.path !== '/' && path.startsWith(`${item.path}/`));
+      const active = (item.paths || [item.path]).some((p) => p === path || (p !== '/' && path.startsWith(`${p}/`)));
       const href = item.href || `#${item.path}`;
       return `<a class="nav ${active ? 'active' : ''}" href="${esc(href)}"${active ? ' aria-current="page"' : ''}>
         <span class="nav-label">${item.icon ? icon(item.icon) : ''}${esc(item.title)}</span>
@@ -162,7 +171,7 @@ export function dialog({ title, body, submitLabel = 'Save', danger = false, wide
     host.innerHTML = `
       <div class="wiz-backdrop" data-close></div>
       <div class="wiz${wide ? '' : ' narrow'}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
-        <header><div><h3>${esc(title)}</h3></div><button class="sm" type="button" data-close aria-label="Close">Close</button></header>
+        <header><div><h3>${esc(title)}</h3></div><button class="link wiz-x" type="button" data-close aria-label="Close">&times;</button></header>
         <form class="wiz-body" novalidate>
           ${body}
           <p class="err" data-err></p>

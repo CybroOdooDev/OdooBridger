@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from obcore.models import (
-    Account, AccountService, Lead, LeadEvent, Service, ServicePackage, StaffUser, User,
+    Account, AccountService, Lead, LeadEvent, OdooConnection, Service, ServicePackage, StaffUser, User,
 )
 from obcore.security import aware
 
@@ -38,7 +38,8 @@ def service_out(s: Service, *, staff: bool = False) -> dict[str, Any]:
     }
     if staff:
         out.update(internal_url=s.internal_url, sso_callback_path=s.sso_callback_path,
-                   has_client_secret=bool(s.client_secret_hash), sort_order=s.sort_order)
+                   has_client_secret=bool(s.client_secret_hash), sort_order=s.sort_order,
+                   uses_odoo=s.uses_odoo)
     return out
 
 
@@ -85,7 +86,8 @@ def account_out(a: Account, *, staff: bool = False) -> dict[str, Any]:
     if staff:
         out.update(stripe_customer_id=a.stripe_customer_id, stripe_subscription_id=a.stripe_subscription_id,
                    suspended_at=iso(a.suspended_at), suspension_reason=a.suspension_reason,
-                   users=[user_out(u) for u in a.users], lead_id=a.lead_id)
+                   users=[user_out(u) for u in a.users], lead_id=a.lead_id,
+                   odoo=[odoo_out(c) for c in a.odoo_connections])
     return out
 
 
@@ -109,3 +111,26 @@ def lead_out(lead: Lead) -> dict[str, Any]:
 def lead_event_out(e: LeadEvent) -> dict[str, Any]:
     return {"id": e.id, "kind": e.kind, "from": e.from_value, "to": e.to_value, "note": e.note,
             "actor": e.actor, "created_at": iso(e.created_at)}
+
+
+def odoo_out(c: "OdooConnection", *, staff: bool = False) -> dict[str, Any]:
+    """An Odoo connection as the portal shows it. Never includes the key."""
+    services = []
+    for row in c.account.services:
+        if row.odoo_connection is not c:
+            continue
+        readiness = row.odoo_readiness or {}
+        services.append({
+            "slug": row.service.slug, "name": row.service.name, "status": row.status,
+            "ready": readiness.get("ready"), "message": readiness.get("message"),
+            "checks": readiness.get("checks") or [], "checked_at": iso(row.odoo_readiness_at),
+            "in_sync": row.provisioned_revision >= row.revision,
+        })
+    return {
+        "id": c.id, "name": c.name, "url": c.url, "db": c.db_name, "login": c.login,
+        "version": c.odoo_version, "api": c.api, "companies": c.companies or [],
+        "status": c.status, "status_message": c.status_message,
+        "last_checked_at": iso(c.last_checked_at), "last_ok_at": iso(c.last_ok_at),
+        "key_expires_at": iso(c.key_expires_at), "has_db_uuid": bool(c.db_uuid),
+        "services": services, "created_at": iso(c.created_at),
+    }

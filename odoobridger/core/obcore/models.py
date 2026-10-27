@@ -15,10 +15,10 @@ holds a service's own data.
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text,
+    JSON, Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -64,6 +64,8 @@ class Account(Base, UUIDPk, Timestamped):
     users: Mapped[list["User"]] = relationship(back_populates="account", cascade="all, delete-orphan")
     services: Mapped[list["AccountService"]] = relationship(
         back_populates="account", cascade="all, delete-orphan")
+    odoo_connections: Mapped[list["OdooConnection"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan", order_by="OdooConnection.created_at")
 
 
 class UserRole(str, enum.Enum):
@@ -123,6 +125,35 @@ class StaffUser(Base, UUIDPk, Timestamped):
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PendingSignup(Base, UUIDPk, Timestamped):
+    """A website signup waiting for its email to be confirmed.
+
+    Nothing else exists yet: no account, no user, no trial, no Stripe
+    customer, nothing sent to any service. Opening the link in the email
+    (and choosing a password) turns this into the account; until then it
+    only holds what the form said. Signing up again with the same email
+    replaces it and sends a new link.
+    """
+
+    __tablename__ = "pending_signup"
+    __table_args__ = (UniqueConstraint("email", name="uq_pending_signup_email"),)
+
+    email: Mapped[str] = mapped_column(String(254), nullable=False)
+    company: Mapped[str] = mapped_column(String(160), nullable=False)
+    full_name: Mapped[str | None] = mapped_column(String(120))
+    country: Mapped[str | None] = mapped_column(String(80))
+    timezone: Mapped[str | None] = mapped_column(String(64))
+    #: [{"service": slug, "package_id": id | null}]
+    services: Mapped[list] = mapped_column(JSON, default=list)
+    interval: Mapped[str] = mapped_column(String(5), default="month")
+    #: "trial" or "buy" (go on to Stripe Checkout once confirmed).
+    mode: Mapped[str] = mapped_column(String(5), default="trial")
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+
+
 class UserSession(Base, UUIDPk, Timestamped):
     """One row per refresh token (its jti hashed), so sessions are revocable."""
 
@@ -164,6 +195,9 @@ class Service(Base, UUIDPk, Timestamped):
     #: Sold on the website and addable from the portal. An inactive or unlisted
     #: service can still be assigned by staff.
     is_public: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: Works on the account's Odoo: it is sent the Odoo connection it is bound
+    #: to. A service without this never receives Odoo credentials.
+    uses_odoo: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
     packages: Mapped[list["ServicePackage"]] = relationship(
@@ -251,9 +285,18 @@ class AccountService(Base, UUIDPk, Timestamped):
     revision: Mapped[int] = mapped_column(Integer, default=1)
     provisioned_revision: Mapped[int] = mapped_column(Integer, default=0)
 
+    # --- Odoo: which connection the service works on, and whether it can ----
+    odoo_connection_id: Mapped[str | None] = mapped_column(
+        ForeignKey("odoo_connection.id", ondelete="SET NULL"), index=True)
+    #: The service's own readiness check on that Odoo, read from its usage
+    #: endpoint: {"ready": bool, "message": str, "checks": [...], "auth_failed": bool}.
+    odoo_readiness: Mapped[dict | None] = mapped_column(JSON)
+    odoo_readiness_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     account: Mapped[Account] = relationship(back_populates="services")
     service: Mapped[Service] = relationship()
     package: Mapped[ServicePackage | None] = relationship()
+    odoo_connection: Mapped["OdooConnection | None"] = relationship()
 
     @property
     def usable(self) -> bool:
@@ -263,6 +306,65 @@ class AccountService(Base, UUIDPk, Timestamped):
         merged = dict((self.package.entitlements if self.package else None) or {})
         merged.update(self.entitlement_overrides or {})
         return merged
+
+
+# =============================================================================
+# The customer's Odoo
+# =============================================================================
+class OdooConnectionStatus(str, enum.Enum):
+    unverified = "unverified"
+    connected = "connected"
+    failed = "failed"
+
+
+class OdooConnection(Base, UUIDPk, Timestamped):
+    """Where the account's Odoo is and how to sign in to it.
+
+    The core owns only the connection; each service keeps what it does with
+    it (company switches, mappings, its own records in Odoo). A service bound
+    to a connection is sent it on provisioning and calls Odoo directly.
+
+    One Odoo database belongs to one account: ``url_key`` + ``db_key`` (and
+    ``db_uuid`` when Odoo lets us read it) are unique across all accounts.
+    """
+
+    __tablename__ = "odoo_connection"
+    __table_args__ = (
+        UniqueConstraint("url_key", "db_key", name="uq_odoo_url_db"),
+        UniqueConstraint("db_uuid", name="uq_odoo_db_uuid"),
+    )
+
+    account_id: Mapped[str] = mapped_column(ForeignKey("account.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120), default="Odoo")
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    db_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    login: Mapped[str] = mapped_column(String(255), nullable=False)
+    api_key_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Normalised host + path (no scheme, no trailing slash, lower case).
+    url_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    db_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    #: Odoo's own database.uuid, when the user may read it.
+    db_uuid: Mapped[str | None] = mapped_column(String(64))
+
+    odoo_version: Mapped[str | None] = mapped_column(String(32))
+    #: "json2" or "xmlrpc", as detected.
+    api: Mapped[str | None] = mapped_column(String(10))
+    #: [{"id", "name"}] the Odoo user can see, from the last good test.
+    companies: Mapped[list | None] = mapped_column(JSON)
+    #: Optional: when the API key expires (Odoo 19+ keys have one).
+    key_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    key_warned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    status: Mapped[str] = mapped_column(String(20), default=OdooConnectionStatus.unverified.value)
+    status_message: Mapped[str | None] = mapped_column(Text)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When the customer was last emailed that it stopped working.
+    failure_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When it last went from working to failing (cleared when it works again).
+    failing_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    account: Mapped[Account] = relationship(back_populates="odoo_connections")
 
 
 # =============================================================================
@@ -373,6 +475,18 @@ class AccountClosure(Base, UUIDPk, Timestamped):
     services: Mapped[list] = mapped_column(JSON, default=list)
     closed_by: Mapped[str] = mapped_column(String(280))
     reason: Mapped[str | None] = mapped_column(Text)
+
+
+class MetricSnapshot(Base, Timestamped):
+    """One row per day: the figures the staff overview compares against
+    (monthly revenue has no history anywhere else)."""
+
+    __tablename__ = "metric_snapshot"
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    mrr_cents: Mapped[int] = mapped_column(Integer, default=0)
+    customers: Mapped[int] = mapped_column(Integer, default=0)
+    subscriptions: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Setting(Base, Timestamped):

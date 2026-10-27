@@ -2,7 +2,8 @@
 
 import '/assets/password-toggle.js';
 import { fmtDate, makeClient, money } from '/assets/api.js';
-import { $, $$, banner, empty, esc, field, guard, loading, readForm, toast, wireTips } from '/assets/ui.js';
+import { $, $$, banner, empty, esc, field, guard, loading, readForm, timezoneNames, toast, wireSearchSelects, wireTips } from '/assets/ui.js';
+import { detectZone } from '/site/geo.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
 
 const { api, session, restore, signOut } = makeClient('customer');
@@ -19,14 +20,6 @@ const STATUS = {
 const statusPill = (s) => `<span class="pill ${STATUS[s]?.[0] || 'mute'}">${esc(STATUS[s]?.[1] || s)}</span>`;
 const canManage = () => ['owner', 'admin'].includes(state.me?.role);
 const isOwner = () => state.me?.role === 'owner';
-
-function limitLine(ent = {}) {
-  const parts = [];
-  if ('max_devices' in ent) parts.push(ent.max_devices == null ? 'Unlimited terminals' : `${ent.max_devices} terminals`);
-  if ('max_employees' in ent) parts.push(ent.max_employees == null ? 'unlimited employees' : `${ent.max_employees} employees`);
-  if ('max_seats' in ent) parts.push(ent.max_seats == null ? 'Unlimited seats' : `${ent.max_seats} seats`);
-  return parts.join(' · ');
-}
 
 async function catalog() {
   if (!state.catalog) state.catalog = await api.get('/public/catalog');
@@ -89,22 +82,27 @@ async function renderSetPassword(route) {
   }
   const first = info.purpose === 'verify';
   authCard(`
-    <h1>${first ? 'Choose Your Password' : 'Choose A New Password'}</h1>
-    <p class="sub">${first ? `Welcome to OdooBridger. Your email is confirmed — set a password for ${esc(info.email)} (${esc(info.account)}).`
+    <h1>${info.signup ? 'Create Your Account' : first ? 'Choose Your Password' : 'Choose A New Password'}</h1>
+    <p class="sub">${info.signup
+      ? `Your email is confirmed. Choose a password for ${esc(info.email)} to create ${esc(info.account)}${info.mode === 'buy' ? ', then go on to payment' : ' and start your free trial'}.`
+      : first ? `Welcome to OdooBridger. Your email is confirmed — set a password for ${esc(info.email)} (${esc(info.account)}).`
       : `For ${esc(info.email)}.`}</p>
     <form id="form">
       ${field({ name: 'password', label: 'New password', type: 'password', required: true,
         help: 'At least 10 characters, with upper and lower case letters and a number.' })}
-      ${field({ name: 'confirm', label: 'Repeat it', type: 'password', required: true })}
-      <button class="primary" style="width:100%" id="go">${first ? 'Save And Sign In' : 'Save Password'}</button>
+      ${field({ name: 'confirm', label: 'Confirm password', type: 'password', required: true })}
+      <button class="primary" style="width:100%" id="go">${info.signup ? (info.mode === 'buy' ? 'Create Account And Pay' : 'Create Account') : first ? 'Save And Sign In' : 'Save Password'}</button>
     </form>`);
   $('#form').addEventListener('submit', (e) => {
     e.preventDefault();
     const values = readForm(e.target);
     submitting($('#go'), async () => {
       if (values.password !== values.confirm) throw new Error('The two passwords are different.');
-      session.persist(await api.post('/auth/link/use', { token, password: values.password }));
-      toast(first ? 'Welcome! You are signed in.' : 'Password changed.', 'ok');
+      const result = await api.post('/auth/link/use', { token, password: values.password });
+      session.persist(result);
+      if (result.checkout_url) { window.location.href = result.checkout_url; return; }
+      if (result.notice) toast(result.notice, 'bad');
+      else toast(info.signup ? 'Your account is ready.' : first ? 'Welcome! You are signed in.' : 'Password changed.', 'ok');
       window.location.hash = '#/services';
     });
   });
@@ -148,27 +146,27 @@ function packagePicker(service, current, interval) {
   }).join('')}</div>`;
 }
 
+const TRASH = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12M9 7V4.5a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 .5.5V7"/></svg>';
+
 function serviceCard(row) {
   const s = row.service;
   const facts = [
-    ['Package', esc(row.package?.name || '—')],
+    ['Plan', esc(row.package?.name || '—')],
     row.status === 'trialing' && row.trial_ends_at ? ['Trial ends', esc(fmtDate(row.trial_ends_at))] : null,
-    limitLine(row.entitlements) ? ['Includes', esc(limitLine(row.entitlements))] : null,
-    ['Billing', row.billed ? 'On your subscription' : row.status === 'cancelled' ? '—' : 'Not paying yet'],
   ].filter(Boolean);
   const live = row.status !== 'cancelled';
   return `
     <div class="svc-card" data-slug="${esc(s.slug)}">
       <div class="svc-head">
-        <div><div class="svc-name">${esc(s.name)}</div>${s.tagline ? `<div class="svc-tag">${esc(s.tagline)}</div>` : ''}</div>
+        <div class="svc-name">${esc(s.name)}</div>
         ${statusPill(row.status)}
       </div>
       <dl class="svc-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
       ${row.status === 'past_due' ? `<div class="hint" style="color:var(--bad)">${row.billed ? 'The last payment failed.' : 'The free trial has ended.'} <a href="#/billing">Pay to carry on</a>.</div>` : ''}
       <div class="svc-actions">
         ${live ? `<button class="primary" data-open="${esc(s.slug)}">Open</button>` : ''}
-        ${live && canManage() ? `<button data-change="${esc(s.slug)}">Change Package</button>` : ''}
-        ${live && canManage() ? `<button class="danger-outline" data-remove="${esc(s.slug)}">Remove</button>` : ''}
+        ${live && canManage() ? `<button data-change="${esc(s.slug)}">Change Plan</button>` : ''}
+        ${live && canManage() ? `<button class="icon-btn" style="margin-left:auto" data-remove="${esc(s.slug)}" title="Remove" aria-label="Remove ${esc(s.name)}">${TRASH}</button>` : ''}
         ${!live && canManage() ? `<button data-readd="${esc(s.slug)}">Add Again</button>` : ''}
       </div>
     </div>`;
@@ -201,9 +199,9 @@ async function changePackageDialog(slug) {
   const service = cat.services.find((s) => s.slug === slug);
   const row = state.account.services.find((r) => r.service.slug === slug);
   const result = await dialog({
-    title: `${service.name} — Change Package`,
+    title: `${service.name} — Change Plan`,
     wide: true,
-    submitLabel: 'Change Package',
+    submitLabel: 'Change Plan',
     body: `${packagePicker(service, row.package?.id, state.account.billing_interval)}
       <p class="hint" style="margin-top:12px">${row.billed
         ? 'Your subscription changes now; the difference is prorated on the next invoice.'
@@ -312,7 +310,7 @@ async function renderBilling(mount, route) {
           <td>${i.status === 'paid' ? '<span class="pill ok">Paid</span>' : i.status === 'open' ? '<span class="pill warn">Due</span>' : `<span class="pill mute">${esc(i.status)}</span>`}</td>
           <td class="num">${money(i.status === 'paid' ? i.amount_paid : i.amount_due, i.currency)}</td>
           <td class="right">${i.payable ? `<a class="btn sm" href="${esc(i.hosted_invoice_url)}" target="_blank" rel="noopener">Pay</a>` : ''}
-            ${i.invoice_pdf ? `<a class="btn sm" href="${esc(i.invoice_pdf)}" target="_blank" rel="noopener">PDF</a>` : ''}</td></tr>`).join('')}</tbody></table></div>`
+            ${i.invoice_pdf ? `<a class="btn sm" href="${esc(i.invoice_pdf)}" target="_blank" rel="noopener">PDF</a>` : ''}</td></tr>`).join('')}</tbody></table></div></div>`
         : empty('No Invoices Yet', '')}
     </div>`;
   $$('[data-interval]', mount).forEach((b) => b.addEventListener('click', () => guard(async () => {
@@ -348,7 +346,7 @@ async function renderTeam(mount) {
   const users = await api.get('/portal/users');
   mount.innerHTML = `
     <div class="card">
-      <div class="card-head"><h2>People</h2><div class="actions">${canManage() ? '<button class="primary" id="invite">Invite Someone</button>' : ''}</div></div>
+      <div class="card-head"><h2>People</h2><div class="actions">${canManage() ? '<button class="primary sm" id="invite">Invite User</button>' : ''}</div></div>
       <p class="hint">Everyone here signs in once and can open every service your account has. Admins manage services and billing; members use the services.</p>
       <div class="table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
@@ -365,7 +363,7 @@ async function renderTeam(mount) {
     </div>`;
   $('#invite', mount)?.addEventListener('click', async () => {
     const ok = await dialog({
-      title: 'Invite Someone', submitLabel: 'Send Invitation',
+      title: 'Invite User', submitLabel: 'Send Invitation',
       body: `${field({ name: 'full_name', label: 'Name' })}${field({ name: 'email', label: 'Email', type: 'email', required: true })}
         ${field({ name: 'role', label: 'Role', options: ROLES.filter(([v]) => v !== 'owner').map(([value, label]) => ({ value, label })), value: 'member' })}
         <p class="hint">They get an email to set their own password.</p>`,
@@ -390,42 +388,63 @@ async function renderTeam(mount) {
  * ====================================================================== */
 async function renderAccount(mount) {
   const a = state.account;
+  const stored = { timezone: a.timezone || '' };
+  // Nothing saved yet: offer the browser's own time zone.
+  const zone = stored.timezone && stored.timezone !== 'UTC' ? stored.timezone : detectZone();
+  const zoneItems = timezoneNames().map((z) => ({ value: z, label: z }));
+  const manage = canManage();
   mount.innerHTML = `
     <div class="card">
-      <div class="card-head"><h2>Company</h2></div>
+      <div class="card-head"><h2>Company</h2>
+        <div class="actions">
+          ${manage ? '<button class="primary sm" type="submit" form="company" id="saveCompany" hidden>Save Changes</button>' : ''}
+          <button class="sm" type="button" id="changePw">Change Password</button>
+          ${isOwner() ? `<button class="icon-btn" type="button" id="delete" title="Delete Account" aria-label="Delete account">${TRASH}</button>` : ''}</div></div>
       <form id="company">
         ${field({ name: 'name', label: 'Company name', value: a.name, required: true })}
-        ${field({ name: 'country', label: 'Country', value: a.country || '' })}
-        ${field({ name: 'timezone', label: 'Timezone', value: a.timezone || 'UTC' })}
-        ${canManage() ? '<button class="primary">Save</button>' : ''}
+        ${field({ name: 'timezone', label: 'Timezone', value: zone, items: zoneItems, placeholder: 'Search time zones' })}
       </form>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <div class="card-head"><h2>Your Password</h2></div>
-      <form id="pw">
-        ${field({ name: 'current_password', label: 'Current password', type: 'password', required: true })}
+    </div>`;
+  const form = $('#company', mount);
+  const save = $('#saveCompany', mount);
+  const initial = { name: a.name, timezone: stored.timezone };
+  const changed = () => {
+    const now = readForm(form);
+    return ['name', 'timezone'].some((k) => (now[k] || '') !== (initial[k] || ''));
+  };
+  const refresh = () => { if (save) save.hidden = !changed(); };
+  form.addEventListener('input', refresh);
+  form.addEventListener('change', refresh);
+  refresh();
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!manage || !changed()) return;
+    guard(async () => {
+      state.account = await api.patch('/portal/account', readForm(e.target));
+      Object.assign(initial, { name: state.account.name, timezone: state.account.timezone || '' });
+      refresh();
+    }, 'Saved.');
+  });
+  $('#changePw', mount).addEventListener('click', () => guard(async () => {
+    const done = await dialog({
+      title: 'Change Password', submitLabel: 'Change Password',
+      body: `${field({ name: 'current_password', label: 'Current password', type: 'password', required: true })}
         ${field({ name: 'new_password', label: 'New password', type: 'password', required: true,
           help: 'At least 10 characters, with upper and lower case letters and a number.' })}
-        <button>Change Password</button>
-      </form>
-    </div>
-    ${isOwner() ? `<div class="card danger-zone" style="margin-top:14px">
-      <div class="card-head"><h2>Delete Account</h2></div>
-      <p>Deletes ${esc(a.name)}, every service's data for it, and its subscription. This can't be undone.</p>
-      <button class="danger-outline" id="delete">Delete Account</button>
-    </div>` : ''}`;
-  $('#company', mount).addEventListener('submit', (e) => {
-    e.preventDefault();
-    guard(async () => { state.account = await api.patch('/portal/account', readForm(e.target)); }, 'Saved.');
-  });
-  $('#pw', mount).addEventListener('submit', (e) => {
-    e.preventDefault();
-    guard(async () => { await api.post('/auth/change-password', readForm(e.target)); e.target.reset(); }, 'Password changed.');
-  });
+        ${field({ name: 'confirm_password', label: 'Confirm new password', type: 'password', required: true })}`,
+      onSubmit: async (f) => {
+        const v = readForm(f);
+        if (v.new_password !== v.confirm_password) throw new Error('The new passwords do not match.');
+        await api.post('/auth/change-password', { current_password: v.current_password, new_password: v.new_password });
+      },
+    });
+    if (done) toast('Password changed.', 'ok');
+  }));
   $('#delete', mount)?.addEventListener('click', async () => {
     const ok = await dialog({
       title: 'Delete This Account?', danger: true, submitLabel: 'Delete Everything',
-      body: `<p>Type <strong>${esc(a.name)}</strong> to confirm.</p>
+      body: `<p>This deletes ${esc(a.name)}, every service's data for it, and its subscription. It can't be undone.</p>
+        <p>Type <strong>${esc(a.name)}</strong> to confirm.</p>
         ${field({ name: 'confirm_name', label: 'Company name', required: true })}
         ${field({ name: 'reason', label: 'Why are you leaving?', type: 'textarea' })}`,
       onSubmit: (form) => api.post('/portal/account/delete', readForm(form)),
@@ -434,15 +453,172 @@ async function renderAccount(mount) {
   });
 }
 
+
+/* =========================================================================
+ * Odoo: the account's one connection, used by every Odoo service
+ * ====================================================================== */
+const ODOO_STATUS = {
+  connected: ['ok', 'Connected'],
+  failed: ['bad', 'Failed'],
+  unverified: ['mute', 'Not Checked'],
+};
+const odooPill = (s) => `<span class="pill ${ODOO_STATUS[s]?.[0] || 'mute'}">${esc(ODOO_STATUS[s]?.[1] || s)}</span>`;
+const readyPill = (r) => (r === true ? '<span class="pill ok">Ready</span>'
+  : r === false ? '<span class="pill bad">Not Ready</span>' : '<span class="pill mute">Not Checked</span>');
+
+function odooFields(conn = null) {
+  return `
+    ${field({ name: 'url', label: 'Odoo address', required: true, value: conn?.url || '',
+      placeholder: 'https://yourcompany.odoo.com',
+      help: 'The public address of your Odoo, e.g. https://yourcompany.odoo.com. If Odoo runs on your own server, use its public IP or domain with the port forwarded, e.g. http://203.0.113.10:8069.' })}
+    ${field({ name: 'db', label: 'Database', value: conn?.db || '',
+      help: conn ? '' : 'Leave blank on Odoo Online: it is the name before .odoo.com.' })}
+    ${field({ name: 'login', label: 'Login', required: true, value: conn?.login || '',
+      placeholder: 'integration@yourcompany.com' })}
+    ${field({ name: 'api_key', label: 'API key', type: 'password', required: !conn,
+      placeholder: conn ? 'Unchanged' : '',
+      help: conn ? 'Leave blank to keep the current key.'
+        : 'In Odoo: your avatar → My Profile → Account Security → New API Key.' })}
+    ${field({ name: 'key_expires_at', label: 'Key expires on', type: 'date',
+      value: conn?.key_expires_at ? conn.key_expires_at.slice(0, 10) : '' })}`;
+}
+
+function odooValues(form, conn) {
+  const values = readForm(form);
+  if (conn && !values.api_key) delete values.api_key;
+  if (!values.key_expires_at) values.key_expires_at = null;
+  return values;
+}
+
+function odooCard(conn) {
+  const companies = (conn.companies || []).map((c) => esc(c.name)).join(', ') || '—';
+  const facts = [
+    ['Address', `<a href="${esc(conn.url)}" target="_blank" rel="noopener">${esc(conn.url)}</a>`],
+    ['Database', esc(conn.db)],
+    ['Login', esc(conn.login)],
+    ['Version', conn.version ? `${esc(conn.version)} · ${conn.api === 'json2' ? 'JSON-2 API' : 'XML-RPC'}` : '—'],
+    ['Companies', companies],
+    ['Last checked', conn.last_checked_at ? esc(fmtDate(conn.last_checked_at)) : '—'],
+    conn.key_expires_at ? ['Key expires', esc(fmtDate(conn.key_expires_at))] : null,
+  ].filter(Boolean);
+  return `
+    <div class="card">
+      <div class="card-head"><h2>${esc(conn.name)}</h2>
+        <div class="actions">${odooPill(conn.status)}
+          <button class="sm" data-odoo-test="${esc(conn.id)}">Test Connection</button>
+          ${canManage() ? `<button class="sm" data-odoo-edit="${esc(conn.id)}">Edit</button>
+            <button class="icon-btn" data-odoo-remove="${esc(conn.id)}" title="Disconnect" aria-label="Disconnect Odoo">${TRASH}</button>` : ''}</div></div>
+      ${conn.status === 'failed' && conn.status_message ? banner('Odoo Is Refusing The Connection', conn.status_message, 'bad') : ''}
+      <dl class="svc-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+    </div>
+    <div class="section-title">Services Using This Odoo</div>
+    ${conn.services.length ? `<div class="card"><div class="table-wrap"><table><thead><tr><th>Service</th><th>Status</th><th>Details</th></tr></thead><tbody>
+      ${conn.services.map((s) => `<tr>
+        <td>${esc(s.name)}</td>
+        <td>${readyPill(s.ready)}</td>
+        <td>${esc(s.message || (s.in_sync ? '' : 'Waiting for the service to pick up the change.'))}
+        </td>
+      </tr>`).join('')}</tbody></table></div></div>`
+    : `<div class="card">${empty('No Services Use Odoo Yet', 'Services that work with Odoo connect to it automatically when you add them.')}</div>`}`;
+}
+
+
+async function renderOdoo(mount) {
+  mount.innerHTML = loading();
+  const data = await api.get('/portal/odoo');
+  const conn = data.connections[0] || null;
+  const waiting = data.services_without.map((s) => esc(s.name)).join(', ');
+  if (!conn) {
+    mount.innerHTML = `
+      ${waiting ? banner('Connect Your Odoo', `${waiting} ${data.services_without.length > 1 ? 'need' : 'needs'} it to work.`, 'warn') : ''}
+      <div class="card">
+        <div class="card-head"><h2>Connect Your Odoo</h2></div>
+        ${canManage() ? `<form id="odooForm">${odooFields()}
+            <p class="err" id="odooErr"></p>
+            <button class="primary" id="odooGo">Test And Connect</button></form>`
+          : '<p class="muted">Ask your account owner or an admin to connect Odoo.</p>'}
+      </div>`;
+    $('#odooForm', mount)?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      $('#odooErr', mount).textContent = '';
+      submitting($('#odooGo', mount), async () => {
+        try {
+          await api.post('/portal/odoo', odooValues(e.target, null));
+        } catch (error) {
+          $('#odooErr', mount).textContent = error.message;
+          return;
+        }
+        toast('Odoo connected.', 'ok');
+        renderOdoo(mount);
+      });
+    });
+    return;
+  }
+  mount.innerHTML = odooCard(conn);
+  mount.onclick = (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.odooTest) {
+      submitting(b, async () => {
+        const r = await api.post(`/portal/odoo/${conn.id}/test`);
+        const fresh = r.connections[0];
+        toast(fresh.status === 'connected' ? 'Odoo answered. The connection works.' : fresh.status_message || 'The test failed.',
+          fresh.status === 'connected' ? 'ok' : 'bad');
+        renderOdoo(mount);
+      });
+    }
+    if (b.dataset.odooEdit) {
+      guard(async () => {
+        const done = await dialog({
+          title: 'Edit The Odoo Connection',
+          submitLabel: 'Test And Save',
+          body: odooFields(conn),
+          onSubmit: (form) => api.patch(`/portal/odoo/${conn.id}`, odooValues(form, conn)),
+        });
+        if (done) { toast('Saved. Your services have the new details.', 'ok'); renderOdoo(mount); }
+      });
+    }
+    if (b.dataset.odooRemove) {
+      guard(async () => {
+        const done = await dialog({
+          title: 'Disconnect Odoo?', danger: true, submitLabel: 'Disconnect',
+          body: `<p>${conn.services.map((s) => esc(s.name)).join(', ') || 'Your services'} will stop sending anything to Odoo until you connect it again. Nothing is deleted.</p>`,
+          onSubmit: () => api.del(`/portal/odoo/${conn.id}`),
+        });
+        if (done) { toast('Odoo disconnected.', 'ok'); renderOdoo(mount); }
+      });
+    }
+  };
+}
+
 /* =========================================================================
  * Router
  * ====================================================================== */
 const PAGES = [
-  { path: '/services', title: 'Services', icon: 'grid', render: renderServices },
-  { path: '/billing', title: 'Billing', icon: 'card', render: renderBilling },
-  { path: '/team', title: 'People', icon: 'people', render: renderTeam },
-  { path: '/account', title: 'Account', icon: 'settings', render: renderAccount },
+  { path: '/services', title: 'Services', render: renderServices },
+  { path: '/account', title: 'Company', render: renderCompany, group: 'account' },
+  { path: '/odoo', title: 'Odoo', render: renderOdoo, group: 'account' },
+  { path: '/billing', title: 'Billing', render: renderBilling, group: 'account' },
 ];
+/** The Company tab: the company's details, then its people. */
+async function renderCompany(mount) {
+  mount.innerHTML = '<div id="companyPart"></div><div id="peoplePart" style="margin-top:14px"></div>';
+  await Promise.all([renderAccount($('#companyPart', mount)), renderTeam($('#peoplePart', mount))]);
+}
+const ACCOUNT_TABS = PAGES.filter((p) => p.group === 'account');
+/** The sidebar: Services, and Account holding company, people, Odoo and billing as tabs. */
+const NAV = [
+  { path: '/services', title: 'Services', icon: 'grid' },
+  { path: '/account', title: 'Account', icon: 'settings', paths: [...ACCOUNT_TABS.map((p) => p.path), '/team'] },
+];
+const accountTabs = (path) => `<nav class="tabs" aria-label="Account">${ACCOUNT_TABS.map((p) =>
+  `<a href="#${p.path}"${p.path === path ? ' class="active" aria-current="page"' : ''}>${esc(p.title)}</a>`).join('')}</nav>`;
+
+/** The account's name in the top bar: a name tag, not a status pill. */
+const accountChip = (name) => {
+  const initial = (String(name || '').trim()[0] || '?').toUpperCase();
+  return `<span class="account-chip" title="${esc(name)}"><span class="account-initial" aria-hidden="true">${esc(initial)}</span><span class="account-name">${esc(name)}</span></span>`;
+};
 
 async function loadAccount() {
   const data = await api.get('/portal/account');
@@ -478,23 +654,29 @@ async function route() {
     const open = match('/open/:slug', r.path);
     if (open) return renderOpen(r, open);
     if (['/', '/login', '/forgot-password'].includes(r.path)) { window.location.hash = '#/services'; return; }
+    if (r.path === '/team') { window.location.hash = '#/account'; return; }   // People now lives on Company
     const page = PAGES.find((p) => p.path === r.path);
     await loadAccount();
     mountShell({
-      nav: [{ items: PAGES }],
+      nav: [{ items: NAV }],
       user: state.me.email,
-      pill: `<span class="pill">${esc(state.account.name)}</span>`,
+      pill: accountChip(state.account.name),
       onSignOut: async () => { await signOut(); unmountShell(); window.location.hash = '#/login'; },
     });
-    $('#pageTitle').textContent = page ? page.title : 'Not Found';
+    $('#pageTitle').textContent = page ? (page.group === 'account' ? 'Account' : page.title) : 'Not Found';
     const content = $('#content');
     const fresh = content.cloneNode(false);   // drop listeners from the last page
     content.replaceWith(fresh);
     if (!page) { fresh.innerHTML = empty('Page Not Found', ''); return; }
+    let target = fresh;
+    if (page.group === 'account') {
+      fresh.innerHTML = `${accountTabs(page.path)}<div id="tabBody"></div>`;
+      target = $('#tabBody', fresh);
+    }
     try {
-      await page.render(fresh, r);
+      await page.render(target, r);
     } catch (error) {
-      if (error.status !== 401) fresh.innerHTML = banner('Could Not Load This Page', error.message, 'bad');
+      if (error.status !== 401) target.innerHTML = banner('Could Not Load This Page', error.message, 'bad');
     }
   } finally {
     running = false;
@@ -505,4 +687,5 @@ async function route() {
 window.addEventListener('ob:signed-out', () => { unmountShell(); window.location.hash = '#/login'; route(); });
 window.addEventListener('hashchange', route);
 wireTips();
+wireSearchSelects();
 route();

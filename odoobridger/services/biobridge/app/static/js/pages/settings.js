@@ -706,10 +706,27 @@ async function renderOdoo(mount, route) {
     api.get('/mappings?limit=500').catch(() => []),
     api.get('/sources').catch(() => []),
   ]);
-  const odoo = odooList[0] || null;
+  // The connection actually in use: in platform mode, the one set in OdooBridger.
+  const odoo = odooList.find((c) => c.managed && c.is_active) || odooList.find((c) => c.is_active) || odooList[0] || null;
   // Badges can only be matched once a biometric connection is working too.
   const biometricUp = sources.some((x) => x.status === 'connected');
   const readonly = !auth.canWrite;
+  // Platform mode: OdooBridger owns the address, database, login and key.
+  // Only the company switches are set here.
+  const managed = Boolean(odoo?.managed);
+  await platform.load();
+  // Platform mode with a connection made here before OdooBridger owned it:
+  // it keeps syncing, read-only, until the same Odoo is connected there.
+  const locked = managed || platform.on;
+  const portalOdoo = `${platform.info?.portal_url || '/'}#/odoo`;
+  if (platform.on && !odoo) {
+    mount.innerHTML = `<div class="card">${cardHead('Odoo', '')}
+      ${banner('Connect Odoo In OdooBridger',
+        'Your Odoo is connected once, in your OdooBridger account, and every service uses it. It appears here a moment after you connect it.',
+        'warn', { href: portalOdoo, label: 'Open OdooBridger' })}
+    </div>`;
+    return;
+  }
 
   if (!odoo || odooLastCompanies?.connId !== odoo.id) odooLastCompanies = null;
 
@@ -717,7 +734,7 @@ async function renderOdoo(mount, route) {
   // only unlocks once the values in the form have been tested — see
   // wireTestFirst. Remove is kept apart from both, on the far left.
   const inSetup = Boolean(mount.closest('#setupBody'));
-  const removeControls = odoo && !readonly && !inSetup ? (
+  const removeControls = odoo && !readonly && !inSetup && !locked ? (
     odooConfirmDelete
       ? '<span class="hint">Remove this connection?</span>'
         + '<button type="button" class="sm danger" id="odooRemoveCommit">Remove</button>'
@@ -738,7 +755,14 @@ async function renderOdoo(mount, route) {
       ${!odoo && !readonly ? testFirstHint('Connect Odoo') : ''}
       <div id="odooTestResult"></div>
       <div id="odooStatus">${odoo ? statusRow(odoo) : ''}</div>
+      ${managed ? banner('Set In OdooBridger',
+        'The address, database, login and API key come from your OdooBridger account. Change them there. The companies below are set here.',
+        '', { href: portalOdoo, label: 'Open OdooBridger' }) : ''}
+      ${locked && !managed ? banner('Move This Connection To OdooBridger',
+        'Connect the same Odoo in your OdooBridger account. It takes this connection over and keeps its companies and history.',
+        'warn', { href: portalOdoo, label: 'Open OdooBridger' }) : ''}
       <form id="odooForm" ${readonly ? 'inert' : ''}>
+        <fieldset class="plain-fieldset" ${locked ? 'disabled' : ''}>
         ${field({
           name: 'url', label: 'Server URL', required: true, tip: true, strongHelp: true,
           value: odoo?.url || '', placeholder: 'https://acme.odoo.com',
@@ -749,7 +773,7 @@ async function renderOdoo(mount, route) {
           help: 'On Odoo Online this is usually the subdomain.',
         })}
         ${field({ name: 'username', label: 'Login', required: true, value: odoo?.username || '' })}
-        ${field({
+        ${locked ? '' : field({
           name: 'api_key', label: 'API Key', type: 'password', tip: true,
           required: true, noRequiredAttr: !!odoo,
           placeholder: odoo ? 'unchanged' : '',
@@ -757,6 +781,7 @@ async function renderOdoo(mount, route) {
             ? 'Stored encrypted and never shown again. Leave blank to keep the current one.'
             : 'Odoo → Preferences → Account Security → New API key.',
         })}
+        </fieldset>
         <div id="companyField">${companyFieldHtml(odoo, odooLastCompanies?.companies, savedDisabled(odoo, odooLastCompanies?.companies))}</div>
       </form>
       ${inSetup && actions ? `<div class="setup-foot actions">${actions}</div>` : ''}

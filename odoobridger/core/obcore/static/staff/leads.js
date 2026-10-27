@@ -4,8 +4,11 @@
  * note is in the lead's history. A won lead converts into an account. */
 
 import { money } from "/assets/api.js";
-import { $, $$, empty, esc, field, fmtAgo, guard, loading, readForm, stat, toast, viewSwitchHtml } from '/assets/ui.js';
+import { $, $$, empty, esc, field, fmtAgo, guard, loading, readForm, kpi, moneyInput, parseMoney, toast, viewSwitchHtml } from '/assets/ui.js';
 import { dialog } from '/assets/shell.js';
+import { detectCountryEntry } from '/site/geo.js';
+import { multiSelect } from '/site/multiselect.js';
+import { phoneCode } from '/site/phone-code.js';
 import { api } from './client.js';
 
 const STAGES = [['new', 'New'], ['contacted', 'Contacted'], ['qualified', 'Qualified'], ['won', 'Won'], ['lost', 'Lost']];
@@ -38,22 +41,22 @@ function summaryHtml(rows) {
   const won = count('won');
   const lost = count('lost');
   const value = open.reduce((t, r) => t + (r.value_cents || 0), 0);
-  return `<div class="grid cols-4" style="margin-bottom:16px">
-    ${stat({ label: 'Open Leads', value: open.length, note: 'still in play' })}
-    ${stat({ label: 'Pipeline Value', value: money(value), note: 'per month, open leads' })}
-    ${stat({ label: 'Won', value: won, note: `${lost} lost` })}
-    ${stat({ label: 'Conversion', value: won + lost ? `${Math.round((won / (won + lost)) * 100)}%` : '—', note: 'won ÷ (won + lost)' })}
+  return `<div class="kpis four" style="margin-bottom:16px">
+    ${kpi({ icon: 'mail', tone: 'acc', label: 'Open Leads', value: open.length })}
+    ${kpi({ icon: 'money', tone: 'ok', label: 'Pipeline Value', value: money(value) })}
+    ${kpi({ icon: 'trophy', tone: 'ok', label: 'Won', value: won })}
+    ${kpi({ icon: 'percent', tone: 'acc', label: 'Conversion', value: won + lost ? `${Math.round((won / (won + lost)) * 100)}%` : '—' })}
   </div>`;
 }
 
 function boardCard(r) {
-  return `<div class="board-card" draggable="true" data-id="${esc(r.id)}" tabindex="0" role="button" aria-label="${esc(r.name)}, ${esc(r.company)}">
+  return `<div class="board-card${r.stage === 'won' ? ' closed' : ''}" draggable="${r.stage === 'won' ? 'false' : 'true'}" data-id="${esc(r.id)}" tabindex="0" role="button" aria-label="${esc(r.name)}, ${esc(r.company)}">
     <strong class="bc-name">${esc(r.name)}</strong>
     <div class="hint bc-co">${esc(r.company)}</div>
     <div class="bc-topic"><span class="pill mute">${esc(r.topic)}</span>${r.demo_status ? ` ${demoPill(r)}` : ''}</div>
     ${servicesLine(r) ? `<div class="hint">${esc(servicesLine(r))}</div>` : ''}
     ${r.value_cents ? `<div class="hint">${money(r.value_cents)}/mo</div>` : ''}
-    <div class="hint bc-age">${esc(fmtAgo(inStage(r)))} in ${esc(LABEL[r.stage] || r.stage)}</div>
+    <div class="hint bc-age">${r.stage === 'won' ? `Closed ${esc(fmtAgo(inStage(r)))}` : `${esc(fmtAgo(inStage(r)))} in ${esc(LABEL[r.stage] || r.stage)}`}</div>
   </div>`;
 }
 
@@ -80,7 +83,8 @@ function listHtml(rows) {
 
 function statusBar(stage) {
   const at = FLOW.indexOf(stage);
-  const step = (key, cls) => `<button type="button" class="wiz-step ${cls}" data-stage="${key}" aria-current="${key === stage ? 'step' : 'false'}" title="Move to ${esc(LABEL[key])}">
+  const closed = stage === 'won';
+  const step = (key, cls) => `<button type="button" class="wiz-step ${cls}" data-stage="${key}" aria-current="${key === stage ? 'step' : 'false'}"${closed ? ' disabled title="Won leads are closed"' : ` title="Move to ${esc(LABEL[key])}"`}>
     <span class="wdot">${cls === 'done' ? '&#10003;' : ''}</span><span class="lbl">${esc(LABEL[key])}</span></button>`;
   return `<div class="wiz-bar" role="group" aria-label="Lead stage">
     ${FLOW.map((k, i) => step(k, stage === 'lost' ? '' : (i < at ? 'done' : i === at ? 'current' : ''))).join('<span class="wiz-line"></span>')}
@@ -88,7 +92,7 @@ function statusBar(stage) {
 }
 
 function demoRow(r) {
-  if (r.stage === 'new' || !wantsDemo(r)) return '';
+  if (r.stage === 'new' || r.stage === 'won' || !wantsDemo(r)) return '';
   return `<span class="wiz-demo-label">Demo</span>
     <div class="seg" role="group" aria-label="Demo status">${DEMOS.map(([v, l]) => `
       <button type="button" class="seg-btn ${v} ${r.demo_status === v ? 'on' : ''}" data-demo="${v}" aria-pressed="${r.demo_status === v}">${esc(l)}</button>`).join('')}</div>`;
@@ -108,12 +112,12 @@ function panelHtml(r) {
   return `<div class="wiz-backdrop" data-close></div>
     <div class="wiz" role="dialog" aria-modal="true" aria-label="Lead: ${esc(r.name)}">
       <header><div>
-        <h3>${esc(r.name)} <span class="hint">· ${esc(r.company)}</span></h3>
+        <h3>${esc(r.name)} <span class="hint">· ${esc(r.company)}</span>${r.stage === 'won' ? ' <span class="pill ok">Won · Closed</span>' : ''}</h3>
         <div class="hint"><a href="mailto:${esc(r.email)}">${esc(r.email)}</a>${r.phone ? ` · ${esc(r.phone)}` : ''}${r.country ? ` · ${esc(r.country)}` : ''} · came in ${esc(fmtAgo(r.created_at))}</div>
       </div>
       <div class="row" style="gap:8px">
         ${r.account_id ? `<a class="btn sm" href="#/accounts/${esc(r.account_id)}">Open Account</a>` : '<button class="sm primary" id="wConvert">Convert To Account</button>'}
-        <button class="sm" data-close aria-label="Close">Close</button></div></header>
+        <button class="link wiz-x" type="button" data-close aria-label="Close">&times;</button></div></header>
       <div class="wiz-status" id="wStatus">${statusBar(r.stage)}</div>
       <div class="wiz-demo" id="wDemo">${demoRow(r)}</div>
       <div class="wiz-body"><div class="wiz-cols">
@@ -128,16 +132,17 @@ function panelHtml(r) {
           </div>
           ${r.message ? `<p class="wiz-msg">${esc(r.message)}</p>` : ''}
           <div class="grid cols-2" style="margin-top:12px">
-            <div><label for="wValue">Expected value per month</label>
-              <input id="wValue" type="number" min="0" step="1" value="${r.value_cents != null ? r.value_cents / 100 : ''}" placeholder="0"></div>
+            <div><label for="wValue">Expected revenue per month</label>
+              ${r.stage === 'won' ? `<div class="wiz-fixed">${r.value_cents != null ? `${money(r.value_cents)}/mo` : '—'}</div>` : moneyInput({ id: 'wValue', value_cents: r.value_cents })}</div>
             <div><label for="wDemoAt">Demo date</label>
-              <input id="wDemoAt" type="datetime-local" value="${r.demo_at ? r.demo_at.slice(0, 16) : ''}"></div>
+              ${r.stage === 'won' ? `<div class="wiz-fixed">${r.demo_at ? esc(new Date(r.demo_at).toLocaleString()) : '—'}</div>`
+                : `<input id="wDemoAt" type="datetime-local" value="${r.demo_at ? r.demo_at.slice(0, 16) : ''}">`}</div>
           </div>
           <div id="wLostWrap" class="${r.stage === 'lost' ? '' : 'hidden'}" style="margin-top:12px">
             <label for="wLost">Why was it lost? <span class="opt">optional</span></label>
             <input id="wLost" type="text" maxlength="160" value="${esc(r.lost_reason || '')}" placeholder="Too expensive, chose a competitor, no response…">
           </div>
-          <div class="row" style="margin-top:12px"><button class="primary" id="wSave">Save</button></div>
+          ${r.stage === 'won' ? '' : '<div class="row" style="margin-top:12px"><button class="primary" id="wSave">Save</button></div>'}
         </section>
         <section>
           <h4>History</h4>
@@ -151,27 +156,36 @@ function panelHtml(r) {
 }
 
 async function newLeadDialog(services) {
-  return dialog({
+  let picker = null;
+  let dial = null;
+  const opened = dialog({
     title: 'New Lead', submitLabel: 'Add Lead', wide: true,
     body: `<div class="grid cols-2">
       ${field({ name: 'name', label: 'Name', required: true })}${field({ name: 'company', label: 'Company', required: true })}
-      ${field({ name: 'email', label: 'Email', type: 'email', required: true })}${field({ name: 'phone', label: 'Phone' })}
-      ${field({ name: 'country', label: 'Country' })}${field({ name: 'value', label: 'Expected value per month', type: 'number' })}
+      ${field({ name: 'email', label: 'Email', type: 'email', required: true })}
+      <div class="field"><label for="leadPhone">Contact number <span class="opt">optional</span></label>
+        <div class="phone-row"><div id="leadDial"></div><input id="leadPhone" name="phone" type="tel" placeholder="Phone number"></div></div>
+      <div class="field"><label>Interested services <span class="opt">optional</span></label><div id="leadServices"></div></div>
+      <div class="field"><label for="leadValue">Expected revenue per month <span class="opt">optional</span></label>
+        ${moneyInput({ id: 'leadValue', name: 'value' })}</div>
     </div>
-    <label>Services</label>
-    <div class="row" style="gap:14px;flex-wrap:wrap;margin-bottom:12px">${services.map((s) =>
-      `<label style="font-weight:400"><input type="checkbox" data-svc="${esc(s.slug)}"> ${esc(s.name)}</label>`).join('')}</div>
     ${field({ name: 'message', label: 'Notes', type: 'textarea' })}`,
     onSubmit: (form) => {
       const v = readForm(form);
+      const number = (v.phone || '').trim();
       return api.post('/staff/leads', {
-        topic: 'Sales question', name: v.name, company: v.company, email: v.email, phone: v.phone || null,
-        country: v.country || null, message: v.message || null,
-        value_cents: v.value == null ? null : Math.round(v.value * 100),
-        services: $$('[data-svc]', form).filter((c) => c.checked).map((c) => c.dataset.svc),
+        topic: 'Sales question', name: v.name, company: v.company, email: v.email,
+        phone: number ? `${dial.dial()} ${number}` : null,
+        country: number ? dial.country() : null, message: v.message || null,
+        value_cents: parseMoney(v.value),
+        services: picker.values(),
       });
     },
   });
+  picker = multiSelect($('#leadServices'), services.map((s) => ({ value: s.slug, label: s.name })),
+    { placeholder: 'Select one or more services' });
+  dial = phoneCode($('#leadDial'), detectCountryEntry());
+  return opened;
 }
 
 export async function renderLeads(mount, route = { query: {} }) {
@@ -223,13 +237,18 @@ export async function renderLeads(mount, route = { query: {} }) {
     };
     const bindBar = () => $$('.wiz-step', host).forEach((b) => b.addEventListener('click', () => {
       const to = b.dataset.stage;
-      if (to === lead.stage) return;
+      if (to === lead.stage || lead.stage === 'won') return;
       guard(async () => {
         Object.assign(lead, await api.patch(`/staff/leads/${id}`, { stage: to }));
         changed = true;
         $('#wStatus', host).innerHTML = statusBar(lead.stage);
         bindBar();
         paintDemo();
+        if (lead.stage === 'won') {   // now closed: show it again, read-only
+          document.removeEventListener('keydown', onKey);
+          await renderLeads(mount, { query: { open: id } });
+          return;
+        }
         $('#wLostWrap', host).classList.toggle('hidden', lead.stage !== 'lost');
         if (lead.stage === 'lost') $('#wLost', host).focus();
         await refreshHistory();
@@ -237,10 +256,10 @@ export async function renderLeads(mount, route = { query: {} }) {
     }));
     bindBar();
     paintDemo();
-    $('#wSave', host).addEventListener('click', () => guard(async () => {
+    $('#wSave', host)?.addEventListener('click', () => guard(async () => {
       const value = $('#wValue', host).value;
       const demoAt = $('#wDemoAt', host).value;
-      const body = { value_cents: value === '' ? null : Math.round(Number(value) * 100) };
+      const body = { value_cents: parseMoney(value) };
       if (demoAt) body.demo_at = new Date(demoAt).toISOString();
       if (lead.stage === 'lost') { body.stage = 'lost'; body.lost_reason = $('#wLost', host).value; }
       Object.assign(lead, await api.patch(`/staff/leads/${id}`, body));
@@ -290,6 +309,7 @@ export async function renderLeads(mount, route = { query: {} }) {
       const lead = byId.get(id);
       const to = col.dataset.stage;
       if (!lead || lead.stage === to) return;
+      if (lead.stage === 'won') { toast('Won leads are closed and stay in Won.', 'warn'); return; }
       setTimeout(() => guard(async () => {
         await api.patch(`/staff/leads/${id}`, { stage: to });
         await redraw();

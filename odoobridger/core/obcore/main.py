@@ -39,11 +39,11 @@ async def lifespan(app: FastAPI):
     with session_scope() as db:
         from obcore.services.jobs import ensure_static_staff
 
-        from obcore.services.catalog import ensure_biometric, ensure_demo
+        from obcore.services.catalog import ensure_biometric, retire_demo
 
         ensure_static_staff(db)
         ensure_biometric(db)
-        ensure_demo(db)
+        retire_demo(db)
         keys.load(db)
     task = asyncio.create_task(_jobs()) if settings.run_background_jobs else None
     log.info("%s core started (env=%s)", settings.app_name, settings.environment)

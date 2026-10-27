@@ -39,7 +39,7 @@ def ensure_biometric(db: Session) -> Service | None:
         return None
     service = db.scalar(select(Service).where(Service.slug == "biometric"))
     if service is None:
-        service = Service(slug="biometric", name="Biometric Attendance",
+        service = Service(slug="biometric", name="BioBridge",
                           tagline="Biometric terminals into Odoo attendance, automatically.",
                           description="Connect ZKTeco, Hikvision, Suprema and other terminals to Odoo. "
                                       "Punches become hr.attendance records on a schedule.",
@@ -49,6 +49,9 @@ def ensure_biometric(db: Session) -> Service | None:
         for spec in BIOMETRIC_PACKAGES:
             db.add(ServicePackage(service_id=service.id, **spec))
         log.info("Registered the biometric service at %s", settings.biometric_base_url)
+    if service.name == "Biometric Attendance":   # its earlier name
+        service.name = "BioBridge"
+    service.uses_odoo = True
     service.base_url = settings.biometric_base_url
     service.internal_url = settings.biometric_internal_url or None
     service.client_secret_hash = hash_token(settings.biometric_client_secret)
@@ -56,37 +59,29 @@ def ensure_biometric(db: Session) -> Service | None:
     return service
 
 
-DEMO_PACKAGES = [
-    {"name": "Basic", "description": "A small team.", "monthly_price_cents": 900, "yearly_price_cents": 9000,
-     "sort_order": 1, "entitlements": {"max_seats": 3}, "features": ["3 seats", "Shared dashboard"]},
-    {"name": "Plus", "description": "Growing teams.", "is_default": True, "monthly_price_cents": 1900,
-     "yearly_price_cents": 19000, "sort_order": 2, "entitlements": {"max_seats": 10},
-     "features": ["10 seats", "Shared dashboard"]},
-]
+def retire_demo(db: Session) -> None:
+    """Take the old demo service (Team Desk) off databases that still have it.
 
-
-def ensure_demo(db: Session) -> Service | None:
-    """Register (or update) the demo service, Team Desk, from DEMO_* settings.
-
-    It exists to show a customer several purchased services side by side.
-    Off unless DEMO_CLIENT_SECRET is set.
+    Accounts' trial rows for it are removed with it. A row that was billed
+    through Stripe is left alone and the service only hidden, so a payment
+    is never lost silently; staff can cancel it from the console.
     """
-    if not settings.demo_client_secret:
-        return None
+    from obcore.models import AccountService
+
     service = db.scalar(select(Service).where(Service.slug == "demo"))
     if service is None:
-        service = Service(slug="demo", name="Team Desk (Demo)",
-                          tagline="A small demo service for trying OdooBridger.",
-                          description="Shows how a second service appears next to Biometric Attendance: "
-                                      "its own package, limits, status and sign-in.",
-                          base_url=settings.demo_base_url, sso_callback_path="/sso", sort_order=9)
-        db.add(service)
+        return
+    rows = db.scalars(select(AccountService).where(AccountService.service_id == service.id)).all()
+    if any(r.stripe_item_id for r in rows):
+        service.is_active = False
+        service.is_public = False
+        log.warning("The demo service has billed subscriptions; hidden instead of removed")
         db.flush()
-        for spec in DEMO_PACKAGES:
-            db.add(ServicePackage(service_id=service.id, **spec))
-        log.info("Registered the demo service at %s", settings.demo_base_url)
-    service.base_url = settings.demo_base_url
-    service.internal_url = settings.demo_internal_url or None
-    service.client_secret_hash = hash_token(settings.demo_client_secret)
+        return
+    for row in rows:
+        row.account.services.remove(row)
+        db.delete(row)
     db.flush()
-    return service
+    db.delete(service)
+    db.flush()
+    log.info("Removed the demo service (Team Desk)")

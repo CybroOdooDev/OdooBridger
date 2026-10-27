@@ -738,6 +738,8 @@ class OdooConnectionOut(ORMModel):
     status_message: str | None
     last_checked_at: datetime | None
     is_active: bool
+    #: Platform mode: set in OdooBridger; only the company switches change here.
+    managed: bool = False
     @field_validator("disabled_company_ids", mode="before")
     @classmethod
     def _none_is_empty(cls, value):

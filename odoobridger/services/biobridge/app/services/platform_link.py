@@ -168,8 +168,138 @@ def apply_state(db: Session, state: dict[str, Any]) -> Tenant:
     }
     if "users" in state:
         _apply_users(db, tenant, state.get("users") or [])
+    if "odoo" in state:
+        apply_odoo(db, tenant, state.get("odoo"))
     db.flush()
     return tenant
+
+
+# =============================================================================
+# The account's Odoo, owned by the core
+# =============================================================================
+def _same_odoo(conn, url: str, db_name: str) -> bool:
+    def norm(u: str) -> str:
+        u = (u or "").strip().lower().split("://", 1)[-1].rstrip("/")
+        return u.removeprefix("www.")
+    return norm(conn.url) == norm(url) and (conn.db_name or "").strip().lower() == (db_name or "").strip().lower()
+
+
+def apply_odoo(db: Session, tenant: Tenant, block: dict[str, Any] | None) -> None:
+    """Make the tenant's Odoo connection match the one OdooBridger sent.
+
+    The connection BioBridge already had for the same Odoo database is taken
+    over (so its mappings, company switches and device records carry on);
+    otherwise a new one is made. Any other active connection is switched
+    off: a tenant syncs into one Odoo. ``None`` means the account has no Odoo
+    connection any more — the managed one stops being used, nothing is deleted.
+    """
+    from app.core.crypto import encrypt
+    from app.integrations.odoo import forget_detected_api
+    from app.models import ConnectionStatus, OdooConnection
+
+    rows = list(db.scalars(select(OdooConnection).where(OdooConnection.tenant_id == tenant.id)))
+    if not block:
+        for conn in rows:
+            if conn.managed and conn.is_active:
+                conn.is_active = False
+                conn.status = ConnectionStatus.failed.value
+                conn.status_message = "Odoo was disconnected in OdooBridger."
+        return
+    for key in ("id", "url", "db", "login", "api_key"):
+        if not block.get(key):
+            raise PlatformError(f"The Odoo connection has no {key}.")
+    conn = next((c for c in rows if c.platform_connection_id == block["id"]), None) \
+        or next((c for c in rows if _same_odoo(c, block["url"], block["db"])), None)
+    if conn is None:
+        name, n = "OdooBridger", 1
+        while any(c.name == name for c in rows):
+            n += 1
+            name = f"OdooBridger {n}"
+        conn = OdooConnection(tenant_id=tenant.id, name=name, url=block["url"], db_name=block["db"],
+                              username=block["login"])
+        db.add(conn)
+        log.info("Tenant %s: Odoo connection from OdooBridger (%s)", tenant.slug, block["url"])
+    from app.core.crypto import decrypt
+
+    changed = (conn.url, conn.db_name, conn.username) != (block["url"], block["db"], block["login"]) \
+        or decrypt(conn.api_key_enc, tenant.crypto_key) != block["api_key"]
+    if changed:
+        forget_detected_api(conn.url)
+        conn.url, conn.db_name, conn.username = block["url"], block["db"], block["login"]
+        conn.api_key_enc = encrypt(block["api_key"], tenant.crypto_key)
+        conn.uid_cache = None
+        conn.status = ConnectionStatus.unverified.value
+        conn.status_message = None
+    conn.platform_connection_id = block["id"]
+    if block.get("version"):
+        conn.odoo_version = str(block["version"])[:32]
+    conn.is_active = True
+    for other in rows:
+        if other is not conn and other.is_active:
+            other.is_active = False
+            other.status_message = "Replaced by the Odoo connection set in OdooBridger."
+
+
+def odoo_readiness(db: Session, tenant: Tenant, *, live: bool = False) -> dict[str, Any] | None:
+    """BioBridge's own check on the Odoo OdooBridger gave it: can it sign in and
+    write attendance. ``live`` runs the check now; otherwise the last result."""
+    from datetime import datetime, timezone
+
+    from app.integrations.odoo import OdooAuthError, OdooError
+    from app.models import ConnectionStatus, OdooConnection
+    from app.services.connections import UnsafeTargetError, build_odoo_client
+    from app.services.friendly_errors import friendly_odoo_message
+
+    conn = db.scalar(select(OdooConnection).where(OdooConnection.tenant_id == tenant.id,
+                                                  OdooConnection.platform_connection_id.is_not(None),
+                                                  OdooConnection.is_active.is_(True)))
+    if conn is None:
+        return None
+    if live:
+        now = datetime.now(timezone.utc)
+        try:
+            info = build_odoo_client(tenant, conn).ping()
+        except (OdooError, UnsafeTargetError) as exc:
+            message = friendly_odoo_message(exc)
+            conn.status = ConnectionStatus.failed.value
+            conn.status_message = message
+            conn.last_checked_at = now
+            db.flush()
+            auth = isinstance(exc, OdooAuthError)
+            return {"ready": False, "message": message, "auth_failed": auth,
+                    "checks": [{"name": "Sign in" if auth else "Odoo check", "ok": False}],
+                    "checked_at": now.isoformat()}
+        conn.uid_cache = info["uid"]
+        conn.odoo_version = str(info.get("server_version") or conn.odoo_version or "")
+        conn.has_companion_addon = bool(info.get("has_companion_addon"))
+        conn.has_device_tracking = bool(info.get("has_device_tracking"))
+        conn.device_tracking_mode = info.get("device_tracking_mode")
+        can_write = bool(info.get("can_create_attendance"))
+        conn.status = ConnectionStatus.connected.value if can_write else ConnectionStatus.degraded.value
+        conn.status_message = None if can_write else (
+            "This Odoo user cannot create attendance records. Add them to Employees / Administrator.")
+        conn.last_checked_at = now
+        db.flush()
+    checks = [
+        {"name": "Sign in", "ok": conn.status in (ConnectionStatus.connected.value, ConnectionStatus.degraded.value)},
+        {"name": "Create attendance", "ok": conn.status == ConnectionStatus.connected.value},
+        {"name": "Device tracking", "ok": bool(conn.has_device_tracking), "optional": True},
+    ]
+    if conn.status == ConnectionStatus.unverified.value:
+        return {"ready": None, "message": "Not checked yet.", "auth_failed": False, "checks": [],
+                "checked_at": None}
+    ready = conn.status == ConnectionStatus.connected.value
+    message = "Ready." if ready else (conn.status_message or "Not ready.")
+    auth_failed = conn.status == ConnectionStatus.failed.value and _looks_like_auth(conn.status_message)
+    return {"ready": ready, "message": message, "auth_failed": auth_failed, "checks": checks,
+            "checked_at": conn.last_checked_at.isoformat() if conn.last_checked_at else None}
+
+
+def _looks_like_auth(message: str | None) -> bool:
+    """The friendly messages BioBridge records when Odoo refuses to sign in
+    (see friendly_errors.friendly_odoo_message)."""
+    low = (message or "").lower()
+    return low.startswith("login failed") or "check the database name" in low
 
 
 def _apply_users(db: Session, tenant: Tenant, people: list[dict[str, Any]]) -> None:
@@ -256,7 +386,7 @@ def sign_in(db: Session, claims: dict[str, Any]) -> User:
     return user
 
 
-def usage(db: Session, tenant: Tenant) -> dict[str, Any]:
+def usage(db: Session, tenant: Tenant, *, check_odoo: bool = False) -> dict[str, Any]:
     from app.models import Device, EmployeeMapping, MappingStatus, SyncRun
 
     devices = db.scalar(select(func.count(Device.id)).where(Device.tenant_id == tenant.id)) or 0
@@ -272,4 +402,5 @@ def usage(db: Session, tenant: Tenant) -> dict[str, Any]:
         "sync_interval_minutes": tenant.sync_interval_minutes,
         "last_sync": {"status": last.status, "started_at": last.started_at.isoformat() if last.started_at else None}
         if last else None,
+        "odoo": odoo_readiness(db, tenant, live=check_odoo),
     }

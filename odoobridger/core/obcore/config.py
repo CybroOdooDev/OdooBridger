@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     # --- trials and the subscription sweep -----------------------------------
     default_trial_days: int = 14
     sweep_interval_seconds: int = 300
+    #: How often the sweep asks services whether they can still work on the customer's Odoo.
+    odoo_readiness_minutes: int = 15
+    #: May a customer's Odoo address point into a private network (10.x,
+    #: 192.168.x, localhost)? Unset: allowed outside production only. In
+    #: production the core would otherwise test-connect to internal hosts.
+    odoo_allow_private_targets: bool | None = None
+
+    @field_validator("odoo_allow_private_targets", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
     run_background_jobs: bool = True
 
     # --- email ---------------------------------------------------------------
@@ -61,6 +72,13 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     mail_from: str = "no-reply@odoobridger.com"
     sales_email: str = ""
+    # Company details shown beside the contact form; empty ones are not shown.
+    company_name: str = "Cybrosys Technologies"
+    contact_email: str = ""
+    contact_phone: str = ""
+    contact_address: str = ""
+    contact_hours: str = ""
+    company_website: str = ""
     email_verification_ttl_hours: int = 48
     password_reset_ttl_minutes: int = 60
 
@@ -75,10 +93,6 @@ class Settings(BaseSettings):
     biometric_client_secret: str = ""
     biometric_base_url: str = "http://localhost:8001"
     biometric_internal_url: str = ""
-    # --- the demo service (Team Desk), registered at boot when its secret is set
-    demo_client_secret: str = ""
-    demo_base_url: str = "http://localhost:8002"
-    demo_internal_url: str = ""
 
     http_timeout_seconds: int = 20
     registration_rate_per_hour: int = 10

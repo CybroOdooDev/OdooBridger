@@ -182,25 +182,175 @@ def test_jwks_matches_the_signing_key(client, catalog):
 
 
 def test_pages_are_served(client):
-    for path in ("/", "/site/signup.html", "/site/terms.html", "/site/privacy.html", "/app/", "/staff/", "/assets/app.css", "/assets/shell.js",
+    for path in ("/", "/site/signup.html", "/site/contact.html", "/site/contact.js", "/site/terms.html", "/site/privacy.html", "/app/", "/staff/", "/assets/app.css", "/assets/shell.js",
                  "/app/app.js", "/staff/app.js", "/staff/leads.js", "/site/site.js"):
         assert client.get(path).status_code == 200, path
 
 
-def test_demo_service_is_registered_only_when_its_secret_is_set(client, monkeypatch):
+def test_old_demo_service_is_removed_at_boot(client, catalog):
     from sqlalchemy import select
 
+    from obcore.db import SessionLocal
+    from obcore.models import AccountService, Service, ServicePackage
+    from obcore.services.catalog import retire_demo
+
+    signup(client)
+    db = SessionLocal()
+    demo = Service(slug="demo", name="Team Desk (Demo)", base_url="http://localhost:8002")
+    db.add(demo)
+    db.flush()
+    package = ServicePackage(service_id=demo.id, name="Plus", monthly_price_cents=1900)
+    db.add(package)
+    db.flush()
+    other = db.scalars(select(AccountService)).first()
+    db.add(AccountService(account_id=other.account_id, service_id=demo.id, package_id=package.id,
+                          status="trialing"))
+    db.commit()
+
+    retire_demo(db)
+    db.commit()
+    assert db.scalar(select(Service).where(Service.slug == "demo")) is None
+    assert [r.service.slug for r in db.scalars(select(AccountService))] == ["biometric"]
+    db.close()
+
+
+def test_biometric_service_is_named_biobridge(client, monkeypatch):
     from obcore.config import settings
     from obcore.db import SessionLocal
     from obcore.models import Service
-    from obcore.services.catalog import ensure_demo
+    from obcore.services.catalog import ensure_biometric
+
+    monkeypatch.setattr(settings, "biometric_client_secret", "s3cret")
+    db = SessionLocal()
+    db.add(Service(slug="biometric", name="Biometric Attendance", base_url="http://x"))
+    db.commit()
+    assert ensure_biometric(db).name == "BioBridge"
+    db.close()
+
+
+def test_contact_page_details_come_from_settings(client, monkeypatch):
+    from obcore.config import settings
+
+    monkeypatch.setattr(settings, "contact_email", "")
+    monkeypatch.setattr(settings, "sales_email", "sales@acme.io")
+    monkeypatch.setattr(settings, "contact_phone", "+91 1")
+    info = client.get("/api/v1/public/site").json()
+    assert info["email"] == "sales@acme.io" and info["phone"] == "+91 1" and info["company"]
+    assert set(info) == {"company", "email", "phone", "address", "hours", "website"}
+
+
+def test_buy_now_goes_to_checkout_once_the_email_is_confirmed(client, catalog, fake_stripe):
+    r = client.post("/api/v1/public/signup", json={
+        "company": "Buyer Ltd", "full_name": "Bea Buyer", "email": "bea@buyer.io", "mode": "buy",
+        "interval": "year", "services": [{"service": "biometric"}]})
+    assert r.status_code == 201
+    assert "checkout_url" not in r.json() and "payment" in r.json()["message"]
+    assert not any(path == "checkout/sessions" for _, path, _ in fake_stripe.calls)
+    r = client.post("/api/v1/auth/link/use", json={"token": link_token("bea@buyer.io"), "password": "Secret-Pass-1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["checkout_url"].startswith("https://checkout.stripe.test/") and r.json()["access_token"]
+
+
+def test_buy_now_without_stripe_or_yearly_price_is_refused_before_creating_anything(client, catalog):
+    body = {"company": "Buyer Ltd", "full_name": "Bea Buyer", "email": "bea@buyer.io", "mode": "buy",
+            "services": [{"service": "biometric"}]}
+    r = client.post("/api/v1/public/signup", json=body)
+    assert r.status_code == 409 and "free trial" in r.json()["detail"].lower()
+
+
+def test_buy_now_yearly_needs_a_yearly_price(client, catalog, fake_stripe):
+    body = {"company": "Buyer Ltd", "full_name": "Bea Buyer", "email": "bea@buyer.io", "mode": "buy",
+            "services": [{"service": "biometric"}]}
+    assert client.post("/api/v1/public/signup", json={**body, "interval": "year",
+        "services": [{"service": "biometric", "package_id": catalog["growth"]}]}).status_code == 409
+
+
+
+# --- nothing exists until the email is confirmed -----------------------------------
+def _count(model) -> int:
+    from obcore.db import SessionLocal
 
     db = SessionLocal()
-    monkeypatch.setattr(settings, "demo_client_secret", "")
-    assert ensure_demo(db) is None
-    monkeypatch.setattr(settings, "demo_client_secret", "s3cret")
-    svc = ensure_demo(db)
+    try:
+        return db.query(model).count()
+    finally:
+        db.close()
+
+
+def test_signup_creates_nothing_until_the_link_is_used(client, catalog, service_app):
+    from obcore.models import Account, AccountService, PendingSignup, User
+
+    r = client.post("/api/v1/public/signup", json={
+        "company": "Acme Ltd", "full_name": "Olive Owner", "email": "Owner@Acme.io",
+        "services": [{"service": "biometric", "package_id": catalog["growth"]}]})
+    assert r.status_code == 201
+    assert (_count(Account), _count(User), _count(AccountService), _count(PendingSignup)) == (0, 0, 0, 1)
+    assert service_app.accounts == {}
+    # The link shows who is signing up, and still creates nothing.
+    token = link_token("owner@acme.io")
+    info = client.post("/api/v1/auth/link/check", json={"token": token}).json()
+    assert info["email"] == "owner@acme.io" and info["account"] == "Acme Ltd" and info["signup"] is True
+    assert _count(Account) == 0
+    # Signing in before confirming explains what to do.
+    r = client.post("/api/v1/auth/login", json={"email": "owner@acme.io", "password": "Secret-Pass-1"})
+    assert r.status_code == 403 and "Confirm your email" in r.json()["detail"]
+
+    r = client.post("/api/v1/auth/link/use", json={"token": token, "password": "Secret-Pass-1"})
+    assert r.status_code == 200, r.text
+    headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
+    account = client.get("/api/v1/portal/account", headers=headers).json()["account"]
+    (row,) = account["services"]
+    assert row["status"] == "trialing" and row["package"]["name"] == "Growth"
+    assert (_count(Account), _count(User), _count(PendingSignup)) == (1, 1, 0)
+    assert service_app.accounts[account["id"]]["status"] == "trialing"
+    # The link is spent.
+    assert client.post("/api/v1/auth/link/use", json={"token": token, "password": "Secret-Pass-1"}).status_code == 400
+    assert client.post("/api/v1/auth/login", json={"email": "owner@acme.io", "password": "Secret-Pass-1"}).status_code == 200
+
+
+def test_signing_up_again_replaces_the_unconfirmed_signup(client, catalog):
+    from obcore.models import PendingSignup
+
+    body = {"company": "Acme Ltd", "full_name": "Olive", "email": "owner@acme.io", "services": [{"service": "biometric"}]}
+    client.post("/api/v1/public/signup", json=body)
+    first = link_token("owner@acme.io")
+    client.post("/api/v1/public/signup", json={**body, "company": "Acme Group"})
+    second = link_token("owner@acme.io")
+    assert first != second and _count(PendingSignup) == 1
+    assert client.post("/api/v1/auth/link/check", json={"token": first}).status_code == 400
+    assert client.post("/api/v1/auth/link/check", json={"token": second}).json()["account"] == "Acme Group"
+    # Resend: a new link, the old one stops working.
+    client.post("/api/v1/public/resend", json={"email": "owner@acme.io"})
+    assert link_token("owner@acme.io") != second
+    assert client.post("/api/v1/auth/link/check", json={"token": second}).status_code == 400
+
+
+def test_an_unconfirmed_signup_expires_and_is_cleared(client, catalog):
+    from datetime import timedelta
+
+    from obcore.db import SessionLocal
+    from obcore.models import Account, PendingSignup
+    from obcore.security import utcnow
+    from obcore.services.jobs import sweep_once
+
+    client.post("/api/v1/public/signup", json={"company": "Acme Ltd", "full_name": "O", "email": "owner@acme.io",
+                                               "services": [{"service": "biometric"}]})
+    token = link_token("owner@acme.io")
+    db = SessionLocal()
+    db.query(PendingSignup).one().expires_at = utcnow() - timedelta(minutes=1)
     db.commit()
-    assert svc.slug == "demo" and svc.sso_callback_path == "/sso"
-    assert db.scalar(select(Service).where(Service.slug == "demo")).packages[0].entitlements == {"max_seats": 3}
+    assert client.post("/api/v1/auth/link/use", json={"token": token, "password": "Secret-Pass-1"}).status_code == 400
+    sweep_once(db)
+    db.commit()
     db.close()
+    assert (_count(PendingSignup), _count(Account)) == (0, 0)
+
+
+def test_a_weak_password_creates_nothing(client, catalog):
+    from obcore.models import Account, PendingSignup
+
+    client.post("/api/v1/public/signup", json={"company": "Acme Ltd", "full_name": "O", "email": "owner@acme.io",
+                                               "services": [{"service": "biometric"}]})
+    r = client.post("/api/v1/auth/link/use", json={"token": link_token("owner@acme.io"), "password": "short"})
+    assert r.status_code == 422
+    assert (_count(Account), _count(PendingSignup)) == (0, 1)

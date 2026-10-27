@@ -53,6 +53,45 @@ account sends `DELETE …/accounts/{id}` to every service first — if one can't
 delete its data, the account is not deleted (staff can force it).
 `GET …/accounts/{id}/usage` gives the staff console the service's own numbers.
 
+**Signup** — the website form creates nothing but a pending signup and an
+email. The account, its owner, its services (so the trial starts then) and the
+provisioning to services happen only when the link is opened and a password
+chosen; "Buy Now" goes on to Stripe Checkout at that point. Signing up again
+replaces the pending one with a new link; unconfirmed signups expire
+(`EMAIL_VERIFICATION_TTL_HOURS`) and the sweep clears them.
+
+**The customer's Odoo** — set once per account in the portal (Odoo page) and
+used by every service that works on Odoo (`Service.uses_odoo`). The core owns
+the connection itself: address, database, login, API key (encrypted), version,
+API flavour, company list, status and an optional key expiry date. Each service
+keeps what it does with it (BioBridge: company switches, mappings, the records
+it writes).
+
+* Saving runs the core's test first (reachable, signs in, the key belongs to
+  that login, companies, Odoo's own `database.uuid` when readable); a failing
+  test saves nothing. Odoo 19+ is tested over JSON-2, older Odoo over XML-RPC.
+* One Odoo database belongs to one account: the same URL + database (any
+  spelling: http/https, `www.`, trailing slash, `/odoo`) or the same
+  `database.uuid` is refused for a second account.
+* Odoo services get it in the provisioning PUT as
+  `"odoo": {"id", "name", "url", "db", "login", "api_key", "version", "api",
+  "companies", "status"}` (or `null` once disconnected). A service that doesn't
+  use Odoo never receives the key; the SSO identity token never carries it.
+  Services call Odoo themselves with their copy, so syncs never wait on the core.
+* Readiness comes back through `GET …/usage` as `"odoo": {"ready", "message",
+  "checks", "auth_failed"}` (`?check_odoo=1` asks for a live check). The
+  portal shows it per service; `auth_failed` marks the connection failed and
+  the account's managers are emailed once. A known key expiry is warned
+  14 days ahead.
+* In production the core refuses Odoo addresses in private networks
+  (`ODOO_ALLOW_PRIVATE_TARGETS`), so a customer can't make it call internal hosts.
+  BioBridge in platform mode does the same by default (`ALLOW_PRIVATE_NETWORK_TARGETS`).
+* **A private Odoo or biometric devices** (on-premise, behind NAT) are reached
+  the way any public server is: the customer sets up a public IP or domain
+  with the port forwarded, and enters it as the address. There is no relay or
+  agent. A ZKTeco terminal that can't be forwarded can use the *Cloud push
+  device* option instead, which dials out by itself.
+
 **SSO** — the portal's "Open" button, or a service sending a signed-out visitor
 to `/app/#/open/<slug>?redirect_uri=…&state=…`:
 
@@ -97,13 +136,21 @@ to `/app/#/open/<slug>?redirect_uri=…&state=…`:
 * Settings → Billing shows the package and links to the portal; the sidebar has
   "All Services & Billing";
 * BioBridge's own staff console still works for service operations; status,
-  plan and limit changes there are refused (they belong to the core).
+  plan and limit changes there are refused (they belong to the core);
+* the Odoo connection comes from the core: the provisioned copy is stored
+  encrypted with the tenant's key and marked managed. An existing connection to
+  the same Odoo database is taken over (keeping its company switches, mappings
+  and history); any other active one is switched off. Address, database, login
+  and key are read-only in Settings → Odoo Connection; the company switches are
+  still set there. A sync that finds the key refused reads the connection
+  again once (a new key may have just arrived) before failing.
 
 Settings: `PLATFORM_MODE`, `PLATFORM_CORE_URL`, `PLATFORM_CORE_INTERNAL_URL`,
 `PLATFORM_SERVICE_SLUG` (default `biometric`), `PLATFORM_CLIENT_SECRET`,
 `PLATFORM_PUBLIC_KEY_PEM` (optional; fetched from the core otherwise). Database:
 migration `0012` adds `tenant.platform_account_id`, `tenant.platform_state`,
-`app_user.platform_user_id` (`python3 tools/db_upgrade.py`).
+`app_user.platform_user_id`; `0013` adds `odoo_connection.platform_connection_id`
+(`python3 tools/db_upgrade.py`).
 
 ## Running it
 
@@ -120,13 +167,6 @@ Services & Packages, and add Stripe price ids). Production:
 `SITE_DOMAIN`, `CORE_DOMAIN` and `BIOMETRIC_DOMAIN`, plus the plain-HTTP ADMS
 port for ZKTeco push terminals.
 
-**Demo service.** To see a customer with several services, run
-`python3 deploy/make-env.py --demo` (adds `DEMO_CLIENT_SECRET`) and start with
-`docker compose -f deploy/docker-compose.yml --profile demo up -d --build`.
-"Team Desk (Demo)" appears on the website, signup and portal beside Biometric
-Attendance, on http://localhost:8002. It is one file (`services/demo/app.py`)
-and also shows what a service must implement.
-
 Without `SMTP_HOST` emails are written to the core's log (handy locally: the
 set-password link is there).
 
@@ -140,6 +180,10 @@ set-password link is there).
    callback path). Copy the client secret shown once.
 3. Add packages with the `entitlements` your service understands, and their
    Stripe prices. It appears on the website, signup and the portal.
+4. If it works on the customer's Odoo, tick "Works on the customer's Odoo".
+   Read the `odoo` block from the provisioning PUT, and report your own
+   readiness (`ready`, `message`, `checks`, `auth_failed`) under `odoo` in
+   `GET …/usage`.
 
 ## Tests
 
@@ -151,8 +195,12 @@ python -m pytest                            # (from the root) end to end: core +
 
 ## Not done yet
 
-* The core creates its tables at boot (`create_all`); add Alembic before the
-  first schema change on a live database.
+* The core creates its tables at boot (`create_all`) and adds new nullable or
+  defaulted columns to existing tables (`add_missing_columns`); add Alembic
+  before anything harder (renames, constraints on existing tables).
+* One Odoo connection per account for now (the model, API and provisioning
+  already carry a connection id, so more can be allowed later). No per-service
+  key override yet.
 * BioBridge's own website and its staff console's plans/leads/Stripe pages still
   exist for standalone mode; in platform mode their endpoints are switched off
   but the console menu items still show.

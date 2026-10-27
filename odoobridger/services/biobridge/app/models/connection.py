@@ -90,6 +90,15 @@ class OdooConnection(Base, UUIDPk, Timestamped):
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    #: Platform mode: the id of the OdooBridger connection this row mirrors.
+    #: Address, database, login and key then come from OdooBridger and can't
+    #: be edited here; the company switches stay BioBridge's own.
+    platform_connection_id: Mapped[str | None] = mapped_column(String(32), index=True)
+
+    @property
+    def managed(self) -> bool:
+        return self.platform_connection_id is not None
+
 
 class DeviceSource(Base, UUIDPk, Timestamped):
     """One attendance platform belonging to one tenant.

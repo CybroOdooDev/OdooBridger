@@ -52,16 +52,22 @@ services:
       BIOMETRIC_CLIENT_SECRET: ${BIOMETRIC_CLIENT_SECRET:?set BIOMETRIC_CLIENT_SECRET}
       BIOMETRIC_BASE_URL: ${BIOMETRIC_PUBLIC_URL:-http://localhost:8001}
       BIOMETRIC_INTERNAL_URL: http://biobridge:8000
-      # The demo service (Team Desk): registered only when its secret is set.
-      DEMO_CLIENT_SECRET: ${DEMO_CLIENT_SECRET:-}
-      DEMO_BASE_URL: ${DEMO_PUBLIC_URL:-http://localhost:8002}
-      DEMO_INTERNAL_URL: http://demo:8000
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM:-no-reply@odoobridger.com}
       SALES_EMAIL: ${SALES_EMAIL:-}
+      COMPANY_NAME: ${COMPANY_NAME:-Cybrosys Technologies}
+      # Customer Odoo addresses in private networks (localhost, 10.x, 192.168.x):
+      # empty = allowed unless ENVIRONMENT=production.
+      ODOO_ALLOW_PRIVATE_TARGETS: ${ODOO_ALLOW_PRIVATE_TARGETS:-}
+      ODOO_READINESS_MINUTES: ${ODOO_READINESS_MINUTES:-15}
+      CONTACT_EMAIL: ${CONTACT_EMAIL:-}
+      CONTACT_PHONE: ${CONTACT_PHONE:-}
+      CONTACT_ADDRESS: ${CONTACT_ADDRESS:-}
+      CONTACT_HOURS: ${CONTACT_HOURS:-}
+      COMPANY_WEBSITE: ${COMPANY_WEBSITE:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
 
@@ -81,6 +87,10 @@ services:
       JWT_SECRET: ${BIOBRIDGE_JWT_SECRET:?set BIOBRIDGE_JWT_SECRET}
       MASTER_ENCRYPTION_KEY: ${BIOBRIDGE_MASTER_KEY:?set BIOBRIDGE_MASTER_KEY}
       PLATFORM_MODE: "true"
+      # Hosted: customers' addresses must be public, so they can't make BioBridge
+      # call this network. "true" for a local test with terminals or Odoo on your
+      # own network.
+      ALLOW_PRIVATE_NETWORK_TARGETS: ${BIOBRIDGE_ALLOW_PRIVATE_TARGETS:-false}
       PLATFORM_CORE_URL: ${CORE_PUBLIC_URL:-http://localhost:8000}
       PLATFORM_CORE_INTERNAL_URL: http://core:8000
       PLATFORM_CLIENT_SECRET: ${BIOMETRIC_CLIENT_SECRET}
@@ -94,21 +104,5 @@ services:
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
 
-  demo:
-    <<: *restart
-    profiles: ["demo"]
-    build: {context: ../services/demo}
-    image: odoobridger-demo:latest
-    depends_on: {core: {condition: service_healthy}}
-    ports: ["${DEMO_PORT:-8002}:8000"]
-    environment:
-      SERVICE_SLUG: demo
-      PUBLIC_BASE_URL: ${DEMO_PUBLIC_URL:-http://localhost:8002}
-      CORE_PUBLIC_URL: ${CORE_PUBLIC_URL:-http://localhost:8000}
-      CORE_INTERNAL_URL: http://core:8000
-      CLIENT_SECRET: ${DEMO_CLIENT_SECRET:?set DEMO_CLIENT_SECRET (python3 deploy/make-env.py --demo)}
-    volumes: [demodata:/data]
-
 volumes:
   pgdata:
-  demodata:

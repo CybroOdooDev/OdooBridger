@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from app.core.config import settings
 from app.core.crypto import decrypt
 from app.integrations import providers as _providers  # noqa: F401 — registers the catalogue
-from app.integrations.base import AttendanceProvider, SourceConfig, build_provider
+from app.integrations.base import AttendanceProvider, SourceConfig, build_provider, get_provider_class
 from app.integrations.odoo import OdooClient, OdooCredentials
 from app.models import DeviceSource, OdooConnection, Tenant
 
@@ -47,8 +47,8 @@ def assert_safe_url(url: str) -> None:
         ip = ipaddress.ip_address(info[4][0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
             raise UnsafeTargetError(
-                f"{host} resolves to the private address {ip}. Expose it through "
-                "a public hostname or a tunnel."
+                f"{host} resolves to the private address {ip}, which can't be reached from the internet. "
+                "Use a public address: the public IP or hostname of the network with the port forwarded."
             )
 
 

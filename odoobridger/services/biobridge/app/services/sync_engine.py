@@ -34,7 +34,7 @@ from app.core.crypto import encrypt
 from app.integrations.base import (
     Capability, EmployeeRecord, IdFilterUnsupported, ProviderError, UnsupportedCapability,
 )
-from app.integrations.odoo import OdooClient, OdooError, parse_dt
+from app.integrations.odoo import OdooAuthError, OdooClient, OdooError, parse_dt
 from app.models import (
     AttendanceRecord,
     ConnectionStatus,
@@ -177,6 +177,7 @@ class SyncEngine:
     def run_cycle(self) -> SyncRun:
         self.db.add(self.run)
         self.db.flush()
+        odoo_conn: OdooConnection | None = None
 
         try:
             # The subscription gate, as a backstop.
@@ -227,7 +228,7 @@ class SyncEngine:
                     source.status_message = str(exc)[:500]
                     source.last_checked_at = datetime.now(timezone.utc)
                     self.run.error_count += 1
-                    self._log(f"'{source.name}' unreachable: {exc}", "error")
+                    self._log(f"'{source.name}' unreachable: {str(exc)}", "error")
 
             if reachable == 0:
                 # The run list shows this message and nothing else, so it has to
@@ -262,7 +263,16 @@ class SyncEngine:
                 )
 
             odoo = build_odoo_client(self.tenant, odoo_conn)
-            odoo.authenticate()
+            try:
+                odoo.authenticate()
+            except OdooAuthError:
+                if not odoo_conn.managed:
+                    raise
+                # OdooBridger may have sent a new key since this run loaded
+                # the connection. Read it again and try once more.
+                self.db.refresh(odoo_conn)
+                odoo = build_odoo_client(self.tenant, odoo_conn)
+                odoo.authenticate()
             if odoo_conn.uid_cache != odoo.uid:
                 odoo_conn.uid_cache = odoo.uid
 
@@ -322,6 +332,14 @@ class SyncEngine:
             self.run.status = SyncStatus.failed.value
             self.run.error_message = str(exc)
             self._log(str(exc), "error")
+            if isinstance(exc, OdooAuthError) and odoo_conn is not None:
+                # Recorded on the connection so the dashboard (and, in platform
+                # mode, OdooBridger through the usage report) see Odoo refusing us.
+                from app.services.friendly_errors import friendly_odoo_message
+
+                odoo_conn.status = ConnectionStatus.failed.value
+                odoo_conn.status_message = friendly_odoo_message(exc)
+                odoo_conn.last_checked_at = datetime.now(timezone.utc)
             self._mark_degraded_if_needed()
         except Exception as exc:  # noqa: BLE001 — a worker must never die silently
             self.tenant.consecutive_failures += 1
@@ -1915,6 +1933,8 @@ class SyncEngine:
                 OdooConnection.tenant_id == self.tenant.id,
                 OdooConnection.is_active.is_(True),
             )
+            # The one set in OdooBridger wins in platform mode.
+            .order_by(OdooConnection.platform_connection_id.is_(None))
             .limit(1)
         ).first()
 

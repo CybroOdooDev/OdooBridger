@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import Principal, audit, get_principal, require_syncable, require_writer
+from app.core.config import settings
 from app.core.crypto import encrypt
 from app.db.session import get_db
 from app.integrations.base import (
@@ -105,6 +106,18 @@ def _get_odoo(db: Session, principal: Principal, conn_id: str) -> OdooConnection
     return conn
 
 
+MANAGED_MESSAGE = ("Your Odoo address, database, login and API key are set in OdooBridger. "
+                   "Change them there; the company switches stay here.")
+#: What OdooBridger sets on a managed connection.
+MANAGED_FIELDS = ("url", "db_name", "username", "api_key", "name")
+
+
+def _refuse_if_platform_creates() -> None:
+    if settings.platform_mode:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Connect your Odoo in OdooBridger. It is sent here automatically.")
+
+
 def _probe_odoo(principal: Principal, conn: OdooConnection) -> TestResult:
     # A test is the moment to look at the server afresh — it may have been
     # upgraded (say 18 → 19) since its API was last detected.
@@ -176,6 +189,7 @@ def create_odoo(
     principal: Principal = Depends(require_writer),
     db: Session = Depends(get_db),
 ) -> OdooConnection:
+    _refuse_if_platform_creates()
     if db.scalar(
         select(OdooConnection).where(
             OdooConnection.tenant_id == principal.tenant.id,
@@ -216,6 +230,13 @@ def update_odoo(
 ) -> OdooConnection:
     conn = _get_odoo(db, principal, conn_id)
     data = payload.model_dump(exclude_unset=True)
+    if conn.managed:
+        # Values equal to what is stored are fine (the form sends them back);
+        # a change to anything OdooBridger sets is not.
+        current = {"url": conn.url, "db_name": conn.db_name, "username": conn.username, "name": conn.name}
+        if any(data.get(k) not in (None, "", current.get(k)) for k in MANAGED_FIELDS):
+            raise HTTPException(status.HTTP_409_CONFLICT, MANAGED_MESSAGE)
+        data = {k: v for k, v in data.items() if k not in MANAGED_FIELDS}
     api_key = data.pop("api_key", None)
     if "disabled_company_ids" in data:
         data["disabled_company_ids"] = sorted(set(data["disabled_company_ids"] or [])) or None
@@ -247,6 +268,7 @@ def test_odoo_unsaved(
     fix it and try again without leaving half-configured connections behind.
     """
     api_key_enc = None
+    stored = None
     if payload.conn_id:
         stored = _get_odoo(db, principal, payload.conn_id)
         api_key_enc = stored.api_key_enc
@@ -263,6 +285,8 @@ def test_odoo_unsaved(
         company_id=payload.company_id,
         disabled_company_ids=sorted(set(payload.disabled_company_ids or [])) or None,
     )
+    if stored is not None and stored.managed:
+        draft.platform_connection_id = stored.platform_connection_id
     return _probe_odoo(principal, draft)
 
 
@@ -406,6 +430,9 @@ def delete_odoo(
     db: Session = Depends(get_db),
 ) -> None:
     conn = _get_odoo(db, principal, conn_id)
+    if conn.managed:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "This Odoo connection is set in OdooBridger. Disconnect it there.")
     audit(db, principal, "odoo.delete", conn.id, conn.name, request)
     db.delete(conn)
     db.commit()
@@ -649,7 +676,8 @@ def create_source(
         config={**(payload.config or {}),
                 **({"location": payload.location.strip()}
                    if payload.connection_kind == "device" and payload.location and payload.location.strip()
-                   else {})},
+                   else {}),
+                },
         base_url=payload.base_url,
         username=payload.username,
         password_enc=encrypt(payload.password, principal.tenant.crypto_key),

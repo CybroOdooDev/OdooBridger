@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -12,9 +13,9 @@ from sqlalchemy.orm import Session
 from obcore.config import settings
 from obcore.db import session_scope
 from obcore.mailer import try_send
-from obcore.models import StaffUser
-from obcore.security import hash_password, verify_password
-from obcore.services import billing, provisioning
+from obcore.models import OdooConnection, StaffUser
+from obcore.security import aware, hash_password, utcnow, verify_password
+from obcore.services import billing, odoo_connections, provisioning, signups
 from obcore.services.accounts import audit, owner_of
 
 log = logging.getLogger(__name__)
@@ -58,7 +59,23 @@ def sweep_once(db: Session) -> dict[str, int]:
                      f"has stopped working. Your data is kept. Add payment details to carry on:\n"
                      f"{settings.base}/app/#/billing\n\n— OdooBridger\n")
     pushed = provisioning.push_pending(db)
-    return {"trials_ended": len(expired), "provisioned": pushed}
+    checked = refresh_odoo_readiness(db)
+    notified = odoo_connections.notify_failures(db)
+    signups.clear_expired(db)
+    return {"trials_ended": len(expired), "provisioned": pushed, "odoo_checked": checked, "odoo_notices": notified}
+
+
+def refresh_odoo_readiness(db: Session, *, now=None) -> int:
+    """Read each Odoo service's own readiness for connections not checked lately."""
+    now = now or utcnow()
+    due = now - timedelta(minutes=settings.odoo_readiness_minutes)
+    checked = 0
+    for conn in db.scalars(select(OdooConnection)):
+        rows = [r for r in odoo_connections.bound_rows(conn) if r.usable]
+        if rows and any(r.odoo_readiness_at is None or aware(r.odoo_readiness_at) < due for r in rows):
+            odoo_connections.refresh_readiness(db, conn)
+            checked += 1
+    return checked
 
 
 async def loop() -> None:
@@ -76,5 +93,11 @@ def _tick() -> None:
 
         stripe_api.load_config(db)
         result = sweep_once(db)
+        try:
+            from obcore.services.ops import record_snapshot
+
+            record_snapshot(db)
+        except Exception:  # noqa: BLE001 — a figure for the overview, never worth failing the sweep
+            log.exception("Daily snapshot failed")
         if any(result.values()):
             log.info("Sweep: %s", result)

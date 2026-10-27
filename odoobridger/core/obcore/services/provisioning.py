@@ -15,7 +15,13 @@ Wire format (``PUT {service}/platform/v1/accounts/{account_id}``)::
      "entitlements": {...},
      "trial_ends_at": iso | null, "renews_at": iso | null,
      "users": [{"id", "email", "full_name", "role"}],
+     "odoo": {"id", "name", "url", "db", "login", "api_key", "version", "api",
+              "companies", "status"} | null,      # only for services that use Odoo
      "revision": int}
+
+``odoo`` is present only when ``Service.uses_odoo``; a service that does not
+work on Odoo never receives the key. Null means the account has no Odoo
+connection (any connection the service held should stop being used).
 
 Authorization: ``Bearer <RS256 token>`` with ``typ=provision``,
 ``aud=<service slug>``, ``account_id`` and ``body_sha256`` of the exact body.
@@ -73,7 +79,15 @@ def payload_for(row: AccountService) -> dict[str, Any]:
         "users": [{"id": u.id, "email": u.email, "full_name": u.full_name, "role": u.role}
                   for u in account.users if u.is_active],
         "revision": row.revision,
-    }
+    } | _odoo_part(row)
+
+
+def _odoo_part(row: AccountService) -> dict[str, Any]:
+    if not row.service.uses_odoo:
+        return {}
+    from obcore.services.odoo_connections import provision_block
+
+    return {"odoo": provision_block(row)}
 
 
 def _auth(service: Service, account_id: str, body: bytes, db: Session | None) -> dict[str, str]:
@@ -148,8 +162,12 @@ def remove(db: Session, service: Service, account_id: str) -> None:
     _call("DELETE", _url(service, account_id), _auth(service, account_id, b"", db))
 
 
-def usage(db: Session, row: AccountService) -> dict[str, Any]:
-    """The service's own numbers for an account, for the staff console."""
-    response = _call("GET", _url(row.service, row.account_id, "/usage"),
+def usage(db: Session, row: AccountService, *, check_odoo: bool = False) -> dict[str, Any]:
+    """The service's own numbers for an account (and its Odoo readiness).
+
+    ``check_odoo`` asks the service to test its Odoo access live rather than
+    report what it last saw.
+    """
+    response = _call("GET", _url(row.service, row.account_id, "/usage" + ("?check_odoo=1" if check_odoo else "")),
                      _auth(row.service, row.account_id, b"", db))
     return response.json()
