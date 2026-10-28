@@ -227,6 +227,18 @@ export const api = {
   del: (path) => request(path, { method: 'DELETE' }),
 };
 
+/** Run a sync and resolve with the finished run. The cycle runs on the server
+ * in the background (a first sync can outlast a single request); this polls
+ * it. A sync already in progress is followed rather than doubled. */
+export async function runSync({ interval = 2000 } = {}) {
+  let run = await api.post('/sync/start');
+  while (run.status === 'running') {
+    await new Promise((done) => setTimeout(done, interval));
+    run = await api.get(`/sync/runs/${run.id}`);
+  }
+  return run;
+}
+
 export async function loadSession() {
   // /auth/me is the one route that takes either kind of token, which is why it
   // is safe to call before we know which shell to build.

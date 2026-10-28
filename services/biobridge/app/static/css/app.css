@@ -1576,3 +1576,36 @@ td .switch { vertical-align: middle; }
 /* A fieldset that only groups (platform mode locks the Odoo credentials with it). */
 .plain-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .plain-fieldset:disabled input { opacity: .75; cursor: not-allowed; }
+
+/* The account's name in the top bar: a name tag, unlike status pills
+   (the same as the OdooBridger portal's). */
+.account-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 240px; padding: 4px 12px 4px 4px;
+  border: 1px solid var(--rule); border-radius: var(--radius-sm); background: var(--panel);
+  font-family: var(--sans); font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.2; }
+.account-initial { flex: none; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 6px;
+  background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 700; }
+.account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#tenantPill { display: inline-flex; align-items: center; gap: 8px; }
+@media (max-width: 640px) {
+  .account-chip { padding: 4px; }
+  .account-name { display: none; }
+}
+
+/* Scheduler Info: the scheduler's state as an icon (status on hover). */
+.sched-icon { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; cursor: default; }
+.sched-icon.ok { color: var(--ok, #15803d); background: var(--ok-soft, #e7f6ec); }
+.sched-icon.bad { color: var(--bad); background: var(--bad-soft, #fdecec); }
+.sched-icon.mute { color: var(--muted); background: var(--rule-soft, #f1f3f7); }
+.sched-icon.ok .wave { animation: sched-wave 1.8s ease-in-out infinite; }
+.sched-icon.ok .w2 { animation-delay: .3s; }
+.sched-icon:not(.ok) .w2 { opacity: .35; }
+@keyframes sched-wave { 0%, 100% { opacity: .25; } 40% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .sched-icon.ok .wave { animation: none; } }
+
+/* Platform mode: the Odoo connection OdooBridger holds, shown read-only. */
+.conn-info { display: grid; grid-template-columns: 140px 1fr; gap: 10px 16px; margin: 0 0 18px; font-size: 14px; }
+.conn-info dt { color: var(--muted); }
+.conn-info dd { margin: 0; overflow-wrap: anywhere; font-weight: 600; }
+.conn-info a { color: var(--ink); text-decoration: none; }
+.conn-info a:hover { color: var(--accent); text-decoration: underline; }
+@media (max-width: 640px) { .conn-info { grid-template-columns: 1fr; gap: 2px; } .conn-info dd { margin-bottom: 8px; } }

@@ -37,7 +37,8 @@
           <button type="button" data-mode="trial">Free Trial</button>
           <button type="button" data-mode="buy">Buy Now</button>
         </div>
-        <div class="field"><label>Services</label><div id="services"></div></div>
+        <div class="field"><label>Services</label><div id="services"></div>
+          <div class="help" id="servicesHelp">Optional. You can add services later from your account.</div></div>
         <div id="pickers"></div>
         <div class="field"><label id="billingLabel">Billing</label>
           <div class="bill-pill" role="group" aria-labelledby="billingLabel">
@@ -143,6 +144,7 @@
     function showMode() {
       $$('[data-mode]').forEach((b) => b.classList.toggle('on', b.dataset.mode === mode));
       $('#go').textContent = mode === 'buy' ? 'Continue To Payment' : 'Start Free Trial';
+      $('#servicesHelp').hidden = mode === 'buy';
       paintPricing();
     }
     $$('[data-mode]').forEach((b) => b.addEventListener('click', () => { mode = b.dataset.mode; showMode(); }));
@@ -163,7 +165,8 @@
         service: slug, package_id: ($(`select[name="pkg_${slug}"]`) || {}).value || null,
       }));
       if (!data.company || !data.full_name || !data.email) { err.textContent = 'Please fill in your company, name and email.'; return; }
-      if (!services.length) { err.textContent = 'Choose at least one service.'; return; }
+      // A trial can start without a service: it is added later from the account.
+      if (!services.length && mode === 'buy') { err.textContent = 'Choose at least one service to buy.'; return; }
       $('#go').disabled = true;
       try {
         const response = await fetch('/api/v1/public/signup', {

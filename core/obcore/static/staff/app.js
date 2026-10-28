@@ -55,7 +55,6 @@ const MIX = [['paying', 'Paying', 'var(--ok)'], ['trial', 'Free trial', 'var(--a
 
 const tag = (tone, text) => `<span class="pill ${tone}">${esc(text)}</span>`;
 const badge = (tone, text) => `<span class="pill ${tone} kpi-b">${esc(text)}</span>`;
-const signed = (n) => (n > 0 ? `+${n}` : `${n}`);
 
 /** "3 h", "2 days": how long a problem has been going on. */
 function since(iso) {
@@ -104,7 +103,7 @@ function wireGrowth(root, points) {
     const dot = wrap.querySelectorAll('.ch-dot')[Number(hit.dataset.i)];
     const cx = Number(dot.getAttribute('cx'));
     cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.hidden = false;
-    tip.innerHTML = `<b>${esc(month(p.month))}</b><span>${p.total} customers</span><span>${signed(p.added)} that month</span>`;
+    tip.innerHTML = `<b>${esc(month(p.month))}</b><span>New: ${p.added}</span><span>Closed: ${p.closed ?? 0}</span>`;
     tip.hidden = false;
     const box = wrap.getBoundingClientRect();
     const dbox = dot.getBoundingClientRect();
@@ -203,6 +202,7 @@ async function renderOverview(mount) {
  * ====================================================================== */
 const HEALTH = { healthy: ['ok', 'Healthy'], delayed: ['warn', 'Delayed'], failing: ['bad', 'Failing'],
   not_started: ['mute', 'Not Started'] };
+const ACTIVITY = { active: ['ok', 'Active'], idle: ['warn', 'Idle'], not_started: ['mute', 'Not Started'] };
 const minutes = (n) => (n == null ? '—' : n < 60 ? `${n} min` : n % 60 ? `${Math.floor(n / 60)} h ${n % 60} min` : `${n / 60} h`);
 
 function cell(kind, v) {
@@ -215,6 +215,8 @@ function cell(kind, v) {
   if (kind === 'minutes') return esc(minutes(v));
   if (kind === 'ago') return v ? esc(fmtAgo(v)) : '—';
   if (kind === 'health') { const [t, l] = HEALTH[v] || ['mute', v || '—']; return tag(t, l); }
+  if (kind === 'activity') { const [t, l] = ACTIVITY[v] || ['mute', v || '—']; return tag(t, l); }
+  if (kind === 'onoff') return v == null ? '—' : v ? tag('ok', 'On') : tag('mute', 'Off');
   if (typeof v === 'number') return esc(v.toLocaleString());
   return esc(v ?? '—');
 }
@@ -276,6 +278,8 @@ async function renderServiceDashboard(mount, route, { slug }) {
   const cols = d.columns;
   const rowHtml = (c) => `<tr class="click" data-account="${esc(c.account_id)}" data-name="${esc(c.name.toLowerCase())}">
     <td><b>${esc(c.name)}</b></td><td>${esc(c.plan || '—')}</td><td>${statusPill(c.status)}</td>
+    <td class="nowrap">${c.since ? esc(fmtDate(c.since)) : '—'}</td>
+    <td class="nowrap">${c.billing ? tag(c.billing.tone || 'mute', c.billing.date ? `${c.billing.label} ${fmtDate(c.billing.date)}` : c.billing.label) : '—'}</td>
     ${cols.map((col) => `<td class="${col.kind === 'usage' || col.kind === 'number' ? 'nowrap' : ''}">${cell(col.kind, c.values[col.key])}</td>`).join('')}</tr>`;
   mount.innerHTML = `
     <div class="svc-head-row">${tag(tone, label)}<span class="muted">${esc(facts)}</span></div>
@@ -285,16 +289,18 @@ async function renderServiceDashboard(mount, route, { slug }) {
       ${d.tiles.map((t) => kpi({ icon: t.icon || 'server', tone: t.tone || 'acc', label: t.label,
         value: typeof t.value === 'number' ? t.value.toLocaleString() : (t.value ?? '—') })).join('')}
     </div>
-    ${d.series || d.attention.length ? `<div class="ov-row2">
+    ${d.series ? `<div class="ov-row2">
       ${d.series ? `<div class="card"><div class="card-head"><h2>${esc(d.series.title || 'Activity')}</h2>${d.series.subtitle ? `<span class="hint">${esc(d.series.subtitle)}</span>` : ''}</div>${dailyBars(d.series)}</div>` : ''}
       <div class="card"><div class="card-head"><h2>Needs Attention</h2></div>
         ${d.attention.length ? `<ul class="alerts">${d.attention.map((i) => incidentRow({ ...i, issue: i.title, service: null,
           severity: SEVERITY[i.severity] ? i.severity : 'medium' })).join('')}</ul>` : empty('Nothing Needs Attention', '')}</div>
-    </div>` : ''}
+    </div>` : d.attention.length ? `<div class="card" style="margin-top:14px"><div class="card-head"><h2>Needs Attention</h2></div>
+        <ul class="alerts">${d.attention.map((i) => incidentRow({ ...i, issue: i.title, service: null,
+          severity: SEVERITY[i.severity] ? i.severity : 'medium' })).join('')}</ul></div>` : ''}
     <div class="card" style="margin-top:14px"><div class="card-head"><h2>Customers</h2>
       <input type="search" id="svcSearch" placeholder="Search customers" style="max-width:260px"></div>
       ${d.customers.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Customer</th><th>Plan</th><th>Status</th>${cols.map((c) => `<th>${esc(c.label)}</th>`).join('')}</tr></thead>
+        <thead><tr><th>Customer</th><th>Plan</th><th>Status</th><th>Since</th><th>Billing</th>${cols.map((c) => `<th>${esc(c.label)}</th>`).join('')}</tr></thead>
         <tbody>${d.customers.map(rowHtml).join('')}</tbody></table></div>` : empty('No Customers Yet', '')}</div>`;
   if (d.series) wireBars(mount, d.series);
   $('#svcSearch', mount)?.addEventListener('input', (e) => {
@@ -833,8 +839,65 @@ async function renderClosures(mount) {
       || `<tr><td colspan="6">${empty('No Closed Accounts', '')}</td></tr>`}</tbody></table></div></div>`;
 }
 
+const SEV_FLOOR = { critical: 'Critical only', high: 'Critical and high', medium: 'Everything (critical, high and medium)' };
+
+function alertsCard(al) {
+  const c = al.settings;
+  const to = [c.all_staff ? 'all active staff' : null, ...(c.emails || [])].filter(Boolean).join(', ') || 'nobody';
+  return `<div class="card" style="margin-top:16px">
+    <div class="card-head"><h2>Alerts</h2><div class="actions">
+      <button class="sm" id="alertTest">Send Test Alert</button><button class="sm" id="alertEdit">Edit</button></div></div>
+    <dl class="kv">
+      <dt>Status</dt><dd>${c.enabled ? tag('ok', 'On') : tag('mute', 'Off')}</dd>
+      <dt>Alert on</dt><dd>${esc(SEV_FLOOR[c.min_severity] || c.min_severity)}</dd>
+      <dt>Email</dt><dd>${esc(to)}</dd>
+      <dt>Webhook</dt><dd>${c.has_webhook ? esc(c.webhook_hint) : '—'}</dd>
+      <dt>Reminders</dt><dd>${c.reminder_hours ? `every ${c.reminder_hours} h while open` : 'off'}</dd>
+      <dt>Wait before alerting</dt><dd>${c.grace_minutes} min</dd>
+      <dt>Open now</dt><dd>${al.open.length}</dd>
+    </dl></div>`;
+}
+
+function wireAlerts(mount, al, reload) {
+  $('#alertTest', mount)?.addEventListener('click', (e) => submitting(e.currentTarget, async () => {
+    try { toast((await api.post('/staff/alerts/test')).message, 'ok'); } catch (error) { toast(error.message, 'bad'); }
+  }));
+  $('#alertEdit', mount)?.addEventListener('click', () => guard(async () => {
+    const c = al.settings;
+    const ok = await dialog({
+      title: 'Alert Settings', submitLabel: 'Save', wide: true,
+      body: `<div class="grid cols-2">
+        ${field({ name: 'enabled', label: 'Alerts', value: String(c.enabled), boolean: true, required: true,
+          options: [{ value: 'true', label: 'On' }, { value: 'false', label: 'Off' }] })}
+        ${field({ name: 'min_severity', label: 'Alert on', value: c.min_severity, required: true,
+          options: Object.entries(SEV_FLOOR).map(([value, label]) => ({ value, label })) })}
+        ${field({ name: 'all_staff', label: 'Email all active staff', value: String(c.all_staff), boolean: true, required: true,
+          options: [{ value: 'true', label: 'Yes' }, { value: 'false', label: 'No, only the addresses below' }] })}
+        ${field({ name: 'emails', label: 'Also email', value: (c.emails || []).join(', '), placeholder: 'ops@yourcompany.com, oncall@…',
+          help: 'Comma separated.' })}
+        ${field({ name: 'webhook_url', label: 'Slack or Teams webhook', placeholder: c.has_webhook ? `Set (${c.webhook_hint}); leave blank to keep` : 'https://hooks.slack.com/services/…',
+          help: 'Any webhook that takes {"text": "..."}. Type "none" to remove it.' })}
+        ${field({ name: 'reminder_hours', label: 'Remind every (hours)', type: 'number', value: c.reminder_hours, required: true,
+          help: '0 turns reminders off.' })}
+        ${field({ name: 'grace_minutes', label: 'Wait before alerting (minutes)', type: 'number', value: c.grace_minutes, required: true,
+          help: 'A problem that clears within this time is never announced.' })}
+      </div>`,
+      onSubmit: (form) => {
+        const v = readForm(form);
+        const body = { enabled: v.enabled, min_severity: v.min_severity, all_staff: v.all_staff,
+          emails: String(v.emails || '').split(/[,\s]+/).filter(Boolean),
+          reminder_hours: Number(v.reminder_hours || 0), grace_minutes: Number(v.grace_minutes || 0) };
+        const hook = String(v.webhook_url || '').trim();
+        if (hook.toLowerCase() === 'none') body.webhook_url = ''; else if (hook) body.webhook_url = hook;
+        return api.put('/staff/alerts', body);
+      },
+    });
+    if (ok) { toast('Alert settings saved.', 'ok'); reload(); }
+  }));
+}
+
 async function renderTeam(mount) {
-  const rows = await api.get('/staff/team');
+  const [rows, al] = await Promise.all([api.get('/staff/team'), api.get('/staff/alerts')]);
   mount.innerHTML = `<div class="card">
     <div class="card-head"><h2>Staff</h2><div class="actions"><button class="primary sm" id="add">Add Staff</button></div></div>
     <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Last sign-in</th><th>Status</th></tr></thead>
@@ -842,7 +905,8 @@ async function renderTeam(mount) {
       <td><b>${esc(s.full_name || '—')}</b>${s.id === state.me.id ? ' <span class="hint">(you)</span>' : ''}${s.is_static ? ' <span class="pill mute">From settings</span>' : ''}</td>
       <td>${esc(s.email)}</td><td>${esc(s.last_login_at ? fmtAgo(s.last_login_at) : 'never')}</td>
       <td>${s.is_active ? '<span class="pill ok">Active</span>' : '<span class="pill mute">Disabled</span>'}</td></tr>`).join('')}</tbody>
-    </table></div></div>`;
+    </table></div></div>${alertsCard(al)}`;
+  wireAlerts(mount, al, () => renderTeam(mount));
   $('#add', mount).addEventListener('click', async () => {
     const ok = await dialog({ title: 'Add Staff', submitLabel: 'Add',
       body: `${field({ name: 'full_name', label: 'Name' })}${field({ name: 'email', label: 'Email', type: 'email', required: true })}

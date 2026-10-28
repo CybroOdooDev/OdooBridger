@@ -142,6 +142,8 @@ def _event_no(row: dict) -> int | None:
 class BioStar2Provider(AttendanceProvider):
     slug = "biostar2"
     label = "Suprema BioStar 2"
+    #: Its device list is the authority on which terminals exist (see sync_inventory).
+    server_inventory = True
     description = (
         "A Suprema BioStar 2 server, which collects punches from the BioStation, "
         "BioEntry, FaceStation and other Suprema terminals connected to it."

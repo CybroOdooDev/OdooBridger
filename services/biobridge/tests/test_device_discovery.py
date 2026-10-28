@@ -360,7 +360,7 @@ def test_two_sources_with_the_same_serial_number_do_not_collide(client, monkeypa
     assert by_source[source_b["id"]][0]["serial_number"] == "GATE-01"
 
 
-def test_a_terminal_no_longer_reported_is_flagged_missing_not_deleted(client, monkeypatch):
+def test_a_terminal_with_history_no_longer_reported_is_flagged_missing_not_deleted(client, monkeypatch):
     token = signup(client, "Acme", "owner@acme.com")
     make_odoo(client, token)
     source = make_source(client, token)
@@ -376,7 +376,16 @@ def test_a_terminal_no_longer_reported_is_flagged_missing_not_deleted(client, mo
     assert len(response_ids) == 3
     assert all(d["missing_since"] is None for d in first.json())
 
-    # GATE-03 stops being reported by the provider.
+    # GATE-03 has real history (a punch on its way to Odoo)...
+    db = client.SessionLocal()
+    from app.models import Device, PunchRecord
+    gate3 = db.get(Device, response_ids["GATE-03"])
+    db.add(PunchRecord(tenant_id=gate3.tenant_id, source_id=gate3.source_id, device_id=gate3.id,
+                       external_id="h1", emp_code="1001", terminal_sn="GATE-03",
+                       punch_time_utc=datetime(2026, 10, 5, 8, 0), punch_time_local=datetime(2026, 10, 5, 12, 0)))
+    db.commit()
+    db.close()
+    # ...and then stops being reported by the provider.
     _FakeDiscoverableProvider.terminals = [
         row for row in TERMINALS if row["serial_number"] != "GATE-03"
     ]
@@ -408,3 +417,17 @@ def test_a_terminal_no_longer_reported_is_flagged_missing_not_deleted(client, mo
     )
     by_serial = {d["serial_number"]: d for d in fourth.json()}
     assert by_serial["GATE-03"]["missing_since"] is None
+
+
+def test_a_terminal_without_history_no_longer_reported_is_removed(client, monkeypatch):
+    token = signup(client, "Acme", "owner@acme.com")
+    make_odoo(client, token)
+    source = make_source(client, token)
+    monkeypatch.setattr(connections_mod, "build_odoo_client", lambda t, c: FakeOdoo())
+
+    _FakeDiscoverableProvider.terminals = list(TERMINALS)
+    client.post(f"/api/v1/sources/{source['id']}/discover-devices", headers=auth(token))
+    _FakeDiscoverableProvider.terminals = TERMINALS[:2]
+    r = client.post(f"/api/v1/sources/{source['id']}/discover-devices", headers=auth(token))
+    assert r.status_code == 200, r.text
+    assert {d["serial_number"] for d in r.json()} == {"GATE-01", "GATE-02"}

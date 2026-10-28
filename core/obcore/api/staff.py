@@ -13,6 +13,7 @@ from obcore.api.deps import get_staff, stripe_config
 from obcore.api.out import (
     account_out, iso, lead_event_out, lead_out, package_out, service_out, staff_out,
 )
+from obcore.config import settings
 from obcore.db import get_db
 from obcore.models import (
     DEMO_STATUSES, LEAD_STAGES, OPEN_STAGES, Account, AccountClosure, AccountService, AccountStatus,
@@ -707,6 +708,59 @@ def convert_lead(lead_id: str, payload: ConvertIn, request: Request, staff: Staf
 # =============================================================================
 # Staff users
 # =============================================================================
+# =============================================================================
+# Alerts from Needs Attention
+# =============================================================================
+@router.get("/alerts")
+def get_alerts(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    from obcore.services import alerts
+
+    cfg = alerts.load(db)
+    return {"settings": alerts.public(cfg), "recipients": alerts.recipients(db, cfg),
+            "open": [{"key": a.key, "severity": a.severity, "issue": a.issue, "account": a.account,
+                      "service": a.service, "first_seen_at": iso(a.first_seen_at),
+                      "notified_at": iso(a.notified_at)} for a in alerts.open_alerts(db)]}
+
+
+class AlertsIn(BaseModel):
+    enabled: bool | None = None
+    min_severity: str | None = None
+    all_staff: bool | None = None
+    emails: list[str] | None = None
+    #: "" removes it; leave out to keep the current one.
+    webhook_url: str | None = Field(default=None, max_length=500)
+    reminder_hours: int | None = None
+    grace_minutes: int | None = None
+
+
+@router.put("/alerts")
+def put_alerts(payload: AlertsIn, staff: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    from obcore.services import alerts
+
+    try:
+        alerts.save(db, payload.model_dump(exclude_unset=True), staff.email)
+    except alerts.AlertError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    acc.audit(db, actor(staff), "alerts.update")
+    db.commit()
+    return get_alerts(staff, db)
+
+
+@router.post("/alerts/test")
+def test_alert(staff: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    from obcore.services import alerts
+
+    cfg = alerts.load(db)
+    if not alerts.recipients(db, cfg) and not cfg.get("webhook_url"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add a recipient or a webhook first.")
+    ok = alerts.deliver(db, cfg, f"[{settings.app_name}] Test alert",
+                        f"This is a test alert sent by {staff.email}. Real alerts look like this, listing what "
+                        "is new, still open and resolved.\n")
+    if not ok:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Nothing got through. Check SMTP and the webhook address.")
+    return {"message": "Test alert sent."}
+
+
 @router.get("/team")
 def team(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> list[dict]:
     return [staff_out(s) for s in db.scalars(select(StaffUser).order_by(StaffUser.email))]

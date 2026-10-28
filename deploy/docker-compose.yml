@@ -35,7 +35,7 @@ services:
   core:
     <<: *restart
     build: {context: ../core}
-    image: odoobridger-core:latest
+    image: ${CORE_IMAGE:-odoobridger-core:latest}
     depends_on: {postgres: {condition: service_healthy}}
     ports: ["${CORE_PORT:-8000}:8000"]
     environment:
@@ -74,7 +74,7 @@ services:
   biobridge:
     <<: *restart
     build: {context: ../services/biobridge, dockerfile: deploy/Dockerfile}
-    image: odoobridger-biobridge:latest
+    image: ${BIOBRIDGE_IMAGE:-odoobridger-biobridge:latest}
     depends_on:
       postgres: {condition: service_healthy}
       core: {condition: service_healthy}

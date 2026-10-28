@@ -7,7 +7,7 @@
 
 import { clearGuard, confirmLeave, dirtyGuard } from './nav-guard.js';
 import './password-toggle.js';
-import { api, auth, loadSession } from './api.js';
+import { api, auth, loadSession, runSync } from './api.js';
 import { finishPlatformSignIn, platform, startPlatformSignIn } from './platform.js';
 import { $, esc, fmtAgo, toast, wireSearchSelects, wireTips } from './ui.js';
 import { renderLogin, renderPlans, renderSignup } from './pages/auth.js';
@@ -71,8 +71,8 @@ const ICON = {
   card: '<rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="M3 10h18M7 15h4"/>',
   // An envelope.
   mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 6.5l8.5 6.5 8.5-6.5"/>',
-  // A cog: toothed wheel with a hub.
-  settings: '<path d="M10.3 3.2h3.4l.5 2.4 1.9.8 2-1.4 2.4 2.4-1.4 2 .8 1.9 2.4.5v3.4l-2.4.5-.8 1.9 1.4 2-2.4 2.4-2-1.4-1.9.8-.5 2.4h-3.4l-.5-2.4-1.9-.8-2 1.4-2.4-2.4 1.4-2-.8-1.9-2.4-.5v-3.4l2.4-.5.8-1.9-1.4-2 2.4-2.4 2 1.4 1.9-.8z"/><circle cx="12" cy="12" r="3.2"/>',
+  // A gear: eight rounded teeth around a hub.
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
 };
 const icon = (name) => `<svg class="nav-icon" viewBox="0 0 24 24" width="17" height="17" fill="none"
   stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[name]}</svg>`;
@@ -90,23 +90,15 @@ const NAV = [
       { path: '/employees', title: 'Employees', badge: 'unmapped', icon: 'employees' },
       { path: '/terminals', title: 'Terminals', icon: 'terminals' },
       { path: '/activity', title: 'Activity', icon: 'activity' },
-    ],
-  },
-  {
-    // A single main item, Settings, with every submenu nested under it and
-    // always shown — the account's own rules, then the two connections
-    // (Odoo: where attendance is written; Biometric: what it's written
-    // from) — so the whole configuration menu is visible in the sidebar
-    // itself, with nothing hidden behind a second click or an in-page tab
-    // bar.
-    tenantOnly: true,
-    items: [
+      // Settings, with its submenus nested under it (they unfold while you're in it).
       {
         path: '/settings/general', title: 'Settings', icon: 'settings', prefix: '/settings',
         children: [
-          { path: '/settings/general', title: 'General' },
-          { path: '/settings/pairing', title: 'Pairing' },
-          { path: '/settings/billing', title: 'Billing' },
+          // Company, timezone, account and billing live in OdooBridger's
+          // portal in platform mode, so those two submenus are standalone only.
+          { path: '/settings/general', title: 'General', standaloneOnly: true },
+          { path: '/settings/pairing', title: 'Pairing, Sync & Alerts' },
+          { path: '/settings/billing', title: 'Billing', standaloneOnly: true },
           { path: '/settings/odoo', title: 'Odoo Connection' },
           { path: '/settings/biometric', title: 'Biometric Connections' },
         ],
@@ -159,7 +151,7 @@ const ROUTES = {
   '/terminals': { title: 'Terminals', render: renderTerminals },
   '/get-started': { title: 'BioBridge Setup', render: renderGetStarted },
   '/settings/general': { title: 'General', render: renderSettings },
-  '/settings/pairing': { title: 'Pairing', render: renderSettings },
+  '/settings/pairing': { title: 'Pairing, Sync & Alerts', render: renderSettings },
   '/settings/billing': { title: 'Billing', render: renderSettings },
   '/settings/billing/choose': { title: 'Choose A Plan', render: renderSettings },
   '/settings/odoo': { title: 'Odoo Connection', render: renderSettings },
@@ -246,7 +238,7 @@ function mountShell() {
     button.disabled = true;
     button.classList.add('spinning');
     try {
-      const result = await api.post('/sync/run-inline');
+      const result = await runSync();
       toast(`Sync ${result.status} — ${result.punches_new} new punch${result.punches_new === 1 ? '' : 'es'}, `
         + `${result.attendances_created} created, ${result.attendances_closed} closed`,
       result.status === 'failed' ? 'bad' : 'ok');
@@ -314,13 +306,15 @@ function renderChrome(path) {
         // parent picks up the subtle "current section" treatment; the pill
         // highlight belongs to whichever child is open.
         const inSection = item.prefix && path.startsWith(item.prefix);
-        const childrenHtml = !inSection ? '' : item.children.map((child) => {
+        const children = item.children.filter((child) => !(child.standaloneOnly && platform.on));
+        const parentHref = children[0]?.path || item.path;
+        const childrenHtml = !inSection ? '' : children.map((child) => {
           const childActive = child.path === path;
           return `<a class="nav nav-child ${childActive ? 'active' : ''}" href="#${esc(child.path)}"${childActive ? ' aria-current="page"' : ''}>
             <span class="nav-label">${esc(child.title)}</span>
           </a>`;
         }).join('');
-        return `<a class="nav nav-parent ${inSection ? 'in-section' : ''}" href="#${esc(item.path)}">
+        return `<a class="nav nav-parent ${inSection ? 'in-section' : ''}" href="#${esc(parentHref)}">
           <span class="nav-label">${item.icon ? icon(item.icon) : ''}${esc(item.title)}</span>
         </a>${childrenHtml}`;
       }
@@ -367,10 +361,14 @@ function renderChrome(path) {
   $('#tenantPill').innerHTML = auth.tenant
     ? (() => {
         const t = auth.tenant;
-        const [tone, note] = t.syncable === false
-          ? ['bad', ' · sync stopped']
-          : t.sync_enabled ? ['ok', ''] : ['warn', ' · sync off'];
-        return `<span class="pill ${tone}">${esc(t.name)}${note}</span>`;
+        const initial = (String(t.name || '').trim()[0] || '?').toUpperCase();
+        // The name is a name tag, as on the OdooBridger portal; a stopped or
+        // switched-off sync still gets its own pill beside it.
+        const state = t.syncable === false
+          ? '<span class="pill bad">Sync Stopped</span>'
+          : t.sync_enabled ? '' : '<span class="pill warn">Sync Off</span>';
+        return `<span class="account-chip" title="${esc(t.name)}"><span class="account-initial" aria-hidden="true">${esc(initial)}</span>`
+          + `<span class="account-name">${esc(t.name)}</span></span>${state}`;
       })()
     : auth.isPlatformAdmin
       ? '<span class="pill">platform staff</span>'
@@ -540,6 +538,12 @@ async function resolve() {
     // The console's landing page is its overview.
     if (!auth.tenant && auth.isPlatformAdmin && !['/platform', '/platform/plans', '/platform/email', '/platform/payments', '/platform/closed', '/platform/leads', '/console'].includes(route.path)) {
       window.location.hash = '#/console';
+      return;
+    }
+
+    // Platform mode: General and Billing are OdooBridger's; land on Pairing.
+    if (platform.on && /^\/settings(\/(general|billing|billing\/choose|plan|plan\/choose|password))?$/.test(route.path)) {
+      window.location.hash = '#/settings/pairing';
       return;
     }
 

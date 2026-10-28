@@ -5,6 +5,7 @@ import { fmtDate, makeClient, money } from '/assets/api.js';
 import { $, $$, banner, empty, esc, field, guard, loading, readForm, timezoneNames, toast, wireSearchSelects, wireTips } from '/assets/ui.js';
 import { detectZone } from '/site/geo.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
+import { multiSelect } from '/site/multiselect.js';
 
 const { api, session, restore, signOut } = makeClient('customer');
 const state = { me: null, account: null, available: [], stripe: false, catalog: null };
@@ -132,12 +133,12 @@ async function renderOpen(route, params) {
 /* =========================================================================
  * Services
  * ====================================================================== */
-function packagePicker(service, current, interval) {
+function packagePicker(service, current, interval, name = 'package_id') {
   const packages = service.packages.filter((p) => p.is_active !== false);
   const pick = current || (packages.find((p) => p.is_default) || packages[0])?.id;
   return `<div class="pkg-grid">${packages.map((p) => {
     const cents = interval === 'year' ? p.yearly_price_cents : p.monthly_price_cents;
-    return `<label class="pkg"><input type="radio" name="package_id" value="${esc(p.id)}" ${p.id === pick ? 'checked' : ''}>
+    return `<label class="pkg"><input type="radio" name="${esc(name)}" value="${esc(p.id)}" ${p.id === pick ? 'checked' : ''}>
       <b>${esc(p.name)}</b>
       <div class="price">${cents == null ? 'Custom' : `${money(cents, p.currency)}<span class="muted" style="font-size:12px">/${interval === 'year' ? 'yr' : 'mo'}</span>`}</div>
       ${p.description ? `<div class="hint">${esc(p.description)}</div>` : ''}
@@ -172,26 +173,76 @@ function serviceCard(row) {
     </div>`;
 }
 
-async function addServiceDialog(slug) {
+/* Add Services: pick one or more services and a plan for each, then either
+ * start the free trial or buy them now (Stripe Checkout). An account that
+ * already pays online just adds them to its subscription. */
+async function addServicesDialog(preselect = []) {
   const cat = await catalog();
-  const service = cat.services.find((s) => s.slug === slug);
-  if (!service) return;
+  const offered = cat.services.filter((s) => state.available.some((a) => a.slug === s.slug));
+  if (!offered.length) return;
   const paying = state.account.pays_online;
+  const canBuy = !paying && state.stripe;
+  let interval = state.account.billing_interval || 'month';
+  let menu;
+  const plans = (form) => {
+    const chosen = menu ? menu.values() : [];
+    const kept = readForm(form);
+    form.querySelector('[data-plans]').innerHTML = chosen.map((slug) => {
+      const service = offered.find((s) => s.slug === slug);
+      return `<div class="section-title" style="margin-top:16px">${esc(service.name)}</div>
+        ${packagePicker(service, kept[`pkg_${slug}`], interval, `pkg_${slug}`)}`;
+    }).join('');
+  };
   const result = await dialog({
-    title: `Add ${service.name}`,
+    title: 'Add Services',
     wide: true,
-    submitLabel: paying ? 'Add To Subscription' : 'Start Free Trial',
-    body: `<p class="muted">${esc(service.description || service.tagline || '')}</p>
-      ${packagePicker(service, null, state.account.billing_interval)}
+    submitLabel: paying ? 'Add To Subscription' : canBuy ? 'Buy Now' : 'Start Free Trial',
+    secondaryLabel: canBuy ? 'Start Free Trial' : null,
+    body: `
+      <div class="field"><label>Services</label><div data-services></div></div>
+      ${canBuy ? `<div class="field"><label>Billing</label>
+        <div class="seg" role="group" aria-label="Billing interval">
+          <button type="button" class="seg-btn ${interval === 'month' ? 'on' : ''}" data-int="month">Monthly</button>
+          <button type="button" class="seg-btn ${interval === 'year' ? 'on' : ''}" data-int="year">Yearly</button>
+        </div></div>` : ''}
+      <div data-plans></div>
       <p class="hint" style="margin-top:12px">${paying
-        ? 'It joins your subscription today; the first charge is prorated.'
-        : `A free trial, no card needed${cat.default_trial_days ? '' : ''}. Add payment details any time from Billing.`}</p>`,
-    onSubmit: async (form) => {
-      const { package_id: packageId } = readForm(form);
-      return api.post('/portal/services', { service: slug, package_id: packageId });
+        ? 'They join your subscription today; the first charge is prorated.'
+        : canBuy
+          ? 'Start a free trial with no card, or buy now and pay by card. Buying includes any services already on trial.'
+          : 'A free trial, no card needed. Add payment details any time from Billing.'}</p>`,
+    onOpen: (form) => {
+      menu = multiSelect(form.querySelector('[data-services]'),
+        offered.map((s) => ({ value: s.slug, label: s.name, hint: s.tagline })),
+        { placeholder: 'Select one or more services', selected: preselect, onChange: () => plans(form) });
+      form.querySelectorAll('[data-int]').forEach((b) => b.addEventListener('click', () => {
+        interval = b.dataset.int;
+        form.querySelectorAll('[data-int]').forEach((x) => x.classList.toggle('on', x === b));
+        plans(form);
+      }));
+      plans(form);
+    },
+    onSubmit: async (form, action) => {
+      const chosen = menu.values();
+      if (!chosen.length) throw new Error('Choose at least one service.');
+      const values = readForm(form);
+      for (const slug of chosen) {
+        await api.post('/portal/services', { service: slug, package_id: values[`pkg_${slug}`] || null });
+      }
+      if (canBuy && action === 'primary') {
+        const { url } = await api.post('/portal/billing/checkout', { interval });
+        window.location.href = url;
+        return { redirecting: true };
+      }
+      return { added: chosen.length };
     },
   });
-  if (result) { toast(`${service.name} added.`, 'ok'); route(); }
+  if (result?.redirecting) return;
+  if (result) {
+    toast(`${result.added === 1 ? 'Service' : `${result.added} services`} added.`, 'ok');
+    await loadAccount();
+    route();
+  }
 }
 
 async function changePackageDialog(slug) {
@@ -232,6 +283,12 @@ async function renderServices(mount) {
     ${state.account.status === 'suspended' ? banner('Account Suspended', 'Your services are paused. Contact support to restore them.', 'bad') : ''}
     ${live.some((r) => r.status === 'trialing') && !state.account.pays_online && canManage()
       ? banner('You Are On A Free Trial', 'Add payment details before it ends to keep every service running.', '', { href: '#/billing', label: 'Billing' }) : ''}
+    ${canManage() && state.available.length ? `
+      <div class="row" style="justify-content:flex-end;margin-bottom:14px">
+        <button class="primary" data-add-services>Add Services</button>
+      </div>` : ''}
+    ${!live.length ? `<div class="card" style="margin-bottom:16px">${empty('No Services Yet',
+      canManage() ? 'Add a service to start its free trial, or buy it now.' : 'Ask your account owner to add one.')}</div>` : ''}
     <div class="svc-grid">
       ${live.map(serviceCard).join('')}
       ${canManage() && state.available.length ? state.available.map((s) => `
@@ -240,15 +297,15 @@ async function renderServices(mount) {
           <div class="svc-tag">${esc(s.tagline || '')}</div>
           <div class="svc-actions"><button data-add="${esc(s.slug)}">Add Service</button></div>
         </div>`).join('') : ''}
-      ${!live.length && !state.available.length ? `<div class="card">${empty('No Services Yet', 'Ask your account owner to add one.')}</div>` : ''}
     </div>
     ${gone.length ? `<div class="section-title">Removed</div><div class="svc-grid">${gone.map(serviceCard).join('')}</div>` : ''}`;
   mount.addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.open) guard(() => openService(b.dataset.open));
-    if (b.dataset.add) guard(() => addServiceDialog(b.dataset.add));
-    if (b.dataset.readd) guard(() => addServiceDialog(b.dataset.readd));
+    if (b.dataset.addServices !== undefined) guard(() => addServicesDialog());
+    if (b.dataset.add) guard(() => addServicesDialog([b.dataset.add]));
+    if (b.dataset.readd) guard(() => addServicesDialog([b.dataset.readd]));
     if (b.dataset.change) guard(() => changePackageDialog(b.dataset.change));
     if (b.dataset.remove) guard(() => removeDialog(b.dataset.remove));
   });
@@ -609,7 +666,7 @@ const ACCOUNT_TABS = PAGES.filter((p) => p.group === 'account');
 /** The sidebar: Services, and Account holding company, people, Odoo and billing as tabs. */
 const NAV = [
   { path: '/services', title: 'Services', icon: 'grid' },
-  { path: '/account', title: 'Account', icon: 'settings', paths: [...ACCOUNT_TABS.map((p) => p.path), '/team'] },
+  { path: '/account', title: 'Account', icon: 'account', paths: [...ACCOUNT_TABS.map((p) => p.path), '/team'] },
 ];
 const accountTabs = (path) => `<nav class="tabs" aria-label="Account">${ACCOUNT_TABS.map((p) =>
   `<a href="#${p.path}"${p.path === path ? ' class="active" aria-current="page"' : ''}>${esc(p.title)}</a>`).join('')}</nav>`;

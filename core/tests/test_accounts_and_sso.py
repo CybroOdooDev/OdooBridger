@@ -354,3 +354,19 @@ def test_a_weak_password_creates_nothing(client, catalog):
     r = client.post("/api/v1/auth/link/use", json={"token": link_token("owner@acme.io"), "password": "short"})
     assert r.status_code == 422
     assert (_count(Account), _count(PendingSignup)) == (0, 1)
+
+
+def test_a_trial_can_start_without_a_service_and_add_one_later(client, catalog, service_app):
+    headers = signup(client, services=[])
+    me = client.get("/api/v1/portal/account", headers=headers).json()
+    assert me["account"]["services"] == []
+    assert "biometric" in [s["slug"] for s in me["available"]]
+    r = client.post("/api/v1/portal/services", headers=headers, json={"service": "biometric"})
+    assert r.status_code == 201, r.text
+    assert [row["status"] for row in r.json()["services"]] == ["trialing"]
+
+
+def test_buying_still_needs_a_service(client, catalog):
+    r = client.post("/api/v1/public/signup", json={
+        "company": "Acme Ltd", "full_name": "Olive Owner", "email": "o@acme.io", "services": [], "mode": "buy"})
+    assert r.status_code == 400

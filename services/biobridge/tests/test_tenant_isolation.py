@@ -25,6 +25,7 @@ from app.api.deps import get_current_user, get_platform_admin, get_principal
 from app.core.crypto import encrypt
 from app.main import app
 from app.models import (
+    SyncRun,
     AdmsCommand,
     AdmsDevice,
     Device,
@@ -72,10 +73,12 @@ def _seed(api, email, company):
     punch = PunchRecord(tenant_id=tid, source_id=source.id, external_id=f"{SERIAL}:1",
                         emp_code="1001", terminal_sn=SERIAL, punch_time_utc=datetime(2026, 10, 1, 4, 0),
                         process_state="pending")
-    s.add_all([device, mapping, punch])
+    run = SyncRun(tenant_id=tid, status="success", triggered_by="manual",
+                  started_at=datetime(2026, 10, 1, 4, 0), finished_at=datetime(2026, 10, 1, 4, 1), log=[])
+    s.add_all([device, mapping, punch, run])
     s.commit()
     ids = {"conn_id": conn.id, "source_id": source.id, "device_id": device.id,
-           "mapping_id": mapping.id, "punch_id": punch.id}
+           "mapping_id": mapping.id, "punch_id": punch.id, "run_id": run.id}
     s.close()
     return token, tid, ids
 

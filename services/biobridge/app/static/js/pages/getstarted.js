@@ -15,7 +15,7 @@
  * next. Leaving and coming back resumes at the first unfinished step.
  */
 
-import { api, auth } from '../api.js';
+import { api, auth, runSync } from '../api.js';
 import { $, banner, busy, esc, guard, loading, toast } from '../ui.js';
 import { needsMatch, unmappedCard, wireUnmapped } from './data.js';
 import { render as renderSettings } from './settings.js';
@@ -270,7 +270,7 @@ export async function render(mount, route) {
         </div>`;
       const button = $('#setupSync', body);
       button.addEventListener('click', () => busy(button, () => guard(async () => {
-        const run = await api.post('/sync/run-inline');
+        const run = await runSync();
         $('#setupSyncResult', body).innerHTML = banner(
           run.status === 'success' ? 'Sync Finished' : `Sync ${run.status}`,
           `${run.punches_new} new punch(es) read, ${run.attendances_created} attendance record(s) created, `

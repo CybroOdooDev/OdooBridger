@@ -26,6 +26,7 @@ def test_overview_counts_customers_and_subscriptions(client, catalog, service_ap
     assert k["subscriptions"]["value"] == 2 and k["subscriptions"]["trials"] == 2
     assert o["mix"]["trial"] == 2
     assert o["growth"][-1]["total"] == 2 and o["growth"][-1]["added"] == 2 and len(o["growth"]) == 12
+    assert o["growth"][-1]["closed"] == 0
     assert {r["name"] for r in o["recent_customers"]} == {"Beta", "Acme Ltd"}
     # No revenue history before the first snapshot of the period start.
     assert k["mrr"]["delta_pct"] is None
@@ -101,7 +102,7 @@ def test_revenue_change_compares_with_the_snapshot_at_the_period_start(client, c
     assert o["kpis"]["mrr"]["delta_pct"] == -100.0   # nobody pays online in the test catalog
 
 
-def test_a_service_dashboard_joins_the_services_figures_with_its_customers(client, catalog, service_app):
+def test_a_service_dashboard_shows_each_customer_not_totals(client, catalog, service_app):
     signup(client)
     db = SessionLocal()
     account_id = db.query(Account).first().id
@@ -110,14 +111,13 @@ def test_a_service_dashboard_joins_the_services_figures_with_its_customers(clien
         "status": "operational", "integrations": {"active": 2, "failed": 0}, "jobs": {"pending": 0},
         "workers": {"scheduler": {"ok": True, "last_run_at": None}}, "accounts": [],
         "dashboard": {
-            "tiles": [{"key": "devices", "label": "Devices Connected", "value": 2, "icon": "device"}],
-            "series": {"title": "Punches Synced Per Day", "unit": "punches",
-                       "points": [{"date": "2026-10-01", "value": 5}]},
-            "columns": [{"key": "devices", "label": "Devices", "kind": "usage"},
-                        {"key": "health", "label": "Sync health", "kind": "health"}],
-            "accounts": {account_id: {"devices": {"used": 2, "limit": 2}, "health": "healthy"}},
-            "attention": [{"account_id": account_id, "severity": "medium", "title": "At device limit",
-                           "detail": "2 of 2 devices on Starter.", "since": None},
+            "tiles": [], "series": None,
+            "columns": [{"key": "sync_enabled", "label": "Automatic sync", "kind": "onoff"},
+                        {"key": "activity", "label": "Activity", "kind": "activity"},
+                        {"key": "health", "label": "Scheduler health", "kind": "health"}],
+            "accounts": {account_id: {"sync_enabled": True, "activity": "active", "health": "delayed"}},
+            "attention": [{"account_id": account_id, "severity": "medium", "title": "Sync delayed",
+                           "detail": "No sync yet; interval 15 min.", "since": None},
                           {"account_id": "someone-else", "severity": "high", "title": "x", "detail": "y"}],
         },
     }
@@ -125,9 +125,27 @@ def test_a_service_dashboard_joins_the_services_figures_with_its_customers(clien
     assert r.status_code == 200, r.text
     d = r.json()
     assert d["service"]["name"] == "BioBridge" and d["service"]["has_dashboard"] is True
-    assert d["tiles"][0]["value"] == 2 and d["series"]["points"][0]["value"] == 5
+    # The tiles are the core's own: customers and how they pay, plus sync issues.
+    tiles = {t["key"]: t["value"] for t in d["tiles"]}
+    assert tiles == {"customers": 1, "trialing": 1, "active": 0, "past_due": 0, "sync_issues": 1}
     [row] = d["customers"]
-    assert row["name"] == "Acme Ltd" and row["plan"] == "Starter" and row["values"]["devices"] == {"used": 2, "limit": 2}
+    assert row["name"] == "Acme Ltd" and row["plan"] == "Starter" and row["since"]
+    assert row["billing"]["label"] == "Trial ends" and row["billing"]["date"]
+    assert row["values"] == {"sync_enabled": True, "activity": "active", "health": "delayed"}
     # Only this service's own customers' notices, named from the core.
-    assert [(a["title"], a["account"]) for a in d["attention"]] == [("At device limit", "Acme Ltd")]
+    assert [(a["title"], a["account"]) for a in d["attention"]] == [("Sync delayed", "Acme Ltd")]
     assert client.get("/api/v1/staff/services/nope/dashboard", headers=staff_headers(client)).status_code == 404
+
+
+def test_customer_history_counts_a_deleted_account_only_while_it_existed(client, catalog, service_app):
+    signup(client)
+    signup(client, email="b@beta.io", company="Beta")
+    staff = staff_headers(client)
+    beta = next(a for a in client.get("/api/v1/staff/accounts", headers=staff).json() if a["name"] == "Beta")
+    r = client.post(f"/api/v1/staff/accounts/{beta['id']}/delete", headers=staff, json={"reason": "test"})
+    assert r.status_code == 200, r.text
+    o = _overview(client)
+    this_month = o["growth"][-1]
+    assert (this_month["added"], this_month["closed"], this_month["total"]) == (2, 1, 1)
+    # Neither account existed before this month.
+    assert all(m["total"] == 0 and m["added"] == 0 for m in o["growth"][:-1])

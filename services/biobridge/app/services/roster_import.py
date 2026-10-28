@@ -183,6 +183,26 @@ def _lookup_names(odoo: OdooClient, model: str) -> dict[int, str]:
         return {}
 
 
+def _release_vanished(db: Session, rows: list[EmployeeMapping], roster: dict[int, dict]) -> None:
+    """A mapped employee Odoo no longer has (deleted there): a badge that never
+    punched is removed, one that has goes back to unmapped to be matched again.
+    Skipped when the roster came back empty, which is a read problem, not a
+    company with no employees."""
+    for m in rows:
+        if m.odoo_employee_id in roster:
+            continue
+        if m.last_punch_at is None:
+            db.delete(m)
+            continue
+        m.status = MappingStatus.unmapped.value
+        m.match_note = f"Odoo employee #{m.odoo_employee_id} no longer exists in Odoo; match this badge again."
+        m.odoo_employee_id = None
+        m.odoo_employee_name = None
+        m.odoo_company_id = m.odoo_company_name = None
+        m.open_attendance_id = None
+        m.open_check_in = None
+
+
 def refresh_companies(db: Session, tenant: Tenant, odoo: OdooClient, force: bool = False) -> int:
     """Fill each mapped employee's Odoo company, department and manager (for
     the Employees page's filters). Costs one roster read; without ``force`` it
@@ -203,6 +223,9 @@ def refresh_companies(db: Session, tenant: Tenant, odoo: OdooClient, force: bool
         log.warning("could not read Odoo employee details: %s", exc)
         return 0
     roster = {r["id"]: r for r in roster_rows}
+    if roster:
+        _release_vanished(db, rows, roster)
+        rows = [m for m in rows if m.status == MappingStatus.mapped.value]
     people = {r["id"]: r.get("name") for r in roster_rows}
     needs = lambda f: any(isinstance(r.get(f), int) and not isinstance(r.get(f), bool) for r in roster_rows)  # noqa: E731
     companies = _lookup_names(odoo, "res.company") if needs("company_id") else {}

@@ -1,6 +1,6 @@
 /* Overview: is it working, what needs attention, and the Sync now button. */
 
-import { api, auth } from '../api.js';
+import { api, auth, runSync } from '../api.js';
 import { pairingReviewed } from '../setup-state.js';
 import {
   $, banner, busy, empty, esc, fmtAgo, fmtIn, guard, loading, pill, stat, fmtUtc, triggerLabel } from '../ui.js';
@@ -65,36 +65,44 @@ function setupChecklist({ health, devices, run, unmapped }) {
     </div>`;
 }
 
-/* "Next sync in 15 min" with the scheduler's pulse. Only shown once setup is
- * finished — before that, the checklist is what the page is for. */
-function scheduleCard(schedule) {
+/* A broadcast mark: a dot with radio waves, which ripple while the scheduler is live. */
+const LIVE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" '
+  + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<circle cx="12" cy="12" r="2" fill="currentColor"/>'
+  + '<path class="wave w1" d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7"/>'
+  + '<path class="wave w2" d="M5.6 18.4a9 9 0 0 1 0-12.8M18.4 5.6a9 9 0 0 1 0 12.8"/></svg>';
+
+/* The scheduler's state for the Scheduler Info card: an icon in its title bar,
+ * coloured by state, saying what it is on hover. */
+function scheduleIcon(schedule) {
   if (!schedule) return '';
   const every = schedule.effective_interval_minutes;
-  let title; let detail; let tag;
+  const [tone, tip] = !schedule.running
+    ? ['bad', 'Scheduler down — automatic syncs are paused']
+    : !schedule.next_run_at
+      ? ['mute', 'Scheduler idle — automatic sync is off']
+      : ['ok', `Scheduler live — syncs every ${every} min${schedule.interval_widened ? ' (slowed to fit your plan)' : ''}`];
+  return `<span class="sched-icon ${tone}" tabindex="0" role="img" aria-label="${esc(tip)}" data-tip="${esc(tip)}">${LIVE}</span>`;
+}
+
+/* ...and its rows: the last sync (with its result) and the next one. */
+function scheduleRows(schedule, run) {
+  const last = run
+    ? `${pill(run.status)} <span data-tip="${esc(fmtUtc(run.started_at))} UTC">${esc(fmtAgo(run.started_at))}</span>`
+    : 'Never';
+  const lastRow = `<tr><td>Last sync</td><td style="text-align:right">${last}</td></tr>`;
+  if (!schedule) return lastRow;
+  let next;
   if (!schedule.running) {
-    title = 'Scheduler Not Running';
-    detail = 'Automatic syncs are paused until the scheduler is back. You can still press Sync Now.';
-    tag = '<span class="pill bad">scheduler down</span>';
+    next = 'Paused until the scheduler is back';
   } else if (!schedule.next_run_at) {
-    title = 'Automatic Sync Is Off';
-    detail = 'Syncing is switched off or stopped for this account. Press Sync Now to run one by hand.';
-    tag = '<span class="pill mute">scheduler idle</span>';
+    next = 'Automatic sync is off';
   } else {
-    title = `Next sync ${fmtIn(schedule.next_run_at)}`;
-    detail = `Every ${every} minutes${schedule.interval_widened ? ' (slowed to fit your plan)' : ''}.`
-      + (schedule.seconds_since_tick != null ? ` Last checked ${fmtAgo(new Date(Date.now() - schedule.seconds_since_tick * 1000).toISOString())}.` : '');
-    tag = '<span class="pill ok">scheduler live</span>';
+    next = fmtIn(schedule.next_run_at);
   }
   return `
-    <div class="card" style="margin-bottom:14px">
-      <div class="row" style="justify-content:space-between;align-items:flex-start">
-        <div>
-          <h2 style="margin:0 0 4px;font-size:22px">${esc(title)}</h2>
-          <div style="color:var(--muted);font-size:13.5px">${esc(detail)}</div>
-        </div>
-        ${tag}
-      </div>
-    </div>`;
+    ${lastRow}
+    <tr><td>Next sync</td><td style="text-align:right">${esc(next)}</td></tr>`;
 }
 
 /* The one word for all biometric connections: the worst state among them. */
@@ -139,7 +147,7 @@ export async function render(mount) {
   mount.innerHTML = `
     <div>
     <div class="rail-main">
-    ${checklist || scheduleCard(data.schedule)}
+    ${checklist}
 
     <div class="grid cols-4" style="margin-bottom:14px">
       ${stat({ label: 'Punches today', value: data.punches_today, href: `#/activity?date_from=${today}` })}
@@ -174,18 +182,18 @@ export async function render(mount) {
       </div>
 
       <div class="card">
-        <h2 class="h2-split">Latest Sync${run ? ` <span class="pill mute" data-tip="${esc(fmtUtc(run.started_at))} UTC">${esc(fmtAgo(run.started_at))}</span>` : ''}</h2>
-        ${run ? `
-          <table>
-            <tbody>
-              <tr><td>Result</td><td style="text-align:right">${pill(run.status)}</td></tr>
+        <h2 class="h2-split">Scheduler Info ${scheduleIcon(data.schedule)}</h2>
+        <table>
+          <tbody>
+            ${scheduleRows(data.schedule, run)}
+            ${run ? `
               <tr><td>New punches</td><td class="num" style="text-align:right">${esc(run.punches_new)}</td></tr>
               <tr><td>Attendance created</td><td class="num" style="text-align:right">${esc(run.attendances_created)}</td></tr>
-              <tr><td>Attendance closed</td><td class="num" style="text-align:right">${esc(run.attendances_closed)}</td></tr>
-            </tbody>
-          </table>
-          ${run.error_message ? banner('Error', run.error_message, 'bad') : ''}
-        ` : empty('No Sync Has Run Yet', 'Connect both sides, then press Sync now.')}
+              <tr><td>Attendance closed</td><td class="num" style="text-align:right">${esc(run.attendances_closed)}</td></tr>` : ''}
+          </tbody>
+        </table>
+        ${run?.error_message ? banner('Error', run.error_message, 'bad') : ''}
+        ${run ? '' : empty('No Sync Has Run Yet', 'Connect both sides, then press Sync now.')}
         ${auth.canWrite ? `
           <div class="row" style="margin-top:14px">
             <button class="primary" id="syncNow" ${needsSetup ? 'disabled' : ''}>Sync Now</button>
@@ -225,9 +233,9 @@ export async function render(mount) {
     button.addEventListener('click', () =>
       busy(button, () =>
         guard(async () => {
-          // run-inline returns the finished run, so the result is immediate
+          // runSync waits for the finished run, so the result is immediate
           // rather than a "queued" message that explains nothing.
-          const result = await api.post('/sync/run-inline');
+          const result = await runSync();
           const summary = `${result.status} — ${result.punches_new} new punch(es), `
             + `${result.attendances_created} created, ${result.attendances_closed} closed`;
           await render(mount);

@@ -84,6 +84,9 @@ class Tenant(Base, UUIDPk, Timestamped):
     #: {alert key: {"first_seen": iso, "emailed_at": iso | null}} — what has
     #: been seen and mailed, so one problem is one email, then a daily reminder.
     alert_state: Mapped[dict | None] = mapped_column(JSON)
+    #: The Odoo database ("host|db") the employee links belong to. When the
+    #: active Odoo becomes another database they are released (app.services.odoo_switch).
+    odoo_identity: Mapped[str | None] = mapped_column(String(300))
 
     # --- pairing policy, tenant-wide defaults --------------------------------
     pairing_mode: Mapped[str] = mapped_column(String(20), default="alternating")

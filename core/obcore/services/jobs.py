@@ -87,6 +87,25 @@ async def loop() -> None:
         await asyncio.sleep(settings.sweep_interval_seconds)
 
 
+async def alert_loop() -> None:
+    """Check Needs Attention for alerts, apart from the slower sweep."""
+    while True:
+        try:
+            await asyncio.to_thread(_alert_tick)
+        except Exception:  # noqa: BLE001 — the loop must survive anything
+            log.exception("Alert check failed")
+        await asyncio.sleep(settings.alert_interval_seconds)
+
+
+def _alert_tick() -> None:
+    from obcore.services import alerts
+
+    with session_scope() as db:
+        result = alerts.check(db)
+        if any(result.values()):
+            log.info("Alerts: %s", result)
+
+
 def _tick() -> None:
     with session_scope() as db:
         from obcore.services import stripe_api

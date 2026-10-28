@@ -238,6 +238,10 @@ def apply_odoo(db: Session, tenant: Tenant, block: dict[str, Any] | None) -> Non
         if other is not conn and other.is_active:
             other.is_active = False
             other.status_message = "Replaced by the Odoo connection set in OdooBridger."
+    db.flush()
+    from app.services.odoo_switch import ensure_current
+
+    ensure_current(db, tenant)   # another Odoo database: let go of the old one's employees
 
 
 def odoo_readiness(db: Session, tenant: Tenant, *, live: bool = False) -> dict[str, Any] | None:

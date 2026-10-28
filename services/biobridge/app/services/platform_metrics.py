@@ -15,8 +15,11 @@ Definitions:
   no device names, addresses, error text or Odoo URLs/messages. Failures are
   reported as counts with generic wording.
 
-The ``dashboard`` block feeds the core's per-service staff page: tiles, a
-daily series, one generic row per customer and a generic attention list.
+The ``dashboard`` block feeds the core's per-service staff page: one row per
+customer about how the service is running for it (automatic sync on or off,
+last sync, activity, scheduler health) and a generic attention list. It
+carries no counts of a customer's devices, employees or punches, and no
+totals across customers: what a customer does with the service is theirs.
 * pending job: a punch not yet written to Odoo (``pending`` or ``error``,
   which are retried).
 * scheduler ok: its heartbeat is no older than three ticks.
@@ -32,13 +35,12 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models import Tenant
-from app.models.attendance import EmployeeMapping, MappingStatus, PunchRecord, PunchState, SyncRun, SyncStatus
-from app.models.connection import ConnectionStatus, Device, DeviceSource, OdooConnection
+from app.models.attendance import PunchRecord, PunchState, SyncRun, SyncStatus
+from app.models.connection import ConnectionStatus, DeviceSource, OdooConnection
 from app.services.scheduling import scheduler_health
 
 PENDING_STATES = (PunchState.pending.value, PunchState.error.value)
 DEGRADED_SHARE = 0.25
-SERIES_DAYS = 30
 DELAY_FLOOR = timedelta(minutes=30)
 
 
@@ -94,12 +96,6 @@ def _ago(delta: timedelta) -> str:
     return f"{max(1, seconds // 60)} min"
 
 
-def _counts(db: Session, column, ids: list[str], *where) -> dict[str, int]:
-    if not ids:
-        return {}
-    return dict(db.execute(select(column, func.count()).where(column.in_(ids), *where).group_by(column)).all())
-
-
 def collect(db: Session) -> dict[str, Any]:
     tenant_rows = db.scalars(select(Tenant).where(Tenant.platform_account_id.is_not(None))).all()
     account_of = {t.id: t.platform_account_id for t in tenant_rows}
@@ -127,7 +123,7 @@ def collect(db: Session) -> dict[str, Any]:
     for tenant_id, row in per.items():
         if row["failed"]:
             row["failures"].append({"key": "devices", "issue": "Sync failing",
-                                    "detail": f"{row['failed']} of {row['active']} devices not syncing",
+                                    "detail": "Terminals aren't syncing",
                                     "since": _iso(first_bad.get(tenant_id))})
     odoo_bad: dict[str, datetime | None] = {}
     for tenant_id, checked in odoo_failing:
@@ -174,13 +170,15 @@ def _plan(tenant: Tenant) -> str | None:
     return package.get("name") or tenant.plan_name
 
 
+#: A customer counts as active when it synced within this long.
+ACTIVE_WITHIN = timedelta(hours=24)
+
+
 def _dashboard(db: Session, tenants: list[Tenant], per: dict[str, dict[str, Any]],
                first_bad: dict[str, datetime | None], odoo_bad: dict[str, datetime | None],
                pending: int) -> dict[str, Any]:
     ids = [t.id for t in tenants]
     now = datetime.now(timezone.utc)
-    devices = _counts(db, Device.tenant_id, ids)
-    employees = _counts(db, EmployeeMapping.tenant_id, ids, EmployeeMapping.status == MappingStatus.mapped.value)
     last_ok = dict(db.execute(
         select(SyncRun.tenant_id, func.max(SyncRun.finished_at))
         .where(SyncRun.tenant_id.in_(ids), SyncRun.status == SyncStatus.success.value)
@@ -189,21 +187,6 @@ def _dashboard(db: Session, tenants: list[Tenant], per: dict[str, dict[str, Any]
         select(DeviceSource.tenant_id, func.min(DeviceSource.created_at))
         .where(DeviceSource.tenant_id.in_(ids), DeviceSource.is_active.is_(True))
         .group_by(DeviceSource.tenant_id)).all()) if ids else {}
-
-    # Punches written to Odoo, by the day they were written (the ledger row's
-    # last change is when it became synced).
-    start = (now - timedelta(days=SERIES_DAYS - 1)).date()
-    by_day: dict[str, int] = {}
-    if ids:
-        day = func.date(PunchRecord.updated_at)
-        for d, n in db.execute(
-                select(day, func.count()).where(
-                    PunchRecord.tenant_id.in_(ids), PunchRecord.process_state == PunchState.synced.value,
-                    PunchRecord.updated_at >= datetime.combine(start, datetime.min.time()))
-                .group_by(day)).all():
-            by_day[str(d)[:10]] = int(n)
-    points = [{"date": (start + timedelta(days=i)).isoformat(),
-               "value": by_day.get((start + timedelta(days=i)).isoformat(), 0)} for i in range(SERIES_DAYS)]
 
     accounts: dict[str, Any] = {}
     attention: list[dict[str, Any]] = []
@@ -224,14 +207,21 @@ def _dashboard(db: Session, tenants: list[Tenant], per: dict[str, dict[str, Any]
             health = "delayed"
         else:
             health = "healthy"
-        usage = {"devices": {"used": int(devices.get(t.id, 0)), "limit": t.plan_max_devices},
-                 "employees": {"used": int(employees.get(t.id, 0)), "limit": t.plan_max_employees}}
-        accounts[acc] = {**usage, "sync_interval": interval, "last_sync_at": _iso(last), "health": health}
+        if not row["active"] and last is None:
+            activity = "not_started"
+        elif last is not None and now - last <= ACTIVE_WITHIN:
+            activity = "active"
+        else:
+            activity = "idle"
+        accounts[acc] = {
+            "sync_enabled": bool(t.sync_enabled) and t.syncable is not False,
+            "sync_interval": interval, "last_sync_at": _iso(last),
+            "activity": activity, "health": health,
+        }
 
         if row["failed"]:
             attention.append({"account_id": acc, "severity": "high", "title": "Sync failing",
-                              "detail": f"{row['failed']} of {row['active']} devices not syncing.",
-                              "since": _iso(first_bad.get(t.id))})
+                              "detail": "Terminals aren't syncing.", "since": _iso(first_bad.get(t.id))})
         elif t.id in odoo_bad:
             attention.append({"account_id": acc, "severity": "high", "title": "Sync failing",
                               "detail": "Attendance can't be written to Odoo.", "since": _iso(odoo_bad[t.id])})
@@ -240,34 +230,15 @@ def _dashboard(db: Session, tenants: list[Tenant], per: dict[str, dict[str, Any]
                       else f"No sync yet; interval {interval or 15} min.")
             attention.append({"account_id": acc, "severity": "medium", "title": "Sync delayed",
                               "detail": detail, "since": _iso(last)})
-        plan = _plan(t)
-        for key, noun in (("devices", "device"), ("employees", "employee")):
-            used, limit = usage[key]["used"], usage[key]["limit"]
-            if limit is not None and used >= limit:
-                attention.append({"account_id": acc, "severity": "medium", "title": f"At {noun} limit",
-                                  "detail": f"{used} of {limit} {key}" + (f" on {plan}." if plan else "."),
-                                  "since": None})
 
-    synced_30d = sum(p["value"] for p in points)
     return {
-        "tiles": [
-            {"key": "customers", "label": "Customers", "value": len(tenants), "icon": "users"},
-            {"key": "devices", "label": "Devices Connected", "value": sum(a["devices"]["used"] for a in accounts.values()),
-             "icon": "device"},
-            {"key": "employees", "label": "Employees Connected",
-             "value": sum(a["employees"]["used"] for a in accounts.values()), "icon": "badge"},
-            {"key": "punches_30d", "label": "Punches (30 Days)", "value": synced_30d, "icon": "check", "tone": "ok"},
-            {"key": "pending", "label": "Pending Sync", "value": pending, "icon": "clock",
-             "tone": "warn" if pending else "ok"},
-        ],
-        "series": {"title": "Punches Synced Per Day", "subtitle": "all customers · last 30 days",
-                   "unit": "punches", "points": points},
+        "tiles": [],
+        "series": None,
         "columns": [
-            {"key": "devices", "label": "Devices", "kind": "usage"},
-            {"key": "employees", "label": "Employees", "kind": "usage"},
-            {"key": "sync_interval", "label": "Sync interval", "kind": "minutes"},
+            {"key": "sync_enabled", "label": "Automatic sync", "kind": "onoff"},
             {"key": "last_sync_at", "label": "Last sync", "kind": "ago"},
-            {"key": "health", "label": "Sync health", "kind": "health"},
+            {"key": "activity", "label": "Activity", "kind": "activity"},
+            {"key": "health", "label": "Scheduler health", "kind": "health"},
         ],
         "accounts": accounts,
         "attention": attention,

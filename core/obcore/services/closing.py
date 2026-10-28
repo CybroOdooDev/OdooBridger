@@ -36,7 +36,7 @@ def delete_account(db: Session, account: Account, *, actor: str, reason: str | N
     db.add(AccountClosure(account_id=account.id, account_name=account.name,
                           owner_email=owner.email if owner else None,
                           services=[r.service.slug for r in account.services],
-                          closed_by=actor, reason=reason))
+                          closed_by=actor, reason=reason, account_created_at=account.created_at))
     audit(db, actor, "account.delete", account_id=account.id, detail=reason)
     db.delete(account)
     db.flush()

@@ -1,6 +1,6 @@
 /* Settings: tenant configuration, split into submenus.
  *
- * General / Pairing / Plan are the account's own rules —
+ * General / Pairing, Sync & Alerts / Plan are the account's own rules —
  * previously one long scrolling form, now one submenu each so a change to
  * pairing does not require scrolling past other settings to find it. Odoo and
  * Biometric absorb what used to be the standalone "Connections" page: where
@@ -216,31 +216,16 @@ function saveTenantForm(mount, formId, buttonId, reRender) {
 const infoTip = (text, strong = false) =>
   `<span class="field-tip${strong ? ' strong' : ''}" tabindex="0" role="note" aria-label="${esc(text)}" data-tip="${esc(text)}">${INFO_ICON}</span>`;
 
-async function renderGeneral(mount) {
-  mount.innerHTML = loading();
-  const ctx = await tenantContext();
-  const { tenant, readonly, intervalHelp, schedule, floor } = ctx;
+/* Sync & Alerts: how often punches are pulled, whether the scheduler runs
+ * them at all, and whether serious alerts are emailed. Part of the Pairing,
+ * Sync & Alerts page's form. */
+function syncAlertsCard(ctx) {
+  const { tenant, intervalHelp, schedule, floor } = ctx;
   const intervalWarn = Boolean(schedule && !schedule.running) || tenant.syncable === false;
-  const intervalPresets = [5, 15, 30, 60].filter((m) => !floor || m >= floor);
-
-  // Platform mode: password and account are OdooBridger's.
-  const accountButtons = platform.on
-    ? `<a class="btn" href="${esc(platform.info.portal_url)}">Manage In OdooBridger</a>`
-    : '<button type="button" id="pwOpen">Change User Password</button>'
-    + (auth.user?.role === 'owner'
-      ? `<button type="button" class="danger-outline" id="delAccount" title="Permanently delete this account and everything BioBridge holds for it">${TRASH_ICON} Delete Account</button>` : '');
-
-  mount.innerHTML = `
-    ${topBanners(ctx)}
-    <div class="card">
-      <form id="form" ${readonly ? 'inert' : ''}>
-        ${cardHead('General', '', accountButtons + saveButton(readonly))}
-        ${field({ name: 'name', label: 'Company', value: tenant.name, required: true })}
-        ${field({
-          name: 'timezone', label: 'Timezone', value: tenant.timezone, required: true,
-          help: 'Used to render attendance for your team. Separate from each biometric connection’s own device timezone.',
-          datalist: timezoneNames(), tip: true,
-        })}
+  const intervalPresets = syncPresets(floor);
+  return `
+      <div class="card" style="margin-top:14px">
+        ${cardHead('Sync & Alerts')}
         <div class="field" id="intervalField">
           <label id="intervalLabel">Sync Every ${infoTip(intervalHelp, intervalWarn)}</label>
           <div class="chips" role="radiogroup" aria-labelledby="intervalLabel">
@@ -273,10 +258,13 @@ async function renderGeneral(mount) {
           </label>
         </div>
         </div>
-      </form>
-    </div>
-    `;
+      </div>`;
+}
 
+const syncPresets = (floor) => [5, 15, 30, 60].filter((m) => !floor || m >= floor);
+
+function wireSyncAlerts(mount, floor) {
+  const intervalPresets = syncPresets(floor);
   const form = $('#form', mount);
   const syncBox = $('#sync_enabled', mount);
   const syncState = $('#syncState', mount);
@@ -327,6 +315,35 @@ async function renderGeneral(mount) {
   };
   paintAlert();
   alertBox.addEventListener('change', paintAlert);
+}
+
+async function renderGeneral(mount) {
+  mount.innerHTML = loading();
+  const ctx = await tenantContext();
+  const { tenant, readonly } = ctx;
+
+  // Platform mode: password and account are OdooBridger's.
+  const accountButtons = platform.on
+    ? `<a class="btn" href="${esc(platform.info.portal_url)}">Manage In OdooBridger</a>`
+    : '<button type="button" id="pwOpen">Change User Password</button>'
+    + (auth.user?.role === 'owner'
+      ? `<button type="button" class="danger-outline" id="delAccount" title="Permanently delete this account and everything BioBridge holds for it">${TRASH_ICON} Delete Account</button>` : '');
+
+  mount.innerHTML = `
+    ${topBanners(ctx)}
+    <div class="card">
+      <form id="form" ${readonly ? 'inert' : ''}>
+        ${cardHead('General', '', accountButtons + saveButton(readonly))}
+        ${field({ name: 'name', label: 'Company', value: tenant.name, required: true })}
+        ${field({
+          name: 'timezone', label: 'Timezone', value: tenant.timezone, required: true,
+          help: 'Used to render attendance for your team. Separate from each biometric connection’s own device timezone.',
+          datalist: timezoneNames(), tip: true,
+        })}
+      </form>
+    </div>
+    `;
+
 
   saveTenantForm(mount, 'form', 'save', renderGeneral);
   $('#pwOpen', mount)?.addEventListener('click', openPasswordWizard);
@@ -483,6 +500,7 @@ async function renderPairing(mount) {
           help: 'What to do with a check-out that has no matching check-in: flag it for review, infer a check-in 8 hours earlier, or drop it.',
         })}
       </div>
+      ${syncAlertsCard(ctx)}
     </form>`;
 
   // Only first/last mode groups punches by day, so only it needs a day boundary.
@@ -497,6 +515,7 @@ async function renderPairing(mount) {
   wireChipField(mount, pairForm, 'min_punch_interval_seconds', [0, 30, 60, 120, 300]);
   wireChipField(mount, pairForm, 'max_shift_hours', [8, 12, 16, 24]);
 
+  wireSyncAlerts(mount, ctx.floor);
   saveTenantForm(mount, 'form', 'save', renderPairing);
 }
 
@@ -741,7 +760,15 @@ async function renderOdoo(mount, route) {
         + '<button type="button" class="sm link" id="odooRemoveCancel">Cancel</button>'
       : '<button type="button" class="sm link" id="odooRemove">Remove Connection</button>'
   ) : '';
-  const actions = readonly ? '' : `
+  // Platform mode: the connection is OdooBridger's. It is shown, not edited:
+  // its status, Test Connection, and a way to its settings in OdooBridger.
+  const openCore = `<a class="btn" href="${esc(portalOdoo)}">Open In OdooBridger</a>`;
+  const actions = locked && odoo
+    ? `${pill(odoo.status)}
+      ${readonly ? '' : '<button type="button" id="testOdoo">Test Connection</button>'}
+      ${openCore}
+      ${readonly ? '' : `<button class="primary" id="saveOdoo" type="submit" form="odooForm">Save Changes</button>`}`
+    : readonly ? '' : `
     ${removeControls}
     <button type="button" id="testOdoo">Test Connection</button>
     <button class="primary" id="saveOdoo" type="submit" form="odooForm">
@@ -754,14 +781,20 @@ async function renderOdoo(mount, route) {
       ${cardHead('Odoo', '', inSetup ? '' : actions)}
       ${!odoo && !readonly ? testFirstHint('Connect Odoo') : ''}
       <div id="odooTestResult"></div>
-      <div id="odooStatus">${odoo ? statusRow(odoo) : ''}</div>
-      ${managed ? banner('Set In OdooBridger',
-        'The address, database, login and API key come from your OdooBridger account. Change them there. The companies below are set here.',
-        '', { href: portalOdoo, label: 'Open OdooBridger' }) : ''}
+      <div id="odooStatus">${odoo && !locked ? statusRow(odoo) : ''}${odoo && locked && odoo.status_message
+        ? banner('Error', odoo.status_message, 'bad') : ''}</div>
       ${locked && !managed ? banner('Move This Connection To OdooBridger',
         'Connect the same Odoo in your OdooBridger account. It takes this connection over and keeps its companies and history.',
         'warn', { href: portalOdoo, label: 'Open OdooBridger' }) : ''}
       <form id="odooForm" ${readonly ? 'inert' : ''}>
+        ${locked && odoo ? `
+        <dl class="conn-info">
+          <dt>Server URL</dt><dd><a href="${esc(odoo.url)}" target="_blank" rel="noopener">${esc(odoo.url)}</a></dd>
+          <dt>Database</dt><dd>${esc(odoo.db_name)}</dd>
+        </dl>
+        <input type="hidden" name="url" value="${esc(odoo.url || '')}">
+        <input type="hidden" name="db_name" value="${esc(odoo.db_name || '')}">
+        <input type="hidden" name="username" value="${esc(odoo.username || '')}">` : `
         <fieldset class="plain-fieldset" ${locked ? 'disabled' : ''}>
         ${field({
           name: 'url', label: 'Server URL', required: true, tip: true, strongHelp: true,
@@ -781,7 +814,7 @@ async function renderOdoo(mount, route) {
             ? 'Stored encrypted and never shown again. Leave blank to keep the current one.'
             : 'Odoo → Preferences → Account Security → New API key.',
         })}
-        </fieldset>
+        </fieldset>`}
         <div id="companyField">${companyFieldHtml(odoo, odooLastCompanies?.companies, savedDisabled(odoo, odooLastCompanies?.companies))}</div>
       </form>
       ${inSetup && actions ? `<div class="setup-foot actions">${actions}</div>` : ''}

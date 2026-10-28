@@ -7,6 +7,8 @@ const ICONS = {
   grid: '<rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/>',
   card: '<rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="M3 10h18M7 15h4"/>',
   people: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.8-3.2 3-5 5.5-5s4.7 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M16 14c2.4 0 4 1.5 4.6 4"/>',
+  // A person in a circle: the account.
+  account: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="10" r="3"/><path d="M6.2 18.4a6.5 6.5 0 0 1 11.6 0"/>',
   settings: '<path d="M10.3 3.2h3.4l.5 2.4 1.9.8 2-1.4 2.4 2.4-1.4 2 .8 1.9 2.4.5v3.4l-2.4.5-.8 1.9 1.4 2-2.4 2.4-2-1.4-1.9.8-.5 2.4h-3.4l-.5-2.4-1.9-.8-2 1.4-2.4-2.4 1.4-2-.8-1.9-2.4-.5v-3.4l2.4-.5.8-1.9-1.4-2 2.4-2.4 2 1.4 1.9-.8z"/><circle cx="12" cy="12" r="3.2"/>',
   overview: '<path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-4H4zM14 4v4h6V4z"/>',
   accounts: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
@@ -164,8 +166,11 @@ export function match(pattern, path) {
 
 /* ---- dialogs ------------------------------------------------------------- */
 /** A modal form. ``body`` is HTML; resolves with the dialog element on submit
- * (the caller reads it), or null on cancel. ``onSubmit`` may throw to keep it open. */
-export function dialog({ title, body, submitLabel = 'Save', danger = false, wide = false, onSubmit }) {
+ * (the caller reads it), or null on cancel. ``onSubmit`` may throw to keep it open.
+ * ``secondaryLabel`` adds a second submit button; ``onSubmit(form, action)`` is
+ * told which was pressed ("primary" or "secondary"). ``onOpen(form)`` wires
+ * anything interactive in the body. */
+export function dialog({ title, body, submitLabel = 'Save', secondaryLabel = null, danger = false, wide = false, onSubmit, onOpen }) {
   return new Promise((resolve) => {
     const host = document.createElement('div');
     host.innerHTML = `
@@ -177,7 +182,8 @@ export function dialog({ title, body, submitLabel = 'Save', danger = false, wide
           <p class="err" data-err></p>
           <div class="row" style="justify-content:flex-end;gap:8px;margin-top:14px">
             <button type="button" data-close>Cancel</button>
-            <button type="submit" class="${danger ? 'danger' : 'primary'}">${esc(submitLabel)}</button>
+            ${secondaryLabel ? `<button type="submit" data-action="secondary">${esc(secondaryLabel)}</button>` : ''}
+            <button type="submit" data-action="primary" class="${danger ? 'danger' : 'primary'}">${esc(submitLabel)}</button>
           </div>
         </form>
       </div>`;
@@ -189,18 +195,20 @@ export function dialog({ title, body, submitLabel = 'Save', danger = false, wide
     const form = host.querySelector('form');
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const button = form.querySelector('[type=submit]');
+      const buttons = [...form.querySelectorAll('[type=submit]')];
+      const action = e.submitter?.dataset.action || 'primary';
       const err = form.querySelector('[data-err]');
       err.textContent = '';
-      button.disabled = true;
+      buttons.forEach((b) => { b.disabled = true; });
       try {
-        const result = onSubmit ? await onSubmit(form) : form;
+        const result = onSubmit ? await onSubmit(form, action) : form;
         close(result ?? form);
       } catch (error) {
         err.textContent = error.message || 'Something went wrong';
-        button.disabled = false;
+        buttons.forEach((b) => { b.disabled = false; });
       }
     });
+    if (onOpen) onOpen(form);
     form.querySelector('input, select, textarea')?.focus();
   });
 }

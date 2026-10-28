@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY obcore ./obcore
+COPY alembic ./alembic
+COPY alembic.ini .
+COPY tools ./tools
 RUN useradd --create-home --uid 10002 obcore && chown -R obcore:obcore /app
 USER obcore
 EXPOSE 8000

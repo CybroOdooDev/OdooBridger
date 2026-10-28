@@ -171,7 +171,72 @@ def link_attendance_devices(
 _NOT_HISTORY = ("unmapped", "skipped", "deleted")
 
 
-def restore_terminals_from_punches(db: Session, tenant: Tenant, source: DeviceSource) -> list[Device]:
+def sync_inventory(db: Session, tenant: Tenant, source: DeviceSource, terminals) -> dict:
+    """Make the source's terminals match the inventory it publishes (BioTime's
+    device list, for one). Used by "Import Terminals" and at every sync.
+
+    * a terminal in the inventory is added, or its name/area/IP/model refreshed;
+    * a terminal BioBridge has that the inventory no longer lists:
+      - with real history (punches that reached or are on their way to Odoo)
+        it is kept and flagged missing, so that history keeps its device;
+      - otherwise it is removed. That is the usual case for terminals that
+        only ever appeared because the server still returns old transactions
+        of devices deleted from it.
+
+    Returns {"added", "missing", "removed", "touched": [Device], "serials": set}.
+    """
+    from datetime import datetime
+
+    existing = {d.serial_number: d for d in db.scalars(select(Device).where(Device.source_id == source.id))}
+    added, touched, serials = 0, [], set()
+    for terminal in terminals:
+        serial = (terminal.serial_number or "").strip()
+        if not serial:
+            continue
+        serials.add(serial)
+        device = existing.get(serial)
+        if device is None:
+            device = Device(tenant_id=tenant.id, source_id=source.id, serial_number=serial)
+            db.add(device)
+            existing[serial] = device
+            added += 1
+        device.alias = terminal.alias or device.alias
+        device.area = terminal.area or device.area
+        device.ip_address = terminal.ip_address or device.ip_address
+        device.model = terminal.model or device.model
+        device.missing_since = None
+        touched.append(device)
+    # An empty list is not trusted to mean "every terminal was deleted": an
+    # account without permission on the device list returns nothing too.
+    gone = [d for s, d in existing.items() if s not in serials] if serials else []
+    with_history = set()
+    if gone:
+        with_history = set(db.scalars(
+            select(PunchRecord.device_id).where(
+                PunchRecord.device_id.in_([d.id for d in gone]),
+                PunchRecord.process_state.not_in(_NOT_HISTORY),
+            ).distinct()
+        ))
+    now = datetime.now(timezone.utc)
+    missing = removed = 0
+    for device in gone:
+        if device.id in with_history:
+            if device.missing_since is None:
+                device.missing_since = now
+                missing += 1
+            continue
+        db.execute(update(PunchRecord).where(PunchRecord.device_id == device.id).values(device_id=None))
+        # It may have been pushed to Odoo's device list: take it off there too.
+        from app.services import device_removals
+        device_removals.queue_device(db, tenant.id, device, source.name)
+        db.delete(device)
+        removed += 1
+    db.flush()
+    return {"added": added, "missing": missing, "removed": removed, "touched": touched, "serials": serials}
+
+
+def restore_terminals_from_punches(db: Session, tenant: Tenant, source: DeviceSource,
+                                   only: set[str] | None = None) -> list[Device]:
     """Bring back any terminal that has punches on record but no row.
 
     A terminal deleted from the Biometric connections page whose punches are
@@ -200,8 +265,8 @@ def restore_terminals_from_punches(db: Session, tenant: Tenant, source: DeviceSo
     ).all()
     restored: list[Device] = []
     for serial, count, newest in rows:
-        if serial in known:
-            continue
+        if serial in known or (only is not None and serial not in only):
+            continue   # a source with an inventory only gets back terminals it still lists
         device = Device(
             tenant_id=tenant.id, source_id=source.id, serial_number=serial,
             punch_count=count,

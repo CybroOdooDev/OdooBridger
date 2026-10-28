@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from time import monotonic
 
 from sqlalchemy import func, select
@@ -32,6 +32,7 @@ from app.models import (
     PunchState,
     SubscriptionPlan,
     SyncRun,
+    SyncStatus,
     Tenant,
     TenantStatus,
 )
@@ -56,7 +57,7 @@ from app.services.scheduling import (
     scheduler_health,
 )
 from app.services.alerts import tenant_alerts
-from app.services.sync_engine import SyncEngine
+from app.services.sync_engine import SyncEngine, active_run
 from app.services.timeutils import utcnow_naive
 
 log = logging.getLogger(__name__)
@@ -272,6 +273,56 @@ def trigger_sync_inline(
 ) -> SyncRun:
     """Run a cycle synchronously — used by onboarding's 'first sync' step."""
     return SyncEngine(db, principal.tenant, "manual").run_cycle()
+
+
+def _run_started(tenant_id: str, run_id: str) -> None:
+    """The background half of /sync/start, with its own session."""
+    from app.db.session import session_scope
+
+    with session_scope() as db:
+        tenant = db.get(Tenant, tenant_id)
+        run = db.get(SyncRun, run_id)
+        if tenant is None or run is None:
+            return
+        try:
+            SyncEngine(db, tenant, run.triggered_by or "manual", run=run).run_cycle()
+        except Exception:  # noqa: BLE001 — the run row records what it can
+            log.exception("Background sync %s failed", run_id)
+
+
+@router.post("/sync/start", response_model=SyncRunOut, status_code=status.HTTP_202_ACCEPTED)
+def start_sync(
+    background: BackgroundTasks,
+    request: Request,
+    principal: Principal = Depends(require_syncable),
+    db: Session = Depends(get_db),
+) -> SyncRun:
+    """Start a cycle and answer at once with its run; poll /sync/runs/{id}.
+
+    A first sync can read weeks of punches, which outlasts what a browser waits
+    for one request (Firefox gives up after five minutes). A cycle already in
+    progress is returned instead of starting a second one.
+    """
+    running = active_run(db, principal.tenant.id)
+    if running is not None:
+        return running
+    run = SyncRun(tenant_id=principal.tenant.id, status=SyncStatus.running.value, triggered_by="manual",
+                  started_at=datetime.now(timezone.utc), log=[])
+    db.add(run)
+    audit(db, principal, "sync.manual", None, None, request)
+    db.commit()
+    background.add_task(_run_started, principal.tenant.id, run.id)
+    return run
+
+
+@router.get("/sync/runs/{run_id}", response_model=SyncRunOut)
+def get_run(
+    run_id: str, principal: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> SyncRun:
+    run = db.get(SyncRun, run_id)
+    if run is None or run.tenant_id != principal.tenant.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Sync run not found")
+    return run
 
 
 @router.post("/sync/reset-cursor", response_model=MessageOut)

@@ -475,6 +475,8 @@ class AccountClosure(Base, UUIDPk, Timestamped):
     services: Mapped[list] = mapped_column(JSON, default=list)
     closed_by: Mapped[str] = mapped_column(String(280))
     reason: Mapped[str | None] = mapped_column(Text)
+    #: When the account itself was created (for customer history charts).
+    account_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class MetricSnapshot(Base, Timestamped):
@@ -487,6 +489,28 @@ class MetricSnapshot(Base, Timestamped):
     mrr_cents: Mapped[int] = mapped_column(Integer, default=0)
     customers: Mapped[int] = mapped_column(Integer, default=0)
     subscriptions: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AlertState(Base, Timestamped):
+    """One problem from Needs Attention, remembered across sweeps (and restarts)
+    so staff are told once when it starts, reminded while it lasts, and told
+    when it clears."""
+
+    __tablename__ = "alert_state"
+
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    severity: Mapped[str] = mapped_column(String(10))
+    issue: Mapped[str] = mapped_column(String(240))
+    detail: Mapped[str | None] = mapped_column(Text)
+    account_id: Mapped[str | None] = mapped_column(String(32))
+    account: Mapped[str | None] = mapped_column(String(160))
+    service: Mapped[str | None] = mapped_column(String(80))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reminded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Set when it cleared; the row stays as history until it comes back.
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Setting(Base, Timestamped):

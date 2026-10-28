@@ -58,7 +58,7 @@ from app.services.company_scope import (
     infer_device_companies,
     is_multi_company,
 )
-from app.services.device_links import device_for_punch, restore_terminals_from_punches
+from app.services.device_links import device_for_punch, restore_terminals_from_punches, sync_inventory
 from app.services.connections import (
     UnsafeTargetError,
     build_odoo_client,
@@ -116,6 +116,24 @@ class AllSourcesUnreachable(SyncAborted):
     """
 
 
+#: A run still marked running after this long died with its process.
+RUN_STALE_AFTER = timedelta(hours=1)
+
+
+def active_run(db: Session, tenant_id: str, exclude_id: str | None = None) -> SyncRun | None:
+    """The tenant's cycle in progress, if any (one started within the last hour
+    and not finished)."""
+    query = select(SyncRun).where(
+        SyncRun.tenant_id == tenant_id,
+        SyncRun.status == SyncStatus.running.value,
+        SyncRun.finished_at.is_(None),
+        SyncRun.started_at >= datetime.now(timezone.utc) - RUN_STALE_AFTER,
+    )
+    if exclude_id is not None:
+        query = query.where(SyncRun.id != exclude_id)
+    return db.scalars(query.order_by(SyncRun.started_at.desc()).limit(1)).first()
+
+
 class SyncEngine:
     """Runs one full cycle for one tenant."""
 
@@ -125,6 +143,7 @@ class SyncEngine:
         tenant: Tenant,
         triggered_by: str = "schedule",
         only_source_id: str | None = None,
+        run: SyncRun | None = None,
     ) -> None:
         self.db = db
         self.tenant = tenant
@@ -138,13 +157,18 @@ class SyncEngine:
         # Held locally as well as on the row: the run commits mid-cycle, which
         # expires the ORM object, and a reloaded value can come back naive.
         self._started_at = datetime.now(timezone.utc)
-        self.run = SyncRun(
+        #: ``run``: a row already created for this cycle (see /sync/start).
+        self.run = run or SyncRun(
             tenant_id=tenant.id,
             status=SyncStatus.running.value,
             triggered_by=triggered_by,
             started_at=self._started_at,
             log=[],
         )
+        self._adopted = run is not None
+        if run is not None and run.started_at is not None:
+            started = run.started_at
+            self._started_at = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
         self._log_lines: list[str] = []
         #: device.id -> the id it was upserted to in Odoo's optional
         #: biobridge.device model this cycle, or None once that lookup has
@@ -175,8 +199,18 @@ class SyncEngine:
 
     # -- entry point -------------------------------------------------------
     def run_cycle(self) -> SyncRun:
+        # One cycle per account at a time. Two at once (the schedule and a
+        # "Sync Now", say) would read the same punches and wait on each other's
+        # rows; the second one is not needed anyway.
+        if not self._adopted:
+            other = active_run(self.db, self.tenant.id)
+            if other is not None:
+                log.info("[tenant=%s] A sync is already running (%s); not starting another",
+                         self.tenant.slug, other.id)
+                return other
         self.db.add(self.run)
-        self.db.flush()
+        # Committed now, so the run is visible to the check above elsewhere.
+        self.db.commit()
         odoo_conn: OdooConnection | None = None
 
         try:
@@ -201,6 +235,15 @@ class SyncEngine:
                 )
 
             odoo_conn = self._active_odoo_connection()
+            from app.services.odoo_switch import ensure_current
+
+            released = ensure_current(self.db, self.tenant)
+            if released:
+                self._log(f"The Odoo connection now points at another database: {released['reset']} badge(s) "
+                          f"will be matched again there, {released['removed']} removed.", "warning")
+            # A cycle runs for minutes (a first sync reads weeks of punches):
+            # don't hold the tenant row locked for all of it.
+            self.db.commit()
             sources = self._active_sources()
             if not sources:
                 raise SyncAborted(
@@ -375,9 +418,35 @@ class SyncEngine:
         end_local = utc_to_local(end_utc, tz)
         self._log(f"Fetching '{source.name}' {start_local} -> {end_local} ({tz})")
 
-        # A terminal deleted by hand but still holding punches comes back.
-        for restored in restore_terminals_from_punches(self.db, self.tenant, source):
+        provider = build_source_provider(self.tenant, source)
+        pushes = getattr(provider, "pushes", False)
+
+        # A source that publishes its device list (BioTime, BioStar...) is the
+        # authority on which terminals exist: BioBridge follows it, so old
+        # transactions of a terminal deleted there don't bring it back here.
+        inventory = None
+        if not pushes and getattr(provider, "server_inventory", False) \
+                and provider.supports(Capability.LIST_TERMINALS):
+            try:
+                terminals = list(provider.fetch_terminals())
+            except Exception as exc:  # noqa: BLE001 — the device list is a nicety; punches still sync
+                self._log(f"Couldn't read the device list of '{source.name}': {exc}", ui=False)
+            else:
+                inventory = sync_inventory(self.db, self.tenant, source, terminals)
+                if not inventory["serials"]:
+                    inventory = None   # nothing listed: not trusted, see sync_inventory
+                elif inventory["added"] or inventory["removed"] or inventory["missing"]:
+                    self._log(f"Terminals of '{source.name}': {inventory['added']} new, "
+                              f"{inventory['removed']} removed, {inventory['missing']} no longer listed", ui=False)
+        listed = inventory["serials"] if inventory else None
+
+        # A terminal deleted by hand but still holding punches comes back
+        # (with an inventory, only one the source still lists).
+        for restored in restore_terminals_from_punches(self.db, self.tenant, source, only=listed):
             self._log(f"Restored terminal {restored.serial_number} — it has {restored.punch_count} punch(es) on record", ui=False)
+        # Committed before the long read, so "Import Terminals" or a second sync
+        # running meanwhile isn't left waiting on these rows until it ends.
+        self.db.commit()
         devices = {
             d.serial_number: d
             for d in self.db.scalars(
@@ -385,9 +454,9 @@ class SyncEngine:
             ).all()
         }
         enabled = {sn for sn, d in devices.items() if d.is_enabled}
+        self._listed = listed
 
-        provider = build_source_provider(self.tenant, source)
-        if getattr(provider, "pushes", False):
+        if pushes:
             try:
                 self._claim_pushed(source, provider)
             finally:
@@ -668,10 +737,15 @@ class SyncEngine:
             seen.add(event.external_id)
             self._ingest(event, source, devices, punch_utc)
             created += 1
+        # Each batch is committed: the punches are safe in the ledger as soon as
+        # they are read (a re-read is deduplicated), and the terminals' counters
+        # aren't locked for the rest of a long first sync.
+        self.db.commit()
         return created
 
     def _ingest(self, event, source: DeviceSource, devices: dict, punch_utc: datetime) -> None:
-        store_punch(self.db, self.tenant, source, devices, event, punch_utc, run_id=self.run.id)
+        store_punch(self.db, self.tenant, source, devices, event, punch_utc, run_id=self.run.id,
+                    register_unknown=getattr(self, "_listed", None) is None)
 
     # -- stage 4 -----------------------------------------------------------
     def _register_badges(self) -> None:
@@ -1966,14 +2040,16 @@ class SyncEngine:
 
 def store_punch(
     db: Session, tenant: Tenant, source: DeviceSource, devices: dict,
-    event, punch_utc: datetime, *, run_id: str | None = None,
+    event, punch_utc: datetime, *, run_id: str | None = None, register_unknown: bool = True,
 ) -> PunchRecord:
     """Write one new punch to the ledger, pending.
 
     Shared by the sync engine (pulled punches) and the ADMS receiver (pushed
     ones), so a punch is stored the same way whichever direction it came from.
     ``devices`` is serial -> Device for this source; a terminal not in it is
-    recorded on the spot. The caller has already checked ``external_id`` is new.
+    recorded on the spot, unless ``register_unknown`` is off (the source
+    publishes its device list and doesn't list it: the punch is kept, without
+    a terminal). The caller has already checked ``external_id`` is new.
     """
     direction = Direction.unknown.value
     if event.direction is True:
@@ -1982,7 +2058,7 @@ def store_punch(
         direction = Direction.outward.value
 
     device = devices.get(event.terminal_sn or "")
-    if device is None and event.terminal_sn:
+    if device is None and event.terminal_sn and register_unknown:
         # First punch from a terminal nobody imported: record it, so it
         # shows on the Terminals page, reaches Odoo's device list, and
         # counts toward the plan's device allowance like any other.

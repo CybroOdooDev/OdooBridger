@@ -161,6 +161,8 @@ def _as_str(value: Any) -> str | None:
 class BioTimeProvider(AttendanceProvider):
     slug = "biotime"
     label = "ZKTeco BioTime"
+    #: Its device list is the authority on which terminals exist (see sync_inventory).
+    server_inventory = True
     description = (
         "BioTime 8.x / 9.x web server. Pulls punches, employees and terminals."
     )

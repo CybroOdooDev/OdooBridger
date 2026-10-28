@@ -65,9 +65,10 @@ from app.services.company_scope import (
     terminal_company_id,
 )
 from app.services.device_limits import over_limit_device_ids
-from app.services.device_links import terminal_may_register_in_odoo
+from app.services.device_links import sync_inventory, terminal_may_register_in_odoo
 from app.services.friendly_errors import friendly_odoo_message
 from app.services.provisioning import provision_unmapped
+from app.services.odoo_switch import ensure_current
 from app.services.roster_import import auto_import
 from app.services.sync_engine import SyncEngine
 
@@ -211,6 +212,8 @@ def create_odoo(
     )
     db.add(conn)
     _dupe_name_guard(db, payload.name)
+    db.flush()
+    ensure_current(db, principal.tenant)   # another Odoo database: release the old one's employees
     if _probe_odoo(principal, conn).ok:
         db.flush()
         auto_import(db, principal.tenant)
@@ -248,6 +251,8 @@ def update_odoo(
     if "company_id" in data:
         conn.company_name = None  # stale until the next Test Connection refreshes it
     conn.status = ConnectionStatus.unverified.value
+    db.flush()
+    ensure_current(db, principal.tenant)   # url/db changed or activated: maybe another database
     audit(db, principal, "odoo.update", conn.id, ",".join(data), request)
     _dupe_name_guard(db, data.get("name", conn.name), commit=True)
     db.refresh(conn)
@@ -1116,19 +1121,6 @@ def discover_devices(
     db: Session = Depends(get_db),
 ) -> list[Device]:
     source = _get_source(db, principal, source_id)
-    # Scoped to this source, not the whole tenant — a serial number is only
-    # unique within its own vendor/account namespace, and two sources (e.g.
-    # two BioTime accounts, one per company) can each legitimately report a
-    # terminal with the same serial. Matches the (tenant_id, source_id,
-    # serial_number) constraint on Device and the lookup sync_engine.py
-    # already uses for the same reason.
-    existing = {
-        d.serial_number: d
-        for d in db.scalars(
-            select(Device).where(Device.source_id == source.id)
-        ).all()
-    }
-
     provider = build_source_provider(principal.tenant, source)
     if not provider.supports(Capability.LIST_TERMINALS):
         provider.close()
@@ -1144,53 +1136,22 @@ def discover_devices(
     finally:
         provider.close()
 
-    added = 0
-    touched: list[Device] = []
-    seen_serials: set[str] = set()
-    for terminal in terminals:
-        serial = (terminal.serial_number or "").strip()
-        if not serial:
-            continue
-        seen_serials.add(serial)
-        device = existing.get(serial)
-        if device is None:
-            device = Device(
-                tenant_id=principal.tenant.id, source_id=source.id, serial_number=serial
-            )
-            db.add(device)
-            existing[serial] = device
-            added += 1
-        device.alias = terminal.alias or device.alias
-        device.area = terminal.area or device.area
-        device.ip_address = terminal.ip_address or device.ip_address
-        device.model = terminal.model or device.model
-        # Reported again — whatever absence was tracked before no longer holds.
-        device.missing_since = None
-        touched.append(device)
-
-    # A device this source used to report and now does not: flagged, not
-    # deleted or disabled, so its alias/punch history/pairing override survive
-    # a terminal that is only briefly offline or mid-relocation. The
-    # timestamp is set once and left alone on repeat imports that still don't
-    # see it, so it reflects when it first went missing, not the most recent
-    # check.
-    now = datetime.now(timezone.utc)
-    missing_now = 0
-    for serial, device in existing.items():
-        if serial in seen_serials:
-            continue
-        if device.missing_since is None:
-            device.missing_since = now
-            missing_now += 1
+    # Listed terminals are added or refreshed; one no longer listed is removed
+    # when nothing real happened on it, otherwise kept and flagged missing.
+    inv = sync_inventory(db, principal.tenant, source, terminals)
+    added, missing_now, touched = inv["added"], inv["missing"], inv["touched"]
 
     audit(
         db,
         principal,
         "device.discover",
         source.id,
-        f"{added} new, {missing_now} newly missing",
+        f"{added} new, {missing_now} newly missing, {inv['removed']} removed",
         request,
     )
+    # Saved before the Odoo calls below, which can be slow: a sync running
+    # meanwhile must not wait on these terminals.
+    db.commit()
     # Every terminal this call found, not just newly-added ones — a terminal
     # imported in an earlier call may still have no Odoo device record (see
     # _push_devices_to_odoo), and re-running Import terminals is the natural

@@ -64,35 +64,7 @@ def session_scope() -> Iterator[Session]:
 
 
 def create_schema() -> None:
-    import obcore.models  # noqa: F401 — registers the tables
+    """Bring the database to the latest schema (see obcore.migrations)."""
+    from obcore import migrations
 
-    Base.metadata.create_all(engine)
-    add_missing_columns()
-
-
-def add_missing_columns() -> None:
-    """Add columns new to the model to tables that already exist.
-
-    ``create_all`` only creates missing tables. Until the core has proper
-    migrations, a new column must be nullable or carry a server default, and
-    this adds it (plain ``ALTER TABLE ... ADD COLUMN``; foreign keys and
-    indexes on such a column are left to the model's next real migration).
-    """
-    from sqlalchemy import inspect, text
-    from sqlalchemy.schema import CreateColumn
-
-    with engine.begin() as conn:
-        inspector = inspect(conn)
-        existing_tables = set(inspector.get_table_names())
-        for table in Base.metadata.sorted_tables:
-            if table.name not in existing_tables:
-                continue
-            have = {c["name"] for c in inspector.get_columns(table.name)}
-            for column in table.columns:
-                if column.name in have:
-                    continue
-                if not column.nullable and column.server_default is None:
-                    raise RuntimeError(f"Can't add NOT NULL column {table.name}.{column.name} without a default")
-                ddl = CreateColumn(column).compile(dialect=engine.dialect)
-                # Only the column itself: the FK constraint is not added in place.
-                conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {str(ddl).split(" REFERENCES")[0]}'))
+    migrations.upgrade(engine)

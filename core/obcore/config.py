@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # --- trials and the subscription sweep -----------------------------------
     default_trial_days: int = 14
     sweep_interval_seconds: int = 300
+    #: How often Needs Attention is checked for alerts (seconds).
+    alert_interval_seconds: int = 60
     #: How often the sweep asks services whether they can still work on the customer's Odoo.
     odoo_readiness_minutes: int = 15
     #: May a customer's Odoo address point into a private network (10.x,

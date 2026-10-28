@@ -170,6 +170,59 @@ port for ZKTeco push terminals.
 Without `SMTP_HOST` emails are written to the core's log (handy locally: the
 set-password link is there).
 
+## Database migrations (core)
+
+The core's schema is managed by Alembic (`core/alembic/`, like BioBridge). At
+every start it brings the database to the latest revision
+(`obcore/migrations.py`, under a Postgres advisory lock so instances take
+turns); `python3 core/tools/db_upgrade.py [--check]` does the same by hand.
+
+* A new database is built by the migrations.
+* A database made before migrations (Oct 28, 2026) is adopted once,
+  automatically: missing tables and columns are added the old way, the
+  agent's leftover table and column are dropped, it is checked against the
+  models and stamped at the latest revision.
+
+Making a schema change:
+
+1. edit the model;
+2. `cd core && alembic revision --autogenerate -m "what changed"`;
+3. read and correct the file it wrote (autogenerate is a draft);
+4. keep it compatible with the previous release (add now, drop later): a
+   rollback doesn't undo a migration.
+
+CI builds a Postgres database from the migrations and runs `alembic check`,
+which fails when a model changed without a migration.
+
+## Continuous deployment
+
+`.github/workflows/ci-cd.yml` runs the core, BioBridge and end-to-end tests on
+every push and pull request. On `main`, once they pass, it builds both images,
+pushes them to GitHub Container Registry as
+`ghcr.io/<owner>/odoobridger-core:<commit>` and `…/odoobridger-biobridge:<commit>`
+(plus `latest`), and deploys them over SSH with `deploy/deploy.sh`.
+
+`deploy.sh` pulls that release, restarts the stack with the production compose,
+waits until both containers are healthy, and records it in `deploy/.release`. If
+they don't come up healthy it puts the previous release back and fails the run.
+To roll back on purpose: Actions → CI/CD → Run workflow → an earlier commit SHA.
+A BioBridge release that migrated its database is not undone by a rollback, so
+keep migrations backwards compatible (add columns, don't drop them in the same
+release that stops using them).
+
+One-time server setup:
+
+1. A Linux server with Docker and the compose plugin; a user in the `docker` group.
+2. `mkdir -p /opt/odoobridger/deploy`, then put `deploy/.env` there (from
+   `.env.example` / `make-env.py`, with the production domains). It never leaves the server.
+3. Repository secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` (that
+   user's private key), `DEPLOY_PATH` (`/opt/odoobridger`), optionally `DEPLOY_PORT`.
+4. Optionally add required reviewers to the `production` environment so each
+   deploy waits for approval.
+
+The workflow logs the server in to ghcr.io with its own short-lived token for
+each deploy, so the packages can stay private.
+
 ## Adding another service
 
 1. Build it as its own app. Implement `PUT/DELETE /platform/v1/accounts/{id}`
@@ -195,9 +248,6 @@ python -m pytest                            # (from the root) end to end: core +
 
 ## Not done yet
 
-* The core creates its tables at boot (`create_all`) and adds new nullable or
-  defaulted columns to existing tables (`add_missing_columns`); add Alembic
-  before anything harder (renames, constraints on existing tables).
 * One Odoo connection per account for now (the model, API and provisioning
   already carry a connection id, so more can be allowed later). No per-service
   key override yet.

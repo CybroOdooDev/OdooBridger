@@ -34,7 +34,7 @@ def _check_production() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _check_production()
-    # Adds missing tables only; never alters one.
+    # Migrations: builds, upgrades or adopts the database (obcore/migrations.py).
     create_schema()
     with session_scope() as db:
         from obcore.services.jobs import ensure_static_staff
@@ -45,11 +45,18 @@ async def lifespan(app: FastAPI):
         ensure_biometric(db)
         retire_demo(db)
         keys.load(db)
-    task = asyncio.create_task(_jobs()) if settings.run_background_jobs else None
+    tasks = [asyncio.create_task(_jobs()), asyncio.create_task(_alerts())] if settings.run_background_jobs else []
     log.info("%s core started (env=%s)", settings.app_name, settings.environment)
     yield
-    if task:
+    for task in tasks:
         task.cancel()
+
+
+async def _alerts() -> None:
+    from obcore.services.jobs import alert_loop
+
+    await asyncio.sleep(20)
+    await alert_loop()
 
 
 async def _jobs() -> None:

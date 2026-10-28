@@ -77,7 +77,7 @@ def test_metrics_count_platform_tenants_only(client):  # noqa: F811
     assert account["account_id"] == ACCOUNT and (account["active"], account["failed"]) == (2, 1)
     [failure] = account["failures"]
     assert failure["key"] == "devices" and failure["issue"] == "Sync failing"
-    assert failure["detail"] == "1 of 2 devices not syncing"
+    assert failure["detail"] == "Terminals aren't syncing"
     # Nothing customer-specific about connections leaves BioBridge.
     body = json.dumps(m)
     for secret in ("Warehouse", "Head office", "Terminal did not answer", "10.0.0.", bad_id):
@@ -95,34 +95,29 @@ def _tenant(client):  # noqa: F811
     return tenant
 
 
-def test_dashboard_shape_usage_and_attention(client):  # noqa: F811
+def test_dashboard_has_no_customer_usage_or_totals(client):  # noqa: F811
     _seed(client)
     tenant = _tenant(client)
     db = client.Session()
     t = db.get(Tenant, tenant.id)
-    t.limit_max_devices = 2
-    t.limit_max_employees = 0          # 0 = unlimited
     src = db.query(DeviceSource).filter(DeviceSource.tenant_id == t.id, DeviceSource.name == "Head office").one()
     db.add_all([Device(tenant_id=t.id, source_id=src.id, serial_number=f"SN{i}") for i in range(2)])
-    db.add_all([EmployeeMapping(tenant_id=t.id, emp_code=str(i), status="mapped") for i in range(3)]
-               + [EmployeeMapping(tenant_id=t.id, emp_code="x", status="unmapped")])
-    synced = db.query(PunchRecord).filter(PunchRecord.process_state == "synced").one()
-    synced.attempts = 1   # touch: synced today
+    db.add_all([EmployeeMapping(tenant_id=t.id, emp_code=str(i), status="mapped") for i in range(3)])
     db.commit()
     db.close()
     d = get(client).json()["dashboard"]
-    tiles = {x["key"]: x["value"] for x in d["tiles"]}
-    assert tiles == {"customers": 1, "devices": 2, "employees": 3, "punches_30d": 1, "pending": 2}
-    assert [c["key"] for c in d["columns"]] == ["devices", "employees", "sync_interval", "last_sync_at", "health"]
-    assert len(d["series"]["points"]) == 30 and d["series"]["points"][-1]["value"] == 1
+    # What a customer does with the service stays with it: no device, employee
+    # or punch counts, per customer or in total.
+    assert d["tiles"] == [] and d["series"] is None
+    assert [c["key"] for c in d["columns"]] == ["sync_enabled", "last_sync_at", "activity", "health"]
     row = d["accounts"][ACCOUNT]
-    assert row["devices"] == {"used": 2, "limit": 2} and row["employees"] == {"used": 3, "limit": None}
-    assert row["health"] == "failing" and row["sync_interval"] and row["last_sync_at"]
+    assert set(row) == {"sync_enabled", "sync_interval", "last_sync_at", "activity", "health"}
+    assert row["health"] == "failing" and row["activity"] == "active" and row["sync_enabled"] is True
     titles = {(a["title"], a["severity"]) for a in d["attention"]}
-    assert ("Sync failing", "high") in titles and ("At device limit", "medium") in titles
-    limit = next(a for a in d["attention"] if a["title"] == "At device limit")
-    assert limit["detail"].startswith("2 of 2 devices") and limit["since"] is None
-    assert "Warehouse" not in json.dumps(d)
+    assert ("Sync failing", "high") in titles
+    assert not any("limit" in a["title"] for a in d["attention"])
+    body = json.dumps(d)
+    assert "Warehouse" not in body and "devices" not in body and "employees" not in body
 
 
 def test_dashboard_health_values(client):  # noqa: F811

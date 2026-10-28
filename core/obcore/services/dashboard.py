@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from obcore.models import (
+    AccountClosure,
     OPEN_STAGES, Account, AccountService, AccountStatus, Lead, OdooConnection, OdooConnectionStatus,
     PendingSignup, ServiceStatus,
 )
@@ -62,8 +63,15 @@ def _subscription_label(account: Account) -> str | None:
             "suspended": "suspended"}.get(_mix(account))
 
 
-def _growth(accounts: list[Account], now: datetime) -> list[dict[str, Any]]:
-    """Total customers at the end of each of the last 12 months, and how many joined."""
+def _growth(accounts: list[Account], now: datetime,
+            closures: list[tuple[datetime | None, datetime]] | None = None) -> list[dict[str, Any]]:
+    """Each of the last 12 months: customers at its end, how many joined and how
+    many closed (deleted their account) in it. ``closures`` are (created, closed)
+    pairs of deleted accounts: one counts as a customer from its creation until it
+    closed, and as joining in its creation month. A closure recorded before its
+    creation date was kept counts only from its closing month."""
+    gone = [(aware(c or d), aware(d)) for c, d in (closures or [])]
+    closed = [d for _, d in gone]
     out = []
     year, month = now.year, now.month
     months = []
@@ -78,8 +86,9 @@ def _growth(accounts: list[Account], now: datetime) -> list[dict[str, Any]]:
         start = datetime(y, m, 1, tzinfo=now.tzinfo)
         end = datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=now.tzinfo)
         out.append({"month": f"{y:04d}-{m:02d}",
-                    "total": sum(1 for c in created if c < end),
-                    "added": sum(1 for c in created if start <= c < end)})
+                    "total": sum(1 for c in created if c < end) + sum(1 for c, d in gone if c < end <= d),
+                    "added": sum(1 for c in created if start <= c < end) + sum(1 for c, _ in gone if start <= c < end),
+                    "closed": sum(1 for c in closed if start <= c < end)})
     return out
 
 
@@ -146,6 +155,12 @@ def _incidents(db: Session, accounts: dict[str, Account], health: list[dict[str,
     items = list(found.values())
     items.sort(key=lambda i: (SEVERITY_ORDER[i["severity"]], i["since"] or "9999"))
     return items
+
+
+def current_incidents(db: Session, *, fresh: bool = False) -> list[dict[str, Any]]:
+    """Everything that needs attention right now (what the overview lists)."""
+    accounts = {a.id: a for a in db.scalars(select(Account)) if a.status != AccountStatus.closed.value}
+    return _incidents(db, accounts, ops.collect(db, fresh=fresh), utcnow())
 
 
 def _delta(now_value: int, before: int | None) -> int | None:
@@ -224,7 +239,7 @@ def overview(db: Session, period: str = "30d", *, fresh: bool = False) -> dict[s
                          "not_operational": [s["name"] for s in deployed if s["status"] != "operational"]},
             "attention": {"value": len(incidents), "by_severity": dict(severity), "oldest_since": oldest},
         },
-        "growth": _growth(live, now),
+        "growth": _growth(live, now, [(c.account_created_at, c.created_at) for c in db.scalars(select(AccountClosure))]),
         "services": [{k: (_iso(v) if isinstance(v, datetime) else v) for k, v in s.items()
                       if k not in ("accounts", "dashboard")}
                      for s in health],
@@ -258,6 +273,7 @@ def service_dashboard(db: Session, slug: str, *, fresh: bool = False) -> dict[st
     customers = [{
         "account_id": r.account_id, "name": r.account.name,
         "plan": r.package.name if r.package else None, "status": r.status,
+        "since": _iso(r.created_at), "billing": _billing(r),
         "values": per_account.get(r.account_id) or {},
     } for r in sorted(rows, key=lambda r: r.account.name.lower())]
     names = {r.account_id: r.account.name for r in rows}
@@ -271,10 +287,40 @@ def service_dashboard(db: Session, slug: str, *, fresh: bool = False) -> dict[st
                     "checked_at": _iso(health.get("checked_at")) if isinstance(health.get("checked_at"), datetime)
                     else health.get("checked_at"),
                     "has_dashboard": bool(board)},
-        "tiles": board.get("tiles") or [
-            {"key": "customers", "label": "Customers", "value": len(rows), "icon": "users"}],
+        # The core's own figures about its customers of this service; the
+        # service reports none of its own (nothing about customers' usage).
+        "tiles": _service_tiles(rows, per_account),
         "series": board.get("series"),
         "columns": board.get("columns") or [],
         "customers": customers,
         "attention": attention,
     }
+
+
+def _billing(row: AccountService) -> dict[str, Any]:
+    """How the customer stands on paying for this service, in a few words."""
+    account = row.account
+    if row.status == ServiceStatus.past_due.value:
+        return {"label": "Payment failed" if row.stripe_item_id else "Trial ended, unpaid", "tone": "bad", "date": None}
+    if row.status == ServiceStatus.suspended.value or account.status == AccountStatus.suspended.value:
+        return {"label": "Suspended", "tone": "bad", "date": None}
+    if row.status == ServiceStatus.trialing.value:
+        return {"label": "Trial ends", "tone": "trialing", "date": _iso(row.trial_ends_at)}
+    if row.stripe_item_id:
+        every = "yearly" if account.billing_interval == "year" else "monthly"
+        return {"label": f"Paid online, {every} · renews", "tone": "ok", "date": _iso(account.renews_at)}
+    return {"label": "Invoiced manually", "tone": "mute", "date": None}
+
+
+def _service_tiles(rows: list[AccountService], per_account: dict[str, Any]) -> list[dict[str, Any]]:
+    by = lambda st: sum(1 for r in rows if r.status == st)  # noqa: E731
+    issues = sum(1 for r in rows if (per_account.get(r.account_id) or {}).get("health") in ("failing", "delayed"))
+    return [
+        {"key": "customers", "label": "Customers", "value": len(rows), "icon": "users"},
+        {"key": "trialing", "label": "On Trial", "value": by(ServiceStatus.trialing.value), "icon": "clock"},
+        {"key": "active", "label": "Paying", "value": by(ServiceStatus.active.value), "icon": "card", "tone": "ok"},
+        {"key": "past_due", "label": "Payment Pending", "value": by(ServiceStatus.past_due.value), "icon": "alert",
+         "tone": "bad" if by(ServiceStatus.past_due.value) else "ok"},
+        {"key": "sync_issues", "label": "Sync Issues", "value": issues, "icon": "alert",
+         "tone": "warn" if issues else "ok"},
+    ]

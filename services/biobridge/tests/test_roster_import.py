@@ -58,7 +58,8 @@ def test_existing_mapped_rows_are_left_alone(db, tenant, monkeypatch):
                            odoo_employee_id=99, odoo_employee_name="Hand mapped"))
     db.commit()
     odoo = FakeOdoo()
-    odoo.roster = [{"id": 11, "name": "Jane", "active": True, "barcode": "1001"}]
+    odoo.roster = [{"id": 11, "name": "Jane", "active": True, "barcode": "1001"},
+                   {"id": 99, "name": "Hand mapped", "active": True}]
     _run(db, tenant, odoo, [EmployeeRecord(None, "1001")], monkeypatch)
     assert _maps(db)["1001"].odoo_employee_id == 99
 

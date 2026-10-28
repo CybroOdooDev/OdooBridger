@@ -35,27 +35,33 @@ def terminal_in_use(
     return db.scalar(query.limit(1)) is not None
 
 
+def queue_device(db: Session, tenant_id: str, device: Device, source_name: str | None) -> bool:
+    """Queue the Odoo removal of one terminal unless another connection still
+    has it or it is already queued. Call before the Device row is deleted."""
+    if terminal_in_use(db, tenant_id, device.serial_number, device.ip_address, device.source_id):
+        return False
+    already = db.scalar(select(OdooDeviceRemoval.id).where(
+        OdooDeviceRemoval.tenant_id == tenant_id,
+        OdooDeviceRemoval.serial_number == device.serial_number,
+    ).limit(1))
+    if already is not None:
+        return False
+    db.add(OdooDeviceRemoval(
+        tenant_id=tenant_id,
+        serial_number=device.serial_number,
+        ip_address=device.ip_address,
+        company_id=terminal_company_id(db, device),
+        source_name=source_name,
+    ))
+    return True
+
+
 def queue_source_terminals(db: Session, tenant_id: str, source: DeviceSource) -> int:
     """Queue the Odoo removal of every terminal of ``source`` that no other
     connection has. Call before the source (and its terminals) is deleted."""
     queued = 0
     for device in db.scalars(select(Device).where(Device.source_id == source.id)).all():
-        if terminal_in_use(db, tenant_id, device.serial_number, device.ip_address, source.id):
-            continue
-        already = db.scalar(select(OdooDeviceRemoval.id).where(
-            OdooDeviceRemoval.tenant_id == tenant_id,
-            OdooDeviceRemoval.serial_number == device.serial_number,
-        ).limit(1))
-        if already is not None:
-            continue
-        db.add(OdooDeviceRemoval(
-            tenant_id=tenant_id,
-            serial_number=device.serial_number,
-            ip_address=device.ip_address,
-            company_id=terminal_company_id(db, device),
-            source_name=source.name,
-        ))
-        queued += 1
+        queued += queue_device(db, tenant_id, device, source.name)
     db.flush()
     return queued
 

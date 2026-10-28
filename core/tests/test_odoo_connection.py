@@ -290,26 +290,6 @@ def test_url_normalising():
     assert odoo_probe.guess_db("https://acme.odoo.com") == "acme"
     assert odoo_probe.guess_db("https://erp.acme.com") is None
 
-
-def test_new_columns_are_added_to_an_existing_database():
-    from sqlalchemy import inspect, text
-
-    from obcore.db import add_missing_columns, engine
-
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE service DROP COLUMN uses_odoo"))
-        conn.execute(text("DROP INDEX IF EXISTS ix_account_service_odoo_connection_id"))
-        conn.execute(text("ALTER TABLE account_service DROP COLUMN odoo_readiness"))
-    add_missing_columns()
-    columns = {t: {c["name"] for c in inspect(engine).get_columns(t)} for t in ("service", "account_service")}
-    assert "uses_odoo" in columns["service"] and "odoo_readiness" in columns["account_service"]
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO service (id, slug, name, base_url, sso_callback_path, is_active, is_public, "
-                          "sort_order, created_at, updated_at) VALUES ('s1', 'x', 'X', 'http://x', '/', 1, 1, 0, "
-                          "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
-        assert conn.execute(text("SELECT uses_odoo FROM service WHERE id='s1'")).scalar() in (0, False)
-
-
 def test_private_addresses_are_refused_unless_allowed(monkeypatch):
     from obcore.config import settings
 
