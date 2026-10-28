@@ -18,7 +18,7 @@ from app.db.session import engine as bb_engine
 from app.models import Tenant, User
 from app.services import platform_link
 from obcore.mailer import OUTBOX
-from obcore.services import provisioning
+from obcore.services import ops, provisioning
 
 
 @pytest.fixture()
@@ -28,6 +28,8 @@ def world(monkeypatch):
             TestClient(bb_main.app, base_url="http://biobridge.test") as bb:
         # core -> BioBridge
         monkeypatch.setattr(provisioning, "client_factory", lambda: TestClient(bb_main.app, base_url="http://biobridge.test"))
+        monkeypatch.setattr(ops, "client_factory", lambda: TestClient(bb_main.app, base_url="http://biobridge.test"))
+        ops.forget()
 
         # BioBridge -> core
         def to_core(method):
@@ -150,7 +152,7 @@ def test_the_odoo_connection_is_set_in_the_core_and_used_by_biobridge(world, mon
 
     # The core's test (reachability, login, companies) and BioBridge's own
     # (can it write attendance) both pass against a stand-in Odoo.
-    monkeypatch.setattr(odoo_probe, "probe", lambda url, db, login, key, agent_id=None: odoo_probe.ProbeResult(
+    monkeypatch.setattr(odoo_probe, "probe", lambda url, db, login, key, **_kw: odoo_probe.ProbeResult(
         version="19.0", api="json2", uid=7, companies=[{"id": 1, "name": "Gulf HQ"}], db_uuid="uuid-gulf"))
 
     class Odoo:
@@ -192,178 +194,18 @@ def test_the_odoo_connection_is_set_in_the_core_and_used_by_biobridge(world, mon
     assert not row.is_active
 
 
-
-def test_a_private_odoo_through_the_agent_end_to_end(world, monkeypatch):
-    """Core + BioBridge + a (simulated) agent: BioBridge's readiness check runs
-    against a private Odoo via the core's relay, with private addresses refused
-    everywhere else."""
-    import base64
-    import sys
-    from pathlib import Path
-
-    from app.core.config import settings as bb_settings
-    from app.integrations import relay as bb_relay
-    from obcore.config import settings as core_settings
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
-    from tests.test_odoo_connection import GOOD_KEY, FakeOdoo   # the core's fake Odoo
-    from tests.test_relay import FakeAgent
-
-    core, bb = world
-    monkeypatch.setattr(core_settings, "odoo_allow_private_targets", False)
-    monkeypatch.setattr(bb_settings, "allow_private_network_targets", False)
-    # BioBridge -> core relay, in-process.
-    monkeypatch.setattr(bb_relay, "client_factory", lambda timeout: _Core(core))
-
+def test_the_staff_overview_reads_biobridges_own_metrics(world):
+    core, _ = world
     r = core.post("/api/v1/public/signup", json={
-        "company": "Lan Co", "full_name": "Lana", "email": "lana@lan.io", "services": [{"service": "biometric"}]})
+        "company": "Metrics Co", "full_name": "M", "email": "m@metrics.io", "services": [{"service": "biometric"}]})
     assert r.status_code == 201, r.text
-    tokens = core.post("/api/v1/auth/link/use", json={"token": _link("lana@lan.io"), "password": "Secret-Pass-1"}).json()
-    customer = {"Authorization": f"Bearer {tokens['access_token']}"}
-
-    created = core.post("/api/v1/portal/agents", headers=customer, json={"name": "Server room"}).json()
-    odoo = _FullOdoo()
-    agent = FakeAgent(core, created["key"], ["http://10.1.1.5:8069"], odoo)
-    try:
-        r = core.post("/api/v1/portal/odoo", headers=customer, json={
-            "url": "http://10.1.1.5:8069", "db": "acme", "login": "bot@acme.io", "api_key": GOOD_KEY,
-            "agent_id": created["agent"]["id"]})
-        assert r.status_code == 201, r.text
-        (svc,) = r.json()["connections"][0]["services"]
-        assert svc["ready"] is True, svc            # BioBridge reached the private Odoo through the agent
-        assert any("hr.employee/search_count" in u for u in agent.seen)
-    finally:
-        agent.close()
-
-
-class _Core:
-    """httpx-like client that sends BioBridge's relay calls into the core app."""
-
-    def __init__(self, core):
-        self.core = core
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def post(self, url, json=None, headers=None):
-        return self.core.post(url.replace("http://core.test", ""), json=json, headers=headers)
-
-
-def _FullOdoo():
-    """The core's fake Odoo plus what BioBridge's readiness check asks."""
-    import httpx
-
-    from tests.test_odoo_connection import FakeOdoo
-
-    class Full(FakeOdoo):
-        def handler(self, request):
-            path = request.url.path
-            if path.startswith("/json/2/"):
-                method = path.rsplit("/", 1)[-1]
-                if method == "search_count":
-                    return httpx.Response(200, json=3)
-                if method in ("has_access", "check_access_rights"):
-                    return httpx.Response(200, json=True)
-                if method == "fields_get":
-                    return httpx.Response(200, json={})
-                if method in ("search_read", "search") and "res.company" not in path:
-                    return httpx.Response(200, json=[])
-            return super().handler(request)
-
-    return Full()
-
-
-def test_a_zkteco_terminal_is_read_through_a_real_agent(world, monkeypatch):
-    """The whole path, on real sockets: a real agent process dials the core over a
-    WebSocket, BioBridge's ZKTeco client opens a stream through the core, and the
-    agent reaches a (fake) terminal on 'the customer's network'."""
-    import importlib.util
-    import os
-    import socket
-    import subprocess
-    import sys
-    import threading
-    import time
-    from pathlib import Path
-
-    import uvicorn
-    from app.core.config import settings as bb_settings
-    from app.integrations.base import SourceConfig
-    from app.integrations.providers.zkteco import ZKDeviceProvider
-    from app.integrations.relay import PlatformRelayTcp
-
-    root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location(
-        "bb_zk_fake", root / "services" / "biobridge" / "tests" / "test_zkteco_protocol.py")
-    zk_tests = importlib.util.module_from_spec(spec)
-    sys.modules["bb_zk_fake"] = zk_tests
-    try:
-        spec.loader.exec_module(zk_tests)
-    except Exception:  # the fake device module imports BioBridge's own test helpers
-        sys.path.insert(0, str(root / "services" / "biobridge"))
-        spec.loader.exec_module(zk_tests)
-
-    core, _bb = world
-    catalog = core.get("/api/v1/public/catalog").json()
-    service = next(s for s in catalog["services"] if s["slug"] == "biometric")
-    core.post("/api/v1/public/signup", json={
-        "company": "Zed Ltd", "full_name": "Zoe", "email": "zoe@zed.io",
-        "services": [{"service": "biometric", "package_id": service["packages"][0]["id"]}]})
-    tokens = core.post("/api/v1/auth/link/use", json={"token": _link("zoe@zed.io"), "password": "Secret-Pass-1"}).json()
-    customer = {"Authorization": f"Bearer {tokens['access_token']}"}
-    account_id = core.get("/api/v1/portal/account", headers=customer).json()["account"]["id"]
-    created = core.post("/api/v1/portal/agents", headers=customer, json={"name": "Zed office"}).json()
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(core_main.app, host="127.0.0.1", port=port, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
-    for _ in range(100):
-        if server.started:
-            break
-        time.sleep(0.1)
-    assert server.started
-
-    with zk_tests.FakeZKDevice(params={"~SerialNumber": "REALAGENT1"}, attlog_count=3) as device:
-        # Installed the way customers do: only its key and where to connect.
-        env = {**os.environ, "OB_AGENT_KEY": created["key"], "OB_RELAY_URL": f"ws://127.0.0.1:{port}/relay/v1/agent",
-               "OB_LOG_LEVEL": "DEBUG"}
-        env.pop("OB_ALLOW", None)
-        agent = subprocess.Popen([sys.executable, str(root / "agent" / "odoobridger_agent.py")], env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        try:
-            from obcore.services.relay import hub
-
-            for _ in range(100):
-                if hub.online(created["agent"]["id"]):
-                    break
-                time.sleep(0.1)
-            assert hub.online(created["agent"]["id"]), "the agent never connected"
-
-            monkeypatch.setattr(bb_settings, "platform_core_url", f"http://127.0.0.1:{port}")
-            from app.integrations.relay import allow_on_agent
-
-            # BioBridge hands the device's address to the agent (what adding a device does); the
-            # running agent has it at once.
-            assert allow_on_agent(account_id, created["agent"]["id"], f"zk://127.0.0.1:{device.port}") is None
-            connect = PlatformRelayTcp(account_id, created["agent"]["id"])
-            provider = ZKDeviceProvider(SourceConfig(base_url=f"zk://127.0.0.1:{device.port}", timezone="UTC",
-                                                     tcp_connect=connect))
-            result = provider.test_connection()
-            assert result.ok and "REALAGENT1" in result.message, result.message
-
-            # A port the agent was not told it may reach is refused on the customer's side of things too.
-            other = ZKDeviceProvider(SourceConfig(base_url="zk://127.0.0.1:22", timezone="UTC", tcp_connect=connect))
-            refused = other.test_connection()
-            assert not refused.ok and "not one of the agent's addresses" in refused.message, refused.message
-        finally:
-            agent.terminate()
-            try:
-                agent.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                agent.kill()
-            server.should_exit = True
+    core.post("/api/v1/auth/link/use", json={"token": _link("m@metrics.io"), "password": "Secret-Pass-1"})
+    staff = core.post("/api/v1/auth/staff/login", json={"email": "staff@odoobridger.io",
+                                                         "password": "Staff-Password-1"}).json()
+    o = core.get("/api/v1/staff/overview?fresh=true",
+                 headers={"Authorization": f"Bearer {staff['access_token']}"}).json()
+    bio = next(s for s in o["services"] if s["slug"] == "biometric")
+    # BioBridge answered both its health check and the signed metrics call.
+    assert bio["has_metrics"] is True and bio["status"] in ("operational", "degraded")
+    assert set(bio["integrations"]) == {"active", "failed"}
+    assert bio["customers"] >= 1

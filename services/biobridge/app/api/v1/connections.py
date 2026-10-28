@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import Principal, audit, get_principal, require_syncable, require_writer
 from app.core.config import settings
-from app.integrations.relay import explain
 from app.core.crypto import encrypt
 from app.db.session import get_db
 from app.integrations.base import (
@@ -287,9 +286,7 @@ def test_odoo_unsaved(
         disabled_company_ids=sorted(set(payload.disabled_company_ids or [])) or None,
     )
     if stored is not None and stored.managed:
-        # Same route as the saved one (an OdooBridger agent, if it uses one).
         draft.platform_connection_id = stored.platform_connection_id
-        draft.relay_agent_id = stored.relay_agent_id
     return _probe_odoo(principal, draft)
 
 
@@ -455,19 +452,6 @@ def list_providers(_: Principal = Depends(get_principal)) -> list[dict]:
     return available_providers()
 
 
-@router.get("/relay-agents")
-def list_relay_agents(principal: Principal = Depends(get_principal)) -> list[dict]:
-    """The customer's OdooBridger Agents, to reach devices on their own network.
-
-    Only in platform mode, where the core owns agents; elsewhere there are none.
-    """
-    if not (settings.platform_mode and principal.tenant.platform_account_id):
-        return []
-    from app.integrations.relay import list_agents
-
-    return list_agents(principal.tenant.platform_account_id)
-
-
 _MODE_LABEL = {"platform": "platform server", "device": "standalone device"}
 
 
@@ -594,15 +578,6 @@ def _get_source(db: Session, principal: Principal, source_id: str) -> DeviceSour
 def _probe_source(principal: Principal, source: DeviceSource) -> TestResult:
     """Each provider reports success in its own terms, so the message is theirs."""
     provider = None
-    if (settings.platform_mode and principal.tenant.platform_account_id and source.relay_agent_id
-            and source.provider != adms.PROVIDER_SLUG and source.base_url):
-        # Through the customer's agent: let it reach this device (applied to
-        # the running agent at once; nothing to change on their computer).
-        from app.integrations.relay import allow_on_agent
-
-        problem = allow_on_agent(principal.tenant.platform_account_id, source.relay_agent_id, source.base_url)
-        if problem:
-            log.info("Could not add %s to agent %s: %s", source.base_url, source.relay_agent_id, problem)
     try:
         provider = build_source_provider(principal.tenant, source)
         result = provider.test_connection()
@@ -611,9 +586,9 @@ def _probe_source(principal: Principal, source: DeviceSource) -> TestResult:
             source.token_enc = encrypt(cached, principal.tenant.crypto_key)
     except (ProviderError, UnsafeTargetError) as exc:
         source.status = ConnectionStatus.failed.value
-        source.status_message = explain(exc)[:500]
+        source.status_message = str(exc)[:500]
         source.last_checked_at = datetime.now(timezone.utc)
-        return TestResult(ok=False, message=explain(exc))
+        return TestResult(ok=False, message=str(exc))
     finally:
         if provider is not None:
             provider.close()
@@ -702,8 +677,7 @@ def create_source(
                 **({"location": payload.location.strip()}
                    if payload.connection_kind == "device" and payload.location and payload.location.strip()
                    else {}),
-                **({"relay_agent_id": payload.relay_agent_id}
-                   if payload.relay_agent_id and settings.platform_mode else {})},
+                },
         base_url=payload.base_url,
         username=payload.username,
         password_enc=encrypt(payload.password, principal.tenant.crypto_key),
@@ -747,14 +721,6 @@ def update_source(
     data = payload.model_dump(exclude_unset=True)
     password = data.pop("password", None)
     location = data.pop("location", None) if "location" in data else ...
-    if "relay_agent_id" in data:
-        agent_id = data.pop("relay_agent_id")
-        config = dict(source.config or {})
-        if agent_id and settings.platform_mode:
-            config["relay_agent_id"] = agent_id
-        else:
-            config.pop("relay_agent_id", None)
-        source.config = config
     if location is not ... and source.connection_kind == "device":
         config = dict(source.config or {})
         if location and location.strip():
@@ -877,13 +843,6 @@ def test_source_unsaved(
         verify_ssl=payload.verify_ssl,
         config=payload.config or (dict(stored.config or {}) if stored else {}),
     )
-    if "relay_agent_id" in payload.model_fields_set:
-        config = dict(draft.config or {})
-        if payload.relay_agent_id and settings.platform_mode:
-            config["relay_agent_id"] = payload.relay_agent_id
-        else:
-            config.pop("relay_agent_id", None)
-        draft.config = config
     return _probe_source(principal, draft)
 
 

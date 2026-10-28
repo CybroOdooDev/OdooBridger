@@ -158,7 +158,7 @@ function panelHtml(r, events) {
           <div class="hint"><a href="mailto:${esc(r.email)}">${esc(r.email)}</a>${r.phone ? ` · ${esc(r.phone)}` : ''}
             · came in ${esc(fmtAgo(r.created_at))}</div>
         </div>
-        <button class="sm" data-close aria-label="Close">Close</button>
+        <button class="link wiz-x" type="button" data-close aria-label="Close">&times;</button>
       </header>
       <div class="wiz-status" id="wStatus">${statusBar(r.status)}</div>
       <div class="wiz-demo" id="wDemo">${demoRow(r)}</div>

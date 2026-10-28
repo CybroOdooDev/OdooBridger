@@ -48,5 +48,5 @@ export function phoneCode(root, initial) {
   });
   document.addEventListener('click', (e) => { if (!root.contains(e.target)) details.open = false; });
   paintCurrent();
-  return { dial: () => `+${current[2]}` };
+  return { dial: () => `+${current[2]}`, country: () => current[1] };
 }

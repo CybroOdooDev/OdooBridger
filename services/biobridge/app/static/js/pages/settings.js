@@ -1360,12 +1360,6 @@ function openAddWizard({ providersFor, onDone, canProvision = new Set() }) {
       render();
     }
   });
-  loadRelayAgents().then((list) => {
-    if (dialog.isConnected && state.step === 1 && state.provider && list.length) {
-      state.values = readForm($('#wizForm', dialog) || dialog);
-      render();
-    }
-  });
   const companyField = () => (isDevice() && companies.length ? field({
     name: 'company_id', label: 'Company', required: true, value: state.values.company_id || '',
     options: [{ value: '', label: 'Choose a company…' }, ...companies.map((c) => ({ value: String(c.id), label: c.name }))],
@@ -1661,15 +1655,6 @@ function openEditWizard({ source, onDone, canProvision = new Set() }) {
     });
   }
 
-  loadRelayAgents().then(() => {
-    if (!dialog.isConnected || form.querySelector('[name=relay_agent_id]')) return;
-    const html = relayFieldHtml(source, provider);
-    if (!html) return;
-    const wrap = document.createElement('div');
-    wrap.innerHTML = html;
-    form.append(wrap);
-  });
-
   /** The form's values shaped the way the API takes them. A blank password
    * means "keep the saved one", so it is left out. */
   const payload = () => {
@@ -1951,31 +1936,7 @@ function sourceFormHtml(source, kind, providers, currentProvider, provision = fa
 /** The connection's own fields — shared by the inline edit form and the
  * add-connection wizard. The field set follows the provider: a standalone
  * ZKTeco device has an address and an optional comm key, no username. */
-/* --- Devices on the customer's own network: reached through their OdooBridger Agent ---- */
-let relayAgents = [];
-const NO_RELAY = new Set(['zk_adms']);   // push devices dial out themselves; everything else can go through an agent
-
-async function loadRelayAgents() {
-  try { relayAgents = await api.get('/relay-agents'); } catch { relayAgents = []; }
-  return relayAgents;
-}
-
-function relayFieldHtml(source, provider) {
-  if (!relayAgents.length || NO_RELAY.has(provider)) return '';
-  return field({
-    name: 'relay_agent_id', label: 'How BioBridge Reaches It', value: source?.relay_agent_id || '',
-    options: [{ value: '', label: 'Directly (a public address)' },
-      ...relayAgents.map((a) => ({ value: a.id, label: `Through the agent "${a.name}" (${a.online ? 'online' : 'offline'})` }))],
-    help: 'Choose an agent for a device on a private network, and enter its address as your own network sees it. '
-      + 'The address is added to the agent for you.',
-  });
-}
-
 function sourceFieldsHtml(source, kind, providers, provider) {
-  return sourceFieldsCore(source, kind, providers, provider) + relayFieldHtml(source, provider);
-}
-
-function sourceFieldsCore(source, kind, providers, provider) {
   const isDevice = kind === 'device';
   const isZk = provider === 'zk_device';
   const isPush = provider === 'zk_adms';

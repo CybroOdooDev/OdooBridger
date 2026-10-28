@@ -357,8 +357,6 @@ class OdooIn(BaseModel):
     login: str = Field(min_length=1, max_length=255)
     api_key: str = Field(min_length=8, max_length=200)
     key_expires_at: str | None = Field(default=None, max_length=32)
-    #: Reach it through this OdooBridger Agent (a private Odoo).
-    agent_id: str | None = Field(default=None, max_length=32)
 
 
 @router.post("/odoo", status_code=status.HTTP_201_CREATED)
@@ -366,8 +364,7 @@ def add_odoo(payload: OdooIn, request: Request, customer: Customer = Depends(req
              db: Session = Depends(get_db)) -> dict:
     try:
         conn = odoo.create(db, customer.account, url=payload.url, db_name=payload.db or "", login=payload.login,
-                           api_key_value=payload.api_key, name=payload.name, key_expires_at=payload.key_expires_at,
-                           agent_id=payload.agent_id or None)
+                           api_key_value=payload.api_key, name=payload.name, key_expires_at=payload.key_expires_at)
     except odoo.OdooConnectionError as exc:
         db.rollback()
         raise _fail(exc) from exc
@@ -392,8 +389,6 @@ class OdooPatch(BaseModel):
     #: Blank keeps the current key.
     api_key: str | None = Field(default=None, max_length=200)
     key_expires_at: str | None = Field(default=None, max_length=32)
-    #: Empty/null = direct over the internet; an id = through that agent.
-    agent_id: str | None = Field(default=None, max_length=32)
 
 
 @router.patch("/odoo/{conn_id}")
@@ -404,8 +399,7 @@ def change_odoo(conn_id: str, payload: OdooPatch, request: Request, customer: Cu
     try:
         odoo.update(db, conn, url=data.get("url"), db_name=data.get("db"), login=data.get("login"),
                     api_key_value=data.get("api_key"), name=data.get("name"),
-                    **({"key_expires_at": data["key_expires_at"]} if "key_expires_at" in data else {}),
-                    **({"agent_id": data["agent_id"] or None} if "agent_id" in data else {}))
+                    **({"key_expires_at": data["key_expires_at"]} if "key_expires_at" in data else {}))
     except (odoo.OdooConnectionError, IntegrityError) as exc:
         db.rollback()
         raise _fail(exc if isinstance(exc, odoo.OdooConnectionError) else odoo.OdooConnectionError(

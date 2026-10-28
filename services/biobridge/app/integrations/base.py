@@ -136,11 +136,6 @@ class SourceConfig:
     verify_ssl: bool = True
     timezone: str = "UTC"
     options: dict[str, Any] = field(default_factory=dict)
-    #: Where HTTP calls go instead of straight out: platform mode sets this to
-    #: the customer's OdooBridger Agent relay for a device on a private network.
-    transport: Any = None
-    #: Same, for a protocol that is not HTTP: ``connect(host, port, timeout)`` returning a socket-like object.
-    tcp_connect: Any = None
 
 
 # --------------------------------------------------------------------------- #
@@ -162,11 +157,6 @@ class AttendanceProvider(ABC):
     #: Hikvision, COSEC…). Every shipped provider declares its own; the
     #: default of both only serves test doubles and one-off integrations.
     kinds: frozenset[str] = frozenset({"platform", "device"})
-
-    #: False for a protocol the agent cannot carry yet (raw TCP, push).
-    relay_capable: bool = True
-    #: How the agent carries it: "http" (requests) or "tcp" (the device's own protocol).
-    relay_kind: str = "http"
 
     #: Fields the setup form renders, so the UI hardcodes no vendor.
     config_fields: tuple[dict[str, Any], ...] = ()
@@ -283,8 +273,6 @@ def available_providers() -> list[dict[str, Any]]:
             # Push providers: where the device should send to.
             **({"setup": cls.setup_info()} if hasattr(cls, "setup_info") else {}),
             "pushes": bool(getattr(cls, "pushes", False)),
-            "relay_capable": bool(cls.relay_capable),
-            "relay_kind": cls.relay_kind,
         }
         for cls in sorted(_REGISTRY.values(), key=lambda c: c.label)
     ]

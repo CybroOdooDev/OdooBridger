@@ -203,7 +203,7 @@ class HikvisionProvider(AttendanceProvider):
                 auth=httpx.DigestAuth(self.config.username or "", self.config.password or ""),
                 verify=self.config.verify_ssl,
                 timeout=settings.http_timeout_seconds,
-                transport=self.config.transport or TRANSPORT,
+                transport=TRANSPORT,
             )
         return self._client
 

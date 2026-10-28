@@ -772,8 +772,6 @@ class SourceIn(BaseModel):
     #: Standalone devices only: where the terminal is ("Main entrance").
     #: Stored in config and copied onto the device record when recognised.
     location: str | None = Field(default=None, max_length=120)
-    #: Platform mode: reach this device through one of the account's OdooBridger Agents.
-    relay_agent_id: str | None = Field(default=None, max_length=32)
 
     @field_validator("base_url")
     @classmethod
@@ -797,7 +795,6 @@ class SourceUpdate(BaseModel):
     is_active: bool | None = None
     auto_provision_employees: bool | None = None
     location: str | None = Field(default=None, max_length=120)
-    relay_agent_id: str | None = Field(default=None, max_length=32)
 
     @field_validator("base_url")
     @classmethod
@@ -826,7 +823,6 @@ class SourceTestIn(BaseModel):
     server_timezone: str = "UTC"
     verify_ssl: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
-    relay_agent_id: str | None = Field(default=None, max_length=32)
     source_id: str | None = None
 
     @field_validator("base_url")
@@ -857,7 +853,6 @@ class SourceOut(ORMModel):
     is_active: bool
     auto_provision_employees: bool
     location: str | None = None
-    relay_agent_id: str | None = None
     #: Company its terminals inherit unless one sets its own.
     default_company_id: int | None = None
     default_company_name: str | None = None

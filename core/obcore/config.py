@@ -53,10 +53,6 @@ class Settings(BaseSettings):
     sweep_interval_seconds: int = 300
     #: How often the sweep asks services whether they can still work on the customer's Odoo.
     odoo_readiness_minutes: int = 15
-    #: OdooBridger Agent relay: the largest request or answer carried (bytes),
-    #: and how long a request through an agent may take.
-    relay_max_body_bytes: int = 10_000_000
-    relay_timeout_seconds: int = 60
     #: May a customer's Odoo address point into a private network (10.x,
     #: 192.168.x, localhost)? Unset: allowed outside production only. In
     #: production the core would otherwise test-connect to internal hosts.
@@ -97,10 +93,6 @@ class Settings(BaseSettings):
     biometric_client_secret: str = ""
     biometric_base_url: str = "http://localhost:8001"
     biometric_internal_url: str = ""
-    # --- the demo service (Team Desk), registered at boot when its secret is set
-    demo_client_secret: str = ""
-    demo_base_url: str = "http://localhost:8002"
-    demo_internal_url: str = ""
 
     http_timeout_seconds: int = 20
     registration_rate_per_hour: int = 10

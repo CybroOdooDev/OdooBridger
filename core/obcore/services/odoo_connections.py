@@ -69,40 +69,14 @@ def _check_free(db: Session, account: Account, ukey: str, dkey: str, db_uuid: st
             "can belong to one account only. Contact us if you think this is wrong.")
 
 
-# --- agents -----------------------------------------------------------------------
-def _agent(account: Account, agent_id: str | None):
-    """The account's live agent with this id (None for a direct connection)."""
-    if not agent_id:
-        return None
-    agent = next((a for a in account.relay_agents if a.id == agent_id and a.revoked_at is None), None)
-    if agent is None:
-        raise OdooConnectionError("That OdooBridger Agent is not on your account.")
-    return agent
+def _keys(url: str, db_name: str) -> tuple[str, str]:
+    """Uniqueness keys: the address and the database name, normalised."""
+    return odoo_probe.url_key(url), odoo_probe.db_key(db_name)
 
 
-def _keys(url: str, db_name: str, agent_id: str | None) -> tuple[str, str]:
-    """Uniqueness keys. A private address is only meaningful inside the network
-    of the agent that reaches it, so it is scoped to that agent; Odoo's own
-    database.uuid still catches the same database reached two ways."""
-    ukey = odoo_probe.url_key(url)
-    return (f"agent:{agent_id}/{ukey}" if agent_id else ukey), odoo_probe.db_key(db_name)
-
-
-def _reach(db: Session, agent, url: str) -> None:
-    """Through an agent: make sure it may reach this Odoo (sent to it live)."""
-    if agent is None:
-        return
-    from obcore.services import agent_addresses
-
+def _probe(url: str, db_name: str, login: str, key: str):
     try:
-        agent_addresses.add(db, agent, url)
-    except agent_addresses.AddressError as exc:
-        raise OdooConnectionError(str(exc)) from exc
-
-
-def _probe(url: str, db_name: str, login: str, key: str, agent_id: str | None):
-    try:
-        return odoo_probe.probe(url, db_name, login, key, agent_id=agent_id)
+        return odoo_probe.probe(url, db_name, login, key)
     except odoo_probe.OdooProbeError as exc:
         raise OdooConnectionError(str(exc)) from exc
 
@@ -148,9 +122,12 @@ def _apply_probe(conn: OdooConnection, result: odoo_probe.ProbeResult) -> None:
     conn.last_checked_at = now
     conn.last_ok_at = now
     conn.failure_notified_at = None
+    conn.failing_since = None
 
 
 def _fail(conn: OdooConnection, message: str) -> None:
+    if conn.status != OdooConnectionStatus.failed.value or conn.failing_since is None:
+        conn.failing_since = utcnow()
     conn.status = OdooConnectionStatus.failed.value
     conn.status_message = message[:1000]
     conn.last_checked_at = utcnow()
@@ -160,8 +137,7 @@ def test(db: Session, conn: OdooConnection) -> bool:
     """Run the core's test on a saved connection. Records the outcome; never raises."""
     before = (conn.status, conn.odoo_version, conn.api, conn.companies)
     try:
-        _reach(db, conn.relay_agent, conn.url)
-        result = odoo_probe.probe(conn.url, conn.db_name, conn.login, api_key(conn), agent_id=conn.relay_agent_id)
+        result = odoo_probe.probe(conn.url, conn.db_name, conn.login, api_key(conn))
         if result.db_uuid and result.db_uuid != conn.db_uuid:
             _check_free(db, conn.account, conn.url_key, conn.db_key, result.db_uuid, exclude_id=conn.id)
         _apply_probe(conn, result)
@@ -187,16 +163,11 @@ def _expiry(value: str | datetime | None) -> datetime | None:
 
 
 def create(db: Session, account: Account, *, url: str, db_name: str, login: str, api_key_value: str,
-           name: str | None = None, key_expires_at: str | None = None,
-           agent_id: str | None = None) -> OdooConnection:
-    """Test, then save. A connection that fails its test is not saved.
-
-    ``agent_id``: reach this Odoo through the account's OdooBridger Agent
-    (a private address, as seen from the agent's network)."""
+           name: str | None = None, key_expires_at: str | None = None) -> OdooConnection:
+    """Test, then save. A connection that fails its test is not saved."""
     live = [c for c in account.odoo_connections]
     if len(live) >= MAX_PER_ACCOUNT:
         raise OdooConnectionError("Your account already has an Odoo connection. Change it instead.")
-    agent = _agent(account, agent_id)
     try:
         url = odoo_probe.clean_url(url)
         db_name = (db_name or "").strip() or (odoo_probe.guess_db(url) or "")
@@ -204,15 +175,13 @@ def create(db: Session, account: Account, *, url: str, db_name: str, login: str,
         raise OdooConnectionError(str(exc)) from exc
     if not db_name:
         raise OdooConnectionError("Enter the database name.")
-    ukey, dkey = _keys(url, db_name, agent_id)
+    ukey, dkey = _keys(url, db_name)
     _check_free(db, account, ukey, dkey, None)
-    _reach(db, agent, url)
-    result = _probe(url, db_name, login, api_key_value, agent_id)
+    result = _probe(url, db_name, login, api_key_value)
     _check_free(db, account, ukey, dkey, result.db_uuid)
     conn = OdooConnection(account_id=account.id, name=(name or "").strip() or "Odoo", url=url, db_name=db_name,
                           login=login.strip(), api_key_enc=encrypt(api_key_value.strip(), KEY_PURPOSE),
                           url_key=ukey, db_key=dkey, key_expires_at=_expiry(key_expires_at))
-    conn.relay_agent = agent
     _apply_probe(conn, result)
     conn.account = account
     db.add(conn)
@@ -224,10 +193,9 @@ def create(db: Session, account: Account, *, url: str, db_name: str, login: str,
 
 def update(db: Session, conn: OdooConnection, *, url: str | None = None, db_name: str | None = None,
            login: str | None = None, api_key_value: str | None = None, name: str | None = None,
-           key_expires_at: Any = ..., agent_id: Any = ...) -> OdooConnection:
+           key_expires_at: Any = ...) -> OdooConnection:
     """Change a connection. Anything that affects signing in is tested first;
-    a change that fails its test is not saved (the old connection keeps working).
-    ``agent_id``: ... keeps the route, None goes direct, an id goes through that agent."""
+    a change that fails its test is not saved (the old connection keeps working)."""
     try:
         new_url = odoo_probe.clean_url(url) if url else conn.url
     except odoo_probe.OdooProbeError as exc:
@@ -235,15 +203,12 @@ def update(db: Session, conn: OdooConnection, *, url: str | None = None, db_name
     new_db = (db_name or "").strip() or conn.db_name
     new_login = (login or "").strip() or conn.login
     new_key = (api_key_value or "").strip() or api_key(conn)
-    new_agent_id = conn.relay_agent_id if agent_id is ... else (agent_id or None)
-    agent = _agent(conn.account, new_agent_id)
-    credentials_changed = (new_url, new_db, new_login, new_agent_id) != (
-        conn.url, conn.db_name, conn.login, conn.relay_agent_id) or bool((api_key_value or "").strip())
+    credentials_changed = (new_url, new_db, new_login) != (
+        conn.url, conn.db_name, conn.login) or bool((api_key_value or "").strip())
     if credentials_changed:
-        ukey, dkey = _keys(new_url, new_db, new_agent_id)
+        ukey, dkey = _keys(new_url, new_db)
         _check_free(db, conn.account, ukey, dkey, None, exclude_id=conn.id)
-        _reach(db, agent, new_url)
-        result = _probe(new_url, new_db, new_login, new_key, new_agent_id)
+        result = _probe(new_url, new_db, new_login, new_key)
         if (ukey, dkey) != (conn.url_key, conn.db_key) and result.db_uuid != conn.db_uuid and conn.db_uuid:
             # Pointing the connection at another database: the services' data
             # (mappings, records written) belongs to the old one.
@@ -251,7 +216,6 @@ def update(db: Session, conn: OdooConnection, *, url: str | None = None, db_name
         _check_free(db, conn.account, ukey, dkey, result.db_uuid, exclude_id=conn.id)
         conn.url, conn.db_name, conn.login = new_url, new_db, new_login
         conn.url_key, conn.db_key = ukey, dkey
-        conn.relay_agent = agent
         if (api_key_value or "").strip():
             conn.api_key_enc = encrypt(new_key, KEY_PURPOSE)
             conn.key_warned_at = None
@@ -287,9 +251,6 @@ def provision_block(row: AccountService) -> dict[str, Any] | None:
         "id": conn.id, "name": conn.name, "url": conn.url, "db": conn.db_name, "login": conn.login,
         "api_key": api_key(conn), "version": conn.odoo_version, "api": conn.api,
         "companies": conn.companies or [], "status": conn.status,
-        # Through the account's agent: call Odoo via the core's relay
-        # (POST /api/v1/relay/forward), not directly.
-        "relay": {"agent_id": conn.relay_agent_id} if conn.relay_agent_id else None,
     }
 
 
@@ -320,29 +281,6 @@ def refresh_readiness(db: Session, conn: OdooConnection, *, live: bool = False) 
             continue
         record_readiness(db, row, (usage or {}).get("odoo"))
     db.flush()
-
-
-def recheck_through_agent(agent_id: str) -> None:
-    """An agent just came online: test the Odoo connections that go through it
-    and have each bound service check again, so nothing has to be re-saved or
-    restarted for them to start working. Runs in a worker thread."""
-    from sqlalchemy import select
-
-    from obcore.db import SessionLocal
-
-    db = SessionLocal()
-    try:
-        conns = db.scalars(select(OdooConnection).where(OdooConnection.relay_agent_id == agent_id)).all()
-        for conn in conns:
-            test(db, conn)
-            db.commit()
-            refresh_readiness(db, conn, live=True)
-            db.commit()
-    except Exception:  # noqa: BLE001 — best effort; the regular sweep tries again
-        log.exception("Recheck through agent %s failed", agent_id)
-        db.rollback()
-    finally:
-        db.close()
 
 
 def notify_failures(db: Session, *, now: datetime | None = None) -> int:

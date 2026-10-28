@@ -77,7 +77,7 @@ def test_staff_lists_and_filters_accounts(client, catalog):
     by_email = client.get("/api/v1/staff/accounts?q=a@one", headers=staff).json()
     assert [a["name"] for a in by_email] == ["One"]
     overview = client.get("/api/v1/staff/overview", headers=staff).json()
-    assert overview["accounts"]["total"] == 2
+    assert overview["kpis"]["customers"]["value"] == 2
 
 
 def test_staff_creates_an_account_with_a_comped_service(client, catalog, service_app):
@@ -154,3 +154,34 @@ def test_staff_team_management(client, catalog):
     assert login.status_code == 200
     me = client.get("/api/v1/auth/staff/me", headers=staff).json()
     assert client.patch(f"/api/v1/staff/team/{me['id']}", headers=staff, json={"is_active": False}).status_code == 400
+    new_id = r.json()["id"]
+    # Rename and reset another member's password.
+    r = client.patch(f"/api/v1/staff/team/{new_id}", headers=staff,
+                     json={"full_name": "Nina New", "password": "Changed-Pass-22"})
+    assert r.status_code == 200 and r.json()["full_name"] == "Nina New"
+    assert client.post("/api/v1/auth/staff/login",
+                       json={"email": "new@odoobridger.io", "password": "Changed-Pass-22"}).status_code == 200
+    # Your own password needs your current one.
+    assert client.patch(f"/api/v1/staff/team/{me['id']}", headers=staff,
+                        json={"password": "Another-Pass-33"}).status_code == 400
+    r = client.patch(f"/api/v1/staff/team/{me['id']}", headers=staff,
+                     json={"password": "Another-Pass-33", "current_password": "Staff-Password-1"})
+    assert r.status_code == 200
+    # Weak passwords are refused.
+    assert client.patch(f"/api/v1/staff/team/{new_id}", headers=staff, json={"password": "short"}).status_code == 422
+
+
+def test_a_won_lead_is_closed(client, catalog):
+    _contact(client)
+    staff = staff_headers(client)
+    lead_id = client.get("/api/v1/staff/leads", headers=staff).json()[0]["id"]
+    assert client.patch(f"/api/v1/staff/leads/{lead_id}", headers=staff, json={"stage": "won"}).status_code == 200
+    # It can't move back, nor be edited...
+    r = client.patch(f"/api/v1/staff/leads/{lead_id}", headers=staff, json={"stage": "qualified"})
+    assert r.status_code == 409
+    assert client.patch(f"/api/v1/staff/leads/{lead_id}", headers=staff, json={"value_cents": 100}).status_code == 409
+    assert client.patch(f"/api/v1/staff/leads/{lead_id}", headers=staff, json={"demo_status": "done"}).status_code == 409
+    # ...but notes still go into its history.
+    r = client.post(f"/api/v1/staff/leads/{lead_id}/notes", headers=staff, json={"note": "Signed the contract"})
+    assert r.status_code == 201
+    assert client.get(f"/api/v1/staff/leads/{lead_id}", headers=staff).json()["stage"] == "won"

@@ -30,7 +30,7 @@ from obcore.mailer import OUTBOX
 from obcore.models import Service, ServicePackage, StaffUser
 from obcore.security import hash_password, hash_token
 from obcore.services import accounts as acc
-from obcore.services import provisioning
+from obcore.services import ops, provisioning
 from obcore.services import stripe_api
 
 SERVICE_SECRET = "service-secret-for-tests"
@@ -72,6 +72,25 @@ class FakeService:
                 self.accounts.pop(account_id, None)
                 self.deleted.append(account_id)
             return {"ok": True}
+
+        #: What GET /platform/v1/metrics answers (None = the service has no such endpoint).
+        self.metrics: dict | None = None
+
+        @self.app.get("/health")
+        async def health():
+            if self.down:
+                return _error(503)
+            return {"status": "ok"}
+
+        @self.app.get("/platform/v1/metrics")
+        async def metrics(request: Request):
+            token = request.headers["authorization"].split()[1]
+            aud = jwt.get_unverified_claims(token)["aud"]
+            claims = jwt.decode(token, keys.public_pem(), algorithms=["RS256"], audience=aud)
+            assert claims["typ"] == "metrics" and claims["body_sha256"] == keys.body_digest(b"")
+            if self.metrics is None or aud != "biometric":
+                return _error(404)
+            return self.metrics
 
         @self.app.get("/platform/v1/accounts/{account_id}/usage")
         async def usage(account_id: str, request: Request):
@@ -191,6 +210,8 @@ def _fresh_db():
 def service_app(monkeypatch):
     fake = FakeService()
     monkeypatch.setattr(provisioning, "client_factory", lambda: TestClient(fake.app, base_url="http://biometric.test"))
+    monkeypatch.setattr(ops, "client_factory", lambda: TestClient(fake.app, base_url="http://biometric.test"))
+    ops.forget()
     return fake
 
 
@@ -214,7 +235,7 @@ def catalog(client):
     from obcore.db import SessionLocal
 
     db = SessionLocal()
-    service = Service(slug="biometric", name="Biometric Attendance", base_url="https://biometric.test",
+    service = Service(slug="biometric", name="BioBridge", base_url="https://biometric.test",
                       internal_url="http://biometric.test", client_secret_hash=hash_token(SERVICE_SECRET),
                       uses_odoo=True)
     db.add(service)

@@ -221,15 +221,12 @@ def apply_odoo(db: Session, tenant: Tenant, block: dict[str, Any] | None) -> Non
         log.info("Tenant %s: Odoo connection from OdooBridger (%s)", tenant.slug, block["url"])
     from app.core.crypto import decrypt
 
-    relay_agent_id = (block.get("relay") or {}).get("agent_id") or None
     changed = (conn.url, conn.db_name, conn.username) != (block["url"], block["db"], block["login"]) \
-        or decrypt(conn.api_key_enc, tenant.crypto_key) != block["api_key"] \
-        or conn.relay_agent_id != relay_agent_id
+        or decrypt(conn.api_key_enc, tenant.crypto_key) != block["api_key"]
     if changed:
         forget_detected_api(conn.url)
         conn.url, conn.db_name, conn.username = block["url"], block["db"], block["login"]
         conn.api_key_enc = encrypt(block["api_key"], tenant.crypto_key)
-        conn.relay_agent_id = relay_agent_id
         conn.uid_cache = None
         conn.status = ConnectionStatus.unverified.value
         conn.status_message = None

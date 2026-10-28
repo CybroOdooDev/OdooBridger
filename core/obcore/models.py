@@ -15,10 +15,10 @@ holds a service's own data.
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text,
+    JSON, Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -66,8 +66,6 @@ class Account(Base, UUIDPk, Timestamped):
         back_populates="account", cascade="all, delete-orphan")
     odoo_connections: Mapped[list["OdooConnection"]] = relationship(
         back_populates="account", cascade="all, delete-orphan", order_by="OdooConnection.created_at")
-    relay_agents: Mapped[list["RelayAgent"]] = relationship(
-        back_populates="account", cascade="all, delete-orphan", order_by="RelayAgent.created_at")
 
 
 class UserRole(str, enum.Enum):
@@ -363,49 +361,10 @@ class OdooConnection(Base, UUIDPk, Timestamped):
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: When the customer was last emailed that it stopped working.
     failure_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    #: Set when the Odoo is on a private network: every call to it goes
-    #: through this account's OdooBridger Agent, and ``url`` is the address as
-    #: the agent's own network sees it (http://192.168.1.20:8069).
-    relay_agent_id: Mapped[str | None] = mapped_column(
-        ForeignKey("relay_agent.id", ondelete="SET NULL"), index=True)
+    #: When it last went from working to failing (cleared when it works again).
+    failing_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     account: Mapped[Account] = relationship(back_populates="odoo_connections")
-    relay_agent: Mapped["RelayAgent | None"] = relationship()
-
-
-class RelayAgent(Base, UUIDPk, Timestamped):
-    """An OdooBridger Agent: a small program a customer runs inside their own
-    network so OdooBridger can reach a private Odoo (later, LAN terminals).
-
-    It dials out to the core over a WebSocket — no inbound port, no VPN — and
-    only ever forwards to the addresses its own configuration allows. The core
-    and services send it HTTP requests; it makes them on the local network and
-    sends back the answers.
-    """
-
-    __tablename__ = "relay_agent"
-
-    account_id: Mapped[str] = mapped_column(ForeignKey("account.id", ondelete="CASCADE"), index=True)
-    name: Mapped[str] = mapped_column(String(120), default="Office agent")
-    key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    #: The last characters of the key, so people can tell keys apart.
-    key_hint: Mapped[str] = mapped_column(String(8), nullable=False)
-    #: What the agent last said about itself.
-    version: Mapped[str | None] = mapped_column(String(20))
-    hostname: Mapped[str | None] = mapped_column(String(120))
-    #: The limit set on the agent's own computer (OB_ALLOW), as it last reported.
-    #: Empty for agents installed with only their key (the usual case).
-    allowed: Mapped[list | None] = mapped_column(JSON)
-    #: What it may reach, managed here ("192.168.1.20:8069", "10.0.11.43:4370",
-    #: "192.168.1.0/24@80+443"): added when an Odoo or a device is connected
-    #: through it, or by hand in the portal, and sent to the running agent.
-    managed_allowed: Mapped[list | None] = mapped_column(JSON)
-    last_ip: Mapped[str | None] = mapped_column(String(64))
-    connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-    account: Mapped[Account] = relationship(back_populates="relay_agents")
 
 
 # =============================================================================
@@ -516,6 +475,18 @@ class AccountClosure(Base, UUIDPk, Timestamped):
     services: Mapped[list] = mapped_column(JSON, default=list)
     closed_by: Mapped[str] = mapped_column(String(280))
     reason: Mapped[str | None] = mapped_column(Text)
+
+
+class MetricSnapshot(Base, Timestamped):
+    """One row per day: the figures the staff overview compares against
+    (monthly revenue has no history anywhere else)."""
+
+    __tablename__ = "metric_snapshot"
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    mrr_cents: Mapped[int] = mapped_column(Integer, default=0)
+    customers: Mapped[int] = mapped_column(Integer, default=0)
+    subscriptions: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Setting(Base, Timestamped):

@@ -101,7 +101,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlparse
 
-from app.integrations.relay import RelayTcpError
 from app.integrations.base import (
     AttendanceProvider,
     Capability,
@@ -468,11 +467,7 @@ class _Connection:
     open between sync cycles.
     """
 
-    def __init__(self, host: str, port: int, comm_key: int, timeout: int = SOCKET_TIMEOUT,
-                 connect=None) -> None:
-        #: ``connect(host, port, timeout)`` -> socket-like; None dials directly. Platform mode
-        #: passes one that goes through the customer's OdooBridger Agent.
-        self._connect_fn = connect
+    def __init__(self, host: str, port: int, comm_key: int, timeout: int = SOCKET_TIMEOUT) -> None:
         self.host = host
         self.port = port
         self.comm_key = comm_key
@@ -495,12 +490,7 @@ class _Connection:
     # -- transport -----------------------------------------------------
     def _open(self) -> None:
         try:
-            if self._connect_fn is not None:
-                self.sock = self._connect_fn(self.host, self.port, self.timeout)
-            else:
-                self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        except RelayTcpError as exc:
-            raise ZKError(str(exc)) from exc
+            self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         except socket.gaierror as exc:
             raise ZKError(f"Cannot resolve the device address '{self.host}': {exc}") from exc
         except TimeoutError:
@@ -616,8 +606,6 @@ class _Connection:
         return _Reply(command=command, session_id=session_id, reply_id=reply_id, data=body[8:])
 
     def _transport_error(self, exc: OSError) -> ZKError:
-        if isinstance(exc, RelayTcpError):
-            return ZKError(str(exc))
         if isinstance(exc, TimeoutError):
             return ZKError(
                 f"Timed out waiting for a reply from {self.host}:{self.port}. The "
@@ -799,7 +787,6 @@ class _Connection:
 @register
 class ZKDeviceProvider(AttendanceProvider):
     slug = "zk_device"
-    relay_kind = "tcp"      # carried by the agent as a raw TCP stream
     label = "Standalone device (ZKTeco protocol)"
     description = (
         "One physical ZKTeco terminal, reached directly over the network — "
@@ -838,7 +825,7 @@ class ZKDeviceProvider(AttendanceProvider):
         pass  # nothing kept open between calls — see _Connection's docstring
 
     def _connect(self) -> _Connection:
-        return _Connection(self.host, self.port, self.comm_key, connect=self.config.tcp_connect)
+        return _Connection(self.host, self.port, self.comm_key)
 
     def _serial(self, conn: _Connection) -> str:
         if self._serial_cache is None:

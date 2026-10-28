@@ -133,13 +133,4 @@ def odoo_out(c: "OdooConnection", *, staff: bool = False) -> dict[str, Any]:
         "last_checked_at": iso(c.last_checked_at), "last_ok_at": iso(c.last_ok_at),
         "key_expires_at": iso(c.key_expires_at), "has_db_uuid": bool(c.db_uuid),
         "services": services, "created_at": iso(c.created_at),
-        "agent": _agent_brief(c),
     }
-
-
-def _agent_brief(c: "OdooConnection") -> dict[str, Any] | None:
-    if not c.relay_agent_id or c.relay_agent is None:
-        return None
-    from obcore.services.relay import hub
-
-    return {"id": c.relay_agent.id, "name": c.relay_agent.name, "online": hub.online(c.relay_agent.id)}

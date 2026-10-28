@@ -140,7 +140,7 @@ class Settings(BaseSettings):
     def _platform_is_hosted(self):
         # As OdooBridger's service this runs hosted, next to other internal
         # systems: a customer's address must not reach into that network.
-        # A private Odoo is reached through the customer's agent instead.
+        # Customers expose their Odoo and devices on a public address.
         # An explicit ALLOW_PRIVATE_NETWORK_TARGETS still wins.
         if self.platform_mode and "allow_private_network_targets" not in self.model_fields_set:
             object.__setattr__(self, "allow_private_network_targets", False)

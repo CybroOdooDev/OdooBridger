@@ -201,7 +201,7 @@ def test_disconnecting_tells_the_service(client, catalog, odoo, service_app):
     acc_id = account_id(client, headers)
     r = client.delete(f"/api/v1/portal/odoo/{conn_id}", headers=headers)
     assert r.status_code == 200 and r.json()["connections"] == []
-    assert r.json()["services_without"] == [{"slug": "biometric", "name": "Biometric Attendance"}]
+    assert r.json()["services_without"] == [{"slug": "biometric", "name": "BioBridge"}]
     assert service_app.payloads[("biometric", acc_id)]["odoo"] is None
 
 

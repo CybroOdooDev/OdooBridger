@@ -217,7 +217,6 @@ class BioTimeProvider(AttendanceProvider):
             # on a LAN or private tunnel, and an inherited proxy silently breaks
             # every sync with an error that points nowhere useful.
             trust_env=False,
-            transport=config.transport,
         )
 
     # -- lifecycle ---------------------------------------------------------

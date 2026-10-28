@@ -93,5 +93,11 @@ def _tick() -> None:
 
         stripe_api.load_config(db)
         result = sweep_once(db)
+        try:
+            from obcore.services.ops import record_snapshot
+
+            record_snapshot(db)
+        except Exception:  # noqa: BLE001 — a figure for the overview, never worth failing the sweep
+            log.exception("Daily snapshot failed")
         if any(result.values()):
             log.info("Sweep: %s", result)

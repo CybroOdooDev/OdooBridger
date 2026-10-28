@@ -330,35 +330,6 @@ class OdooCredentials:
     disabled_company_ids: list[int] = field(default_factory=list)
     #: "auto" (detect from the server's version), "json2" or "xmlrpc".
     api: str = API_AUTO
-    #: Platform mode, a private Odoo: every request (JSON-2 and XML-RPC) goes
-    #: through this transport — OdooBridger's relay to the customer's agent —
-    #: instead of straight to ``url``. ``url`` is then the address as the
-    #: agent's network sees it.
-    transport: httpx.BaseTransport | None = None
-
-
-class _HttpxXmlrpcTransport(xmlrpc.client.Transport):
-    """XML-RPC over an httpx client — so XML-RPC calls can take the same
-    route (OdooBridger's relay to a customer's agent) as JSON-2 ones."""
-
-    def __init__(self, client: httpx.Client, base_url: str) -> None:
-        super().__init__(use_builtin_types=False)
-        self._client = client
-        self._base = base_url.rstrip("/")
-
-    def request(self, host, handler, request_body, verbose=False):  # type: ignore[override]
-        url = f"{self._base}{handler}"
-        try:
-            resp = self._client.post(url, content=request_body, headers={"Content-Type": "text/xml"})
-        except httpx.HTTPError as exc:
-            # OSError: OdooClient's XML-RPC error handling maps it like a socket failure.
-            raise ConnectionError(str(exc)) from exc
-        if resp.status_code != 200:
-            raise xmlrpc.client.ProtocolError(url, resp.status_code, resp.reason_phrase, dict(resp.headers))
-        parser, unmarshaller = self.getparser()
-        parser.feed(resp.content)
-        parser.close()
-        return unmarshaller.close()
 
 
 class _TimeoutMixin:
@@ -449,9 +420,7 @@ class OdooClient:
         return API_LABELS.get(self.api, self.api)
 
     def _detect_api(self) -> str:
-        # The same private address (http://192.168.1.20:8069) behind two
-        # customers' agents is two different servers.
-        key = (self.url, self.creds.db, getattr(self.creds.transport, "cache_key", None))
+        key = (self.url, self.creds.db)
         with _api_cache_lock:
             cached = _api_cache.get(key)
         if cached and cached[2] > time.monotonic():
@@ -482,11 +451,6 @@ class OdooClient:
 
     # -- transports --------------------------------------------------------
     def _proxy(self, endpoint: str) -> xmlrpc.client.ServerProxy:
-        if self.creds.transport is not None:
-            return xmlrpc.client.ServerProxy(
-                f"{self.url}/xmlrpc/2/{endpoint}", allow_none=True,
-                transport=_HttpxXmlrpcTransport(self.http, self.url),
-            )
         transport = (
             _TimeoutSafeTransport(self._timeout)
             if self.url.lower().startswith("https")
@@ -514,7 +478,7 @@ class OdooClient:
             self._http = httpx.Client(
                 timeout=self._timeout,
                 follow_redirects=False,
-                transport=self.creds.transport or TRANSPORT,
+                transport=TRANSPORT,
                 headers={"User-Agent": "BioBridge (Odoo attendance sync)"},
             )
         return self._http

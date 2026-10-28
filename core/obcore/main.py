@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from obcore import keys
-from obcore.api import auth, billing_hook, portal, public, relay, sso, staff
+from obcore.api import auth, billing_hook, portal, public, sso, staff
 from obcore.config import settings
 from obcore.db import create_schema, session_scope
 
@@ -39,11 +39,11 @@ async def lifespan(app: FastAPI):
     with session_scope() as db:
         from obcore.services.jobs import ensure_static_staff
 
-        from obcore.services.catalog import ensure_biometric, ensure_demo
+        from obcore.services.catalog import ensure_biometric, retire_demo
 
         ensure_static_staff(db)
         ensure_biometric(db)
-        ensure_demo(db)
+        retire_demo(db)
         keys.load(db)
     task = asyncio.create_task(_jobs()) if settings.run_background_jobs else None
     log.info("%s core started (env=%s)", settings.app_name, settings.environment)
@@ -68,8 +68,6 @@ api = APIRouter(prefix="/api/v1")
 for module in (auth, public, portal, sso, staff, billing_hook):
     api.include_router(module.router)
 app.include_router(api)
-# Agents dial in at /relay/v1/agent; its other routes carry their full paths.
-app.include_router(relay.router)
 
 
 @app.get("/.well-known/jwks.json", include_in_schema=False)
@@ -94,7 +92,6 @@ app.mount("/app", Revalidating(directory=STATIC / "portal", html=True), name="po
 app.mount("/staff", Revalidating(directory=STATIC / "staff", html=True), name="staff")
 app.mount("/assets", Revalidating(directory=STATIC / "shared"), name="shared")
 app.mount("/site", Revalidating(directory=STATIC / "site", html=True), name="site")
-app.mount("/downloads", Revalidating(directory=STATIC / "downloads"), name="downloads")
 
 
 @app.get("/", include_in_schema=False)

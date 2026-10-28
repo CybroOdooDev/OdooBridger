@@ -2,7 +2,7 @@
 
 import '/assets/password-toggle.js';
 import { fmtDate, money } from '/assets/api.js';
-import { $, $$, banner, empty, esc, field, fmtAgo, busy, guard, loading, readForm, stat, toast, wireTips } from '/assets/ui.js';
+import { $, $$, banner, empty, esc, field, fmtAgo, busy, guard, kpi, kpiIcon, loading, readForm, toast, wireTips } from '/assets/ui.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
 import { client } from './client.js';
 import { renderLeads } from './leads.js';
@@ -44,39 +44,267 @@ function renderLogin() {
 /* =========================================================================
  * Overview
  * ====================================================================== */
+const SVC_STATUS = {
+  operational: ['ok', 'Operational'], degraded: ['warn', 'Degraded'], unavailable: ['bad', 'Unavailable'],
+  maintenance: ['warn', 'Maintenance'], disabled: ['mute', 'Disabled'], not_deployed: ['mute', 'Not Deployed'],
+};
+const SEVERITY = { critical: ['bad', 'Critical'], high: ['bad', 'High'], medium: ['warn', 'Medium'] };
+const SUB_LABEL = { paying: ['ok', 'Paying'], trial: ['trialing', 'Trial'], past_due: ['bad', 'Past Due'], suspended: ['bad', 'Suspended'] };
+const MIX = [['paying', 'Paying', 'var(--ok)'], ['trial', 'Free trial', 'var(--accent)'],
+  ['past_due', 'Past due', 'var(--warn)'], ['suspended', 'Suspended', 'var(--bad)'], ['no_service', 'No service', 'var(--faint)']];
+
+const tag = (tone, text) => `<span class="pill ${tone}">${esc(text)}</span>`;
+const badge = (tone, text) => `<span class="pill ${tone} kpi-b">${esc(text)}</span>`;
+const signed = (n) => (n > 0 ? `+${n}` : `${n}`);
+
+/** "3 h", "2 days": how long a problem has been going on. */
+function since(iso) {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 3600) return `${Math.max(1, Math.round(s / 60))} min`;
+  if (s < 86400) { const h = Math.floor(s / 3600); const m = Math.round((s % 3600) / 60); return m ? `${h} h ${m} min` : `${h} h`; }
+  const d = Math.floor(s / 86400);
+  return `${d} day${d === 1 ? '' : 's'}`;
+}
+
+/** Total customers at each month's end: one line, a point per month, a tooltip on hover. */
+function growthChart(points) {
+  const W = 340; const H = 270; const L = 32; const B = 26; const T = 14; const R = 12;
+  const max = Math.max(4, ...points.map((p) => p.total));
+  const step = Math.ceil(max / 4);
+  const top = step * 4;
+  const x = (i) => L + 8 + (i * (W - L - R - 8)) / Math.max(1, points.length - 1);
+  const y = (v) => H - B - ((H - B - T) * v) / top;
+  const month = (m) => new Date(`${m}-01T00:00:00`).toLocaleDateString(undefined, { month: 'short' });
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.total).toFixed(1)}`).join(' ');
+  const area = `${line} L${x(points.length - 1).toFixed(1)},${H - B} L${x(0).toFixed(1)},${H - B} Z`;
+  const grid = [0, 1, 2, 3, 4].map((g) => `<line x1="${L}" x2="${W - R}" y1="${y(g * step)}" y2="${y(g * step)}" class="ch-grid"/>
+    <text x="${L - 8}" y="${y(g * step) + 4}" text-anchor="end" class="ch-ax">${g * step}</text>`).join('');
+  const labels = points.map((p, i) => (i % 2 === 1 ? `<text x="${x(i)}" y="${H - 7}" text-anchor="middle" class="ch-ax">${esc(month(p.month))}</text>` : '')).join('');
+  const dots = points.map((p, i) => `<circle cx="${x(i)}" cy="${y(p.total)}" r="4" class="ch-dot"/>`).join('');
+  const hits = points.map((p, i) => `<rect x="${x(i) - (W - L) / points.length / 2}" y="${T}" width="${(W - L) / points.length}" height="${H - B - T}"
+    fill="transparent" data-i="${i}"/>`).join('');
+  return `<div class="ch-wrap"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Total customers, last 12 months">
+    <defs><linearGradient id="chFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".18"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+    ${grid}<path d="${area}" fill="url(#chFill)"/><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <line class="ch-cross" y1="${T}" y2="${H - B}" x1="0" x2="0" hidden/>${dots}${labels}${hits}</svg>
+    <div class="ch-tip" hidden></div></div>`;
+}
+
+function wireGrowth(root, points) {
+  const wrap = $('.ch-wrap', root);
+  if (!wrap) return;
+  const tip = $('.ch-tip', wrap);
+  const cross = $('.ch-cross', wrap);
+  const month = (m) => new Date(`${m}-01T00:00:00`).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  wrap.addEventListener('mousemove', (e) => {
+    const hit = e.target.closest('[data-i]');
+    if (!hit) return;
+    const p = points[Number(hit.dataset.i)];
+    const dot = wrap.querySelectorAll('.ch-dot')[Number(hit.dataset.i)];
+    const cx = Number(dot.getAttribute('cx'));
+    cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.hidden = false;
+    tip.innerHTML = `<b>${esc(month(p.month))}</b><span>${p.total} customers</span><span>${signed(p.added)} that month</span>`;
+    tip.hidden = false;
+    const box = wrap.getBoundingClientRect();
+    const dbox = dot.getBoundingClientRect();
+    const left = Math.min(box.width - tip.offsetWidth, Math.max(0, dbox.left - box.left - tip.offsetWidth / 2));
+    tip.style.left = `${left}px`;
+    tip.style.top = `${Math.max(0, dbox.top - box.top - tip.offsetHeight - 10)}px`;
+  });
+  wrap.addEventListener('mouseleave', () => { tip.hidden = true; cross.hidden = true; });
+}
+
+const incidentRow = (i) => `<li${i.account_id ? ` class="click" data-account="${esc(i.account_id)}"` : i.href ? ` class="click" data-href="${esc(i.href)}"` : ''}>
+  <span class="al-ic ${SEVERITY[i.severity][0]}">${kpiIcon('alert')}</span>
+  <div class="al-t"><b>${esc(i.issue)}</b>${i.detail ? `<p class="al-d" title="${esc(i.detail)}">${esc(i.detail)}</p>` : ''}<span>${esc([i.account, i.service].filter(Boolean).join(' · '))}</span></div>
+  <div class="al-r">${tag(...SEVERITY[i.severity])}<span>${esc(since(i.since))}</span></div></li>`;
+
 async function renderOverview(mount) {
   const o = await api.get('/staff/overview');
-  const svc = Object.entries(o.services);
+  const k = o.kpis;
+  // Platform-level notices sit with the rest, not in a banner across the page.
+  const incidents = [...(!o.stripe.enabled ? [{ key: 'stripe', severity: 'medium', issue: 'Online payments are off',
+    detail: 'Add Stripe keys so customers can pay.', service: 'Payments', href: '#/payments' }] : []), ...o.incidents];
+  const mixTotal = MIX.reduce((n, [key]) => n + (o.mix[key] || 0), 0);
+  const mixShown = MIX.filter(([key]) => o.mix[key] || key !== 'no_service');
+  const svcShort = o.services.map((sv) => {
+    const [tone, label] = SVC_STATUS[sv.status] || ['mute', sv.status];
+    const sub = sv.integrations
+      ? `${sv.integrations.active} integrations · ${sv.jobs?.pending ?? 0} queued`
+      : sv.status === 'unavailable' ? (sv.error || 'not answering')
+        : sv.status === 'not_deployed' || sv.status === 'disabled' ? `${sv.customers} customers` : `${sv.customers} customers · no metrics yet`;
+    const failed = sv.integrations ? `${sv.integrations.failed} failed` : '—';
+    return `<li><div><b>${esc(sv.name)}</b><small>${esc(sub)}</small></div>${tag(tone, label)}<span class="num">${esc(failed)}</span></li>`;
+  }).join('');
   mount.innerHTML = `
-    ${!o.stripe.enabled ? banner('Online Payments Are Off', 'Add Stripe keys so customers can pay.', 'warn', { href: '#/payments', label: 'Payments' }) : ''}
-    <div class="grid cols-4">
-      ${stat({ label: 'Accounts', value: o.accounts.total, note: `${o.accounts.suspended || 0} suspended`, href: '#/accounts' })}
-      ${stat({ label: 'Monthly Revenue', value: money(o.mrr_cents), note: 'paying online, per month', href: '#/payments' })}
-      ${stat({ label: 'Open Leads', value: o.leads.open, note: `${money(o.leads.pipeline_value_cents)} in the pipeline`, href: '#/leads' })}
-      ${stat({ label: 'Out Of Sync', value: o.out_of_sync.length, note: 'services not yet told', tone: o.out_of_sync.length ? 'warn' : '' })}
+    <div class="kpis">
+      ${kpi({ icon: 'users', tone: 'acc', label: 'Customers', value: k.customers.value, href: '#/accounts' })}
+      ${kpi({ icon: 'card', tone: 'acc', label: 'Subscriptions', value: k.subscriptions.value, href: '#/accounts' })}
+      ${kpi({ icon: 'money', tone: 'ok', label: 'Monthly Revenue', value: money(k.mrr.value_cents), href: '#/payments' })}
+      ${kpi({ icon: 'link', tone: k.integrations.failed ? 'bad' : 'acc', label: 'Integrations', value: k.integrations.value })}
+      ${kpi({ icon: 'server', tone: k.services.not_operational.length ? 'warn' : 'ok', label: 'Services',
+        value: `${k.services.operational} / ${k.services.deployed}` })}
+      ${kpi({ icon: 'alert', tone: incidents.length ? 'bad' : 'ok', label: 'Needs Attention', value: incidents.length })}
     </div>
-    <div class="grid cols-2" style="margin-top:16px">
-      <div class="card"><div class="card-head"><h2>Services</h2></div>
-        ${svc.length ? `<table><thead><tr><th>Service</th><th>Trial</th><th>Active</th><th>Past Due</th><th>Suspended</th></tr></thead><tbody>
-          ${svc.map(([name, c]) => `<tr><td>${esc(name)}</td><td>${c.trialing || 0}</td><td>${c.active || 0}</td><td>${c.past_due || 0}</td><td>${c.suspended || 0}</td></tr>`).join('')}
-        </tbody></table>` : empty('No Subscriptions Yet', '')}</div>
-      <div class="card"><div class="card-head"><h2>Trials Ending Soon</h2></div>
-        ${o.trials_ending.length ? `<table><tbody>${o.trials_ending.map((t) => `<tr class="click" data-account="${esc(t.account_id)}">
-          <td>${esc(t.account)}</td><td>${esc(t.service)}</td><td class="nowrap">${esc(fmtDate(t.trial_ends_at))}</td></tr>`).join('')}</tbody></table>`
-          : empty('None', '')}</div>
-      <div class="card"><div class="card-head"><h2>New Accounts</h2></div>
-        ${o.recent_accounts.length ? `<table><tbody>${o.recent_accounts.map((a) => `<tr class="click" data-account="${esc(a.id)}">
-          <td>${esc(a.name)}</td><td class="muted">${esc(a.services.join(', ') || '—')}</td><td class="nowrap">${esc(fmtAgo(a.created_at))}</td></tr>`).join('')}</tbody></table>`
-          : empty('None Yet', '')}</div>
-      <div class="card"><div class="card-head"><h2>Waiting On A Service</h2></div>
-        ${o.out_of_sync.length ? `<table><tbody>${o.out_of_sync.map((r) => `<tr class="click" data-account="${esc(r.account_id)}">
-          <td>${esc(r.account)}</td><td>${esc(r.service)}</td><td class="muted">${esc(r.error || 'pending')}</td></tr>`).join('')}</tbody></table>`
-          : empty('Everything Is Up To Date', 'Every service has the latest state of every account.')}</div>
+    <div class="ov-row2">
+      <div class="card"><div class="card-head"><h2>Customers</h2><span class="hint">total · last 12 months</span></div>
+        <div class="cust-split"><div class="cust-chart">${growthChart(o.growth)}</div>
+          <div class="cust-mix">
+        ${mixTotal ? `<div class="mix" role="img" aria-label="Customer mix">${mixShown.filter(([key]) => o.mix[key]).map(([key, label, color]) =>
+          `<span style="flex:${o.mix[key]};background:${color}" title="${esc(label)}: ${o.mix[key]}"></span>`).join('')}</div>
+        <ul class="mix-leg">${mixShown.map(([key, label, color]) => `<li><span class="sw" style="background:${color}"></span>${esc(label)}
+          <b>${o.mix[key] || 0}</b><em>${Math.round(((o.mix[key] || 0) * 100) / mixTotal)}%</em></li>`).join('')}</ul>` : empty('No Customers Yet', '')}
+        <div class="facts2">
+          <div>Email not verified<b>${o.customer_facts.unverified}</b></div>
+          <div>Trials ending 7 d<b>${o.customer_facts.trials_ending_7d}</b></div>
+          <div>With failures<b>${o.customer_facts.with_failures}</b></div>
+          <div><a href="#/leads">Open leads</a><b>${o.customer_facts.open_leads}</b></div></div></div></div></div>
+      <div class="card"><div class="card-head"><h2>Needs Attention</h2>${incidents.length > 5 ? '<a href="#" id="allIncidents">View All →</a>' : ''}</div>
+        ${incidents.length ? `<ul class="alerts">${incidents.slice(0, 5).map(incidentRow).join('')}</ul>`
+          : empty('Nothing Needs Attention', '')}</div>
+    </div>
+    <div class="ov-row2">
+      <div class="card"><div class="card-head"><h2>Recent Customers</h2><a href="#/accounts">Accounts →</a></div>
+        ${o.recent_customers.length ? `<div class="table-wrap"><table>
+          <thead><tr><th>Customer</th><th>Subscription</th><th>Services</th><th>Status</th><th>Registered</th><th>Last active</th></tr></thead>
+          <tbody>${o.recent_customers.map((c) => `<tr${c.id ? ` class="click" data-account="${esc(c.id)}"` : ''}>
+            <td>${esc(c.name)}</td>
+            <td>${c.subscription ? tag(...SUB_LABEL[c.subscription]) : '—'}</td>
+            <td>${esc(c.services.join(', ') || '—')}</td>
+            <td>${c.status === 'unverified' ? tag('mute', 'Email Not Verified') : statusPill(c.status)}</td>
+            <td class="nowrap">${esc(fmtDate(c.created_at))}</td>
+            <td class="nowrap">${c.last_active_at ? esc(fmtAgo(c.last_active_at)) : '—'}</td></tr>`).join('')}</tbody></table></div>`
+          : empty('No Customers Yet', '')}</div>
+      <div class="card"><div class="card-head"><h2>Service Health</h2><a href="#/catalog">Services →</a></div>
+        ${o.services.length ? `<ul class="svc-list">${svcShort}</ul>` : empty('No Services Yet', '')}
+        <div class="hint" style="margin-top:8px">Checked ${esc(fmtAgo(o.services[0]?.checked_at || o.checked_at))}</div></div>
     </div>`;
-  mount.addEventListener('click', (e) => {
+  wireGrowth(mount, o.growth);
+  mount.onclick = (e) => {
+    if (e.target.closest('#allIncidents')) {
+      e.preventDefault();
+      dialog({ title: 'Needs Attention', wide: true, submitLabel: 'Done',
+        body: `<ul class="alerts">${incidents.map(incidentRow).join('')}</ul>` });
+      return;
+    }
+    const go = e.target.closest('[data-href]');
+    if (go) { document.querySelector('.wiz-backdrop')?.click(); window.location.hash = go.dataset.href; return; }
+    const row = e.target.closest('[data-account]');
+    if (row) {
+      document.querySelector('.wiz-backdrop')?.click();
+      window.location.hash = `#/accounts/${row.dataset.account}`;
+    }
+  };
+}
+
+/* =========================================================================
+ * One service's dashboard: only the generic figures the service reports
+ * ====================================================================== */
+const HEALTH = { healthy: ['ok', 'Healthy'], delayed: ['warn', 'Delayed'], failing: ['bad', 'Failing'],
+  not_started: ['mute', 'Not Started'] };
+const minutes = (n) => (n == null ? '—' : n < 60 ? `${n} min` : n % 60 ? `${Math.floor(n / 60)} h ${n % 60} min` : `${n / 60} h`);
+
+function cell(kind, v) {
+  if (kind === 'usage') {
+    if (!v || v.used == null) return '—';
+    const full = v.limit != null && v.used >= v.limit;
+    const text = `${Number(v.used).toLocaleString()} / ${v.limit == null ? '∞' : Number(v.limit).toLocaleString()}`;
+    return full ? `<span class="t-warn" title="At the plan's limit">${esc(text)}</span>` : esc(text);
+  }
+  if (kind === 'minutes') return esc(minutes(v));
+  if (kind === 'ago') return v ? esc(fmtAgo(v)) : '—';
+  if (kind === 'health') { const [t, l] = HEALTH[v] || ['mute', v || '—']; return tag(t, l); }
+  if (typeof v === 'number') return esc(v.toLocaleString());
+  return esc(v ?? '—');
+}
+
+/** One series of daily counts: bars, a tooltip on hover. */
+function dailyBars(series) {
+  const pts = series.points || [];
+  const W = 760; const H = 230; const L = 44; const B = 26; const T = 12; const R = 6;
+  const max = Math.max(4, ...pts.map((p) => p.value));
+  const mag = 10 ** Math.floor(Math.log10(max / 4));
+  const step = Math.ceil(max / 4 / mag) * mag;
+  const top = step * 4;
+  const bw = (W - L - R) / Math.max(1, pts.length);
+  const y = (v) => H - B - ((H - B - T) * v) / top;
+  const short = (n) => (n >= 1000 ? `${+(n / 1000).toFixed(1)}k` : `${n}`);
+  const day = (d) => new Date(`${d}T00:00:00`).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+  const grid = [0, 1, 2, 3, 4].map((g) => `<line x1="${L}" x2="${W - R}" y1="${y(g * step)}" y2="${y(g * step)}" class="ch-grid"/>
+    <text x="${L - 8}" y="${y(g * step) + 4}" text-anchor="end" class="ch-ax">${short(g * step)}</text>`).join('');
+  const bars = pts.map((p, i) => {
+    const x = L + i * bw + 2; const w = Math.max(2, bw - 4); const top2 = y(p.value);
+    const h = H - B - top2; const r = Math.min(3, w / 2, h);
+    return h > 0 ? `<path d="M${x},${H - B} V${top2 + r} q0,-${r} ${r},-${r} h${w - 2 * r} q${r},0 ${r},${r} V${H - B} Z" class="ch-bar"/>` : '';
+  }).join('');
+  const last = pts.length - 1;
+  const labels = pts.map((p, i) => ((i % 7 === 0 && last - i >= 4) || i === last
+    ? `<text x="${L + i * bw + bw / 2}" y="${H - 7}" text-anchor="middle" class="ch-ax">${esc(day(p.date))}</text>` : '')).join('');
+  const hits = pts.map((p, i) => `<rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - B - T}" fill="transparent" data-i="${i}"/>`).join('');
+  return `<div class="ch-wrap" data-series><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${esc(series.title || 'Daily figures')}">
+    ${grid}${bars}${labels}${hits}</svg><div class="ch-tip" hidden></div></div>`;
+}
+
+function wireBars(root, series) {
+  const wrap = $('[data-series]', root);
+  if (!wrap) return;
+  const tip = $('.ch-tip', wrap);
+  const pts = series.points || [];
+  const day = (d) => new Date(`${d}T00:00:00`).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+  wrap.addEventListener('mousemove', (e) => {
+    const hit = e.target.closest('[data-i]');
+    if (!hit) return;
+    const p = pts[Number(hit.dataset.i)];
+    tip.innerHTML = `<b>${esc(day(p.date))}</b><span>${Number(p.value).toLocaleString()} ${esc(series.unit || '')}</span>`;
+    tip.hidden = false;
+    const box = wrap.getBoundingClientRect(); const hb = hit.getBoundingClientRect();
+    tip.style.left = `${Math.min(box.width - tip.offsetWidth, Math.max(0, hb.left - box.left + hb.width / 2 - tip.offsetWidth / 2))}px`;
+    tip.style.top = '0px';
+  });
+  wrap.addEventListener('mouseleave', () => { tip.hidden = true; });
+}
+
+async function renderServiceDashboard(mount, route, { slug }) {
+  const d = await api.get(`/staff/services/${encodeURIComponent(slug)}/dashboard`);
+  $('#pageTitle').textContent = d.service.name;
+  const sv = d.service;
+  const [tone, label] = SVC_STATUS[sv.status] || ['mute', sv.status || 'Unknown'];
+  const facts = [sv.version ? `Version ${sv.version}` : null,
+    sv.scheduler?.last_run_at ? `scheduler ran ${fmtAgo(sv.scheduler.last_run_at)}` : null,
+    sv.checked_at ? `checked ${fmtAgo(sv.checked_at)}` : null].filter(Boolean).join(' · ');
+  const cols = d.columns;
+  const rowHtml = (c) => `<tr class="click" data-account="${esc(c.account_id)}" data-name="${esc(c.name.toLowerCase())}">
+    <td><b>${esc(c.name)}</b></td><td>${esc(c.plan || '—')}</td><td>${statusPill(c.status)}</td>
+    ${cols.map((col) => `<td class="${col.kind === 'usage' || col.kind === 'number' ? 'nowrap' : ''}">${cell(col.kind, c.values[col.key])}</td>`).join('')}</tr>`;
+  mount.innerHTML = `
+    <div class="svc-head-row">${tag(tone, label)}<span class="muted">${esc(facts)}</span></div>
+    ${sv.status === 'unavailable' ? banner('The Service Is Not Answering', sv.error || 'Its figures will show once it answers again.', 'bad') : ''}
+    ${!sv.has_dashboard && sv.status !== 'unavailable' ? banner('No Figures From This Service Yet', 'It does not report a dashboard; only its customers are listed.', 'warn') : ''}
+    <div class="kpis" style="grid-template-columns:repeat(${Math.min(5, Math.max(1, d.tiles.length))},minmax(0,1fr))">
+      ${d.tiles.map((t) => kpi({ icon: t.icon || 'server', tone: t.tone || 'acc', label: t.label,
+        value: typeof t.value === 'number' ? t.value.toLocaleString() : (t.value ?? '—') })).join('')}
+    </div>
+    ${d.series || d.attention.length ? `<div class="ov-row2">
+      ${d.series ? `<div class="card"><div class="card-head"><h2>${esc(d.series.title || 'Activity')}</h2>${d.series.subtitle ? `<span class="hint">${esc(d.series.subtitle)}</span>` : ''}</div>${dailyBars(d.series)}</div>` : ''}
+      <div class="card"><div class="card-head"><h2>Needs Attention</h2></div>
+        ${d.attention.length ? `<ul class="alerts">${d.attention.map((i) => incidentRow({ ...i, issue: i.title, service: null,
+          severity: SEVERITY[i.severity] ? i.severity : 'medium' })).join('')}</ul>` : empty('Nothing Needs Attention', '')}</div>
+    </div>` : ''}
+    <div class="card" style="margin-top:14px"><div class="card-head"><h2>Customers</h2>
+      <input type="search" id="svcSearch" placeholder="Search customers" style="max-width:260px"></div>
+      ${d.customers.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Customer</th><th>Plan</th><th>Status</th>${cols.map((c) => `<th>${esc(c.label)}</th>`).join('')}</tr></thead>
+        <tbody>${d.customers.map(rowHtml).join('')}</tbody></table></div>` : empty('No Customers Yet', '')}</div>`;
+  if (d.series) wireBars(mount, d.series);
+  $('#svcSearch', mount)?.addEventListener('input', (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    $$('tr[data-name]', mount).forEach((tr) => { tr.hidden = !!q && !tr.dataset.name.includes(q); });
+  });
+  mount.onclick = (e) => {
     const row = e.target.closest('[data-account]');
     if (row) window.location.hash = `#/accounts/${row.dataset.account}`;
-  });
+  };
 }
 
 /* =========================================================================
@@ -196,20 +424,20 @@ async function renderAccount(mount, route, { id }) {
     <div class="card" style="margin-top:14px">
       <div class="card-head"><h2>Services</h2><div class="actions">${missing.length ? '<button class="sm primary" id="addSvc">Add Service</button>' : ''}</div></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Service</th><th>Package</th><th>Status</th><th>Trial ends</th><th>Limits</th><th>Service told</th><th></th></tr></thead>
+        <thead><tr><th>Service</th><th>Package</th><th>Status</th><th>Trial ends</th><th>Limits</th><th></th></tr></thead>
         <tbody>${a.services.map((r) => `<tr>
           <td><strong>${esc(r.service.name)}</strong></td>
           <td>${esc(r.package?.name || '—')}${r.billed ? ' <span class="pill">billed</span>' : ''}</td>
           <td>${statusPill(r.status)}</td>
           <td>${esc(r.trial_ends_at ? fmtDate(r.trial_ends_at) : '—')}</td>
-          <td class="muted">${esc(Object.entries(r.entitlements).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v ?? '∞'}`).join(', ') || '—')}
+          <td class="muted">${esc(limitsText(r.entitlements))}
             ${r.entitlement_overrides ? '<span class="pill warn">custom</span>' : ''}</td>
-          <td>${r.in_sync ? `<span class="pill ok">Yes</span>` : `<span class="pill warn" title="${esc(r.provision_error || '')}">Pending</span>`}</td>
           <td class="right nowrap">
+            ${r.in_sync ? '' : `<span class="pill warn" title="${esc(r.provision_error || 'The service has not confirmed the latest change yet.')}">Not Synced</span>`}
             <button class="sm" data-manage="${esc(r.service.slug)}">Manage</button>
-            <button class="sm" data-usage="${esc(r.service.slug)}">Usage</button>
-            <button class="sm" data-resync="${esc(r.service.slug)}">Resend</button></td></tr>`).join('')
-          || `<tr><td colspan="7">${empty('No Services', '')}</td></tr>`}</tbody>
+            ${r.in_sync ? `<a class="btn sm" href="#/service/${esc(r.service.slug)}">Open Dashboard</a>`
+              : `<button class="sm" data-resync="${esc(r.service.slug)}">Resend</button>`}</td></tr>`).join('')
+          || `<tr><td colspan="6">${empty('No Services', '')}</td></tr>`}</tbody>
       </table></div>
     </div>
     <div class="grid cols-2" style="margin-top:14px">
@@ -229,7 +457,7 @@ async function renderAccount(mount, route, { id }) {
     <div class="card" style="margin-top:14px"><div class="card-head"><h2>Odoo</h2></div>
       ${(a.odoo || []).length ? `<table><tbody>${a.odoo.map((c) => `<tr>
           <td>${esc(c.url)}<div class="hint">${esc(c.db)} · ${esc(c.login)}${c.version ? ` · Odoo ${esc(c.version)}` : ''}</div></td>
-          <td>${c.status === 'connected' ? '<span class="pill ok">Connected</span>' : c.status === 'failed' ? `<span class="pill bad" title="${esc(c.status_message || '')}">Not Working</span>` : '<span class="pill mute">Not Checked</span>'}</td>
+          <td>${c.status === 'connected' ? '<span class="pill ok">Connected</span>' : c.status === 'failed' ? `<span class="pill bad" title="${esc(c.status_message || '')}">Failed</span>` : '<span class="pill mute">Not Checked</span>'}</td>
           <td>${c.services.map((sv) => `${esc(sv.name)}: ${sv.ready === true ? 'ready' : sv.ready === false ? esc(sv.message || 'not ready') : 'not checked'}`).join('<br>') || '—'}</td>
         </tr>`).join('')}</tbody></table>` : empty('No Odoo Connected', '')}
     </div>
@@ -280,11 +508,6 @@ async function renderAccount(mount, route, { id }) {
   $$('[data-resync]', mount).forEach((b) => b.addEventListener('click', () => guard(async () => {
     const r = await api.post(`/staff/accounts/${id}/services/${b.dataset.resync}/resync`);
     toast(r.message, 'ok'); reload();
-  })));
-  $$('[data-usage]', mount).forEach((b) => b.addEventListener('click', () => guard(async () => {
-    const u = await api.get(`/staff/accounts/${id}/services/${b.dataset.usage}/usage`);
-    await dialog({ title: 'Usage', submitLabel: 'Close',
-      body: `<dl class="kv">${Object.entries(u).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${esc(typeof v === 'object' && v ? JSON.stringify(v) : v ?? '—')}</dd>`).join('')}</dl>` });
   })));
   $$('[data-link]', mount).forEach((b) => b.addEventListener('click', () => guard(async () => {
     const r = await api.post(`/staff/accounts/${id}/users/${b.dataset.link}/resend`);
@@ -414,6 +637,20 @@ const LIMIT_FIELDS = {
     { key: 'min_sync_interval_minutes', label: 'Fastest sync (min)', help: 'The fastest interval a customer on this package can choose.' },
   ],
 };
+
+/** Entitlements as people read them: "2 devices · 50 employees · sync every 15 min". */
+const LIMIT_TEXT = {
+  max_devices: (v) => (v == null ? 'Unlimited devices' : `${v} device${v === 1 ? '' : 's'}`),
+  max_employees: (v) => (v == null ? 'unlimited employees' : `${v} employee${v === 1 ? '' : 's'}`),
+  max_seats: (v) => (v == null ? 'Unlimited seats' : `${v} seat${v === 1 ? '' : 's'}`),
+  min_sync_interval_minutes: (v) => (v == null ? 'any sync interval' : `sync every ${v} min`),
+};
+function limitsText(ent) {
+  const parts = Object.entries(ent || {}).map(([k, v]) => (LIMIT_TEXT[k] ? LIMIT_TEXT[k](v) : `${k.replace(/_/g, ' ')}: ${v ?? 'unlimited'}`));
+  if (!parts.length) return '—';
+  parts[0] = parts[0][0].toUpperCase() + parts[0].slice(1);
+  return parts.join(' · ');
+}
 
 const dollars = (cents) => (cents == null ? '' : cents / 100);
 const cents = (v) => (v == null || v === '' ? null : Math.round(Number(v) * 100));
@@ -546,16 +783,15 @@ async function renderCatalog(mount) {
             <button class="sm primary" data-new-pkg="${esc(s.id)}">New Package</button></div></div>
         <p class="hint">${esc(s.base_url)}${s.internal_url ? ` · internal ${esc(s.internal_url)}` : ''}${s.has_client_secret ? '' : ' · <strong>no client secret yet</strong>'}</p>
         <div class="table-wrap"><table>
-          <thead><tr><th>Package</th><th class="num">Monthly</th><th class="num">Yearly</th><th>Stripe</th><th>Entitlements</th><th>Trial</th><th></th></tr></thead>
+          <thead><tr><th>Package</th><th class="num">Monthly</th><th class="num">Yearly</th><th>Stripe</th><th>Limits</th><th></th></tr></thead>
           <tbody>${s.packages.map((p) => `<tr>
             <td><strong>${esc(p.name)}</strong> ${p.is_default ? '<span class="pill ok">Recommended</span>' : ''}${!p.is_active ? ' <span class="pill mute">Retired</span>' : ''}</td>
             <td class="num">${money(p.monthly_price_cents, p.currency)}</td><td class="num">${money(p.yearly_price_cents, p.currency)}</td>
             <td>${p.stripe_price_id ? '<span class="pill ok">Monthly</span>' : ''} ${p.stripe_yearly_price_id ? '<span class="pill ok">Yearly</span>' : ''}
               ${!p.stripe_price_id && !p.stripe_yearly_price_id ? '<span class="pill warn">Not buyable</span>' : ''}</td>
-            <td class="mono">${esc(JSON.stringify(p.entitlements))}</td>
-            <td>${p.trial_days ?? 'default'}</td>
+            <td>${esc(limitsText(p.entitlements))}</td>
             <td class="right"><button class="sm" data-edit-pkg="${esc(p.id)}">Edit</button></td></tr>`).join('')
-            || `<tr><td colspan="7">${empty('No Packages', '')}</td></tr>`}</tbody>
+            || `<tr><td colspan="6">${empty('No Packages', '')}</td></tr>`}</tbody>
         </table></div>
       </div>`).join('') || `<div class="card">${empty('No Services', 'Add the first one.')}</div>`}`;
   const reload = () => renderCatalog(mount);
@@ -600,13 +836,13 @@ async function renderClosures(mount) {
 async function renderTeam(mount) {
   const rows = await api.get('/staff/team');
   mount.innerHTML = `<div class="card">
-    <div class="card-head"><h2>Staff</h2><div class="actions"><button class="primary" id="add">Add Staff</button></div></div>
-    <table><thead><tr><th>Name</th><th>Email</th><th>Last sign-in</th><th>Status</th><th></th></tr></thead>
-    <tbody>${rows.map((s) => `<tr><td>${esc(s.full_name || '—')}${s.is_static ? ' <span class="pill">from settings</span>' : ''}</td>
+    <div class="card-head"><h2>Staff</h2><div class="actions"><button class="primary sm" id="add">Add Staff</button></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Last sign-in</th><th>Status</th></tr></thead>
+    <tbody>${rows.map((s) => `<tr class="click" data-staff="${esc(s.id)}">
+      <td><b>${esc(s.full_name || '—')}</b>${s.id === state.me.id ? ' <span class="hint">(you)</span>' : ''}${s.is_static ? ' <span class="pill mute">From settings</span>' : ''}</td>
       <td>${esc(s.email)}</td><td>${esc(s.last_login_at ? fmtAgo(s.last_login_at) : 'never')}</td>
-      <td>${s.is_active ? '<span class="pill ok">Active</span>' : '<span class="pill mute">Disabled</span>'}</td>
-      <td class="right">${s.id !== state.me.id ? `<button class="sm" data-toggle="${esc(s.id)}" data-active="${s.is_active}">${s.is_active ? 'Disable' : 'Enable'}</button>` : ''}</td></tr>`).join('')}</tbody>
-    </table></div>`;
+      <td>${s.is_active ? '<span class="pill ok">Active</span>' : '<span class="pill mute">Disabled</span>'}</td></tr>`).join('')}</tbody>
+    </table></div></div>`;
   $('#add', mount).addEventListener('click', async () => {
     const ok = await dialog({ title: 'Add Staff', submitLabel: 'Add',
       body: `${field({ name: 'full_name', label: 'Name' })}${field({ name: 'email', label: 'Email', type: 'email', required: true })}
@@ -614,15 +850,55 @@ async function renderTeam(mount) {
       onSubmit: (form) => api.post('/staff/team', readForm(form)) });
     if (ok) renderTeam(mount);
   });
-  $$('[data-toggle]', mount).forEach((b) => b.addEventListener('click', () => guard(async () => {
-    await api.patch(`/staff/team/${b.dataset.toggle}`, { is_active: b.dataset.active !== 'true' });
-    renderTeam(mount);
-  })));
+  mount.onclick = (e) => {
+    const tr = e.target.closest('[data-staff]');
+    if (!tr) return;
+    const s = rows.find((x) => x.id === tr.dataset.staff);
+    const self = s.id === state.me.id;
+    guard(async () => {
+      const ok = await dialog({
+        title: 'Edit Staff', submitLabel: 'Save',
+        body: `${field({ name: 'full_name', label: 'Name', value: s.full_name || '', required: true })}
+          <div class="field"><label>Email</label><div class="wiz-fixed">${esc(s.email)}</div></div>
+          ${self ? '' : field({ name: 'is_active', label: 'Status', value: String(s.is_active), boolean: true, required: true,
+            options: [{ value: 'true', label: 'Active' }, { value: 'false', label: 'Disabled: cannot sign in' }] })}
+          <div class="section-title" style="margin-top:6px">Change Password</div>
+          ${s.is_static
+            ? '<p class="hint">This login comes from STAFF_EMAIL and STAFF_PASSWORD in the settings; change its password there.</p>'
+            : `${self ? field({ name: 'current_password', label: 'Current password', type: 'password' }) : ''}
+              ${field({ name: 'password', label: 'New password', type: 'password',
+                help: 'Leave blank to keep it. At least 10 characters, mixed case and a number.' })}
+              ${field({ name: 'confirm', label: 'Confirm password', type: 'password' })}`}`,
+        onSubmit: async (form) => {
+          const v = readForm(form);
+          const body = { full_name: v.full_name };
+          if (!self) body.is_active = v.is_active;
+          if (v.password) {
+            if (v.password !== v.confirm) throw new Error('The new passwords do not match.');
+            body.password = v.password;
+            if (self) body.current_password = v.current_password || '';
+          }
+          return api.patch(`/staff/team/${s.id}`, body);
+        },
+      });
+      if (ok) {
+        toast('Saved.', 'ok');
+        if (self) { state.me = { ...state.me, full_name: ok.full_name }; route(); } else renderTeam(mount);
+      }
+    });
+  };
 }
 
 /* =========================================================================
  * Router
  * ====================================================================== */
+/** The signed-in staff member in the top bar (amber, so it never reads as a customer's tag). */
+function staffChip(me) {
+  const name = (me?.full_name || '').trim() || me?.email || 'Staff';
+  return `<span class="account-chip staff-chip" title="${esc(`Staff console · ${me?.email || ''}`)}">
+    <span class="account-initial" aria-hidden="true">${esc(name[0].toUpperCase())}</span><span class="account-name">${esc(name)}</span></span>`;
+}
+
 const PAGES = [
   { path: '/overview', title: 'Overview', icon: 'overview', render: renderOverview },
   { path: '/accounts', title: 'Accounts', icon: 'accounts', render: renderAccounts },
@@ -632,7 +908,8 @@ const PAGES = [
   { path: '/closed', title: 'Closed Accounts', icon: 'closed', render: renderClosures },
   { path: '/team', title: 'Staff', icon: 'people', render: renderTeam },
 ];
-const DETAIL = [{ pattern: '/accounts/:id', title: 'Account', render: renderAccount }];
+const DETAIL = [{ pattern: '/accounts/:id', title: 'Account', render: renderAccount },
+  { pattern: '/service/:slug', title: 'Service', render: renderServiceDashboard }];
 
 let running = false;
 let again = false;
@@ -653,10 +930,13 @@ async function route() {
         if (m) { page = d; params = m; break; }
       }
     }
+    let navServices = [];
+    try { navServices = (await services()).map((sv) => ({ path: `/service/${sv.slug}`, title: sv.name, icon: 'grid' })); } catch { /* the nav still works without them */ }
     mountShell({
-      nav: [{ label: 'Console', items: PAGES }],
+      nav: [{ label: 'Console', items: PAGES },
+        ...(navServices.length ? [{ label: 'Services', items: navServices }] : [])],
       user: state.me.email,
-      pill: '<span class="pill warn">staff console</span>',
+      pill: staffChip(state.me),
       onSignOut: async () => { await signOut(); state.me = null; unmountShell(); route(); },
     });
     $('#pageTitle').textContent = page ? page.title : 'Not Found';

@@ -17,8 +17,8 @@ def friendly_odoo_message(exc: Exception) -> str:
     low = text.lower()
 
     if isinstance(exc, UnsafeTargetError):
-        return ("Connection failed. This address is on a private network and BioBridge has no agent route for it. "
-                "In OdooBridger, open Odoo and save the connection again.")
+        return ("Connection failed. This address is on a private network and can't be reached from the internet. "
+                "Use the public address of your Odoo, with its port forwarded.")
 
     if isinstance(exc, OdooAuthError) or "rejected the credentials" in low or "refused the authentication" in low:
         if "no database named" in low:

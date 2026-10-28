@@ -87,18 +87,10 @@ it writes).
   (`ODOO_ALLOW_PRIVATE_TARGETS`), so a customer can't make it call internal hosts.
   BioBridge in platform mode does the same by default (`ALLOW_PRIVATE_NETWORK_TARGETS`).
 * **A private Odoo or biometric devices** (on-premise, behind NAT) are reached
-  through the **OdooBridger Agent** (`agent/`). The customer runs it once with
-  only its key; it dials out to the core's relay hub (`/relay/v1/agent`). What
-  it may reach is managed in the core (`RelayAgent.managed_allowed`, `host:port`
-  or `network@ports`) and pushed to the running agent live: connecting an Odoo
-  through it adds the Odoo's address, BioBridge adds a device's address when it
-  is tested or saved (`POST /api/v1/relay/agents/{id}/addresses`), and the
-  portal can add or remove addresses. The agent itself still keeps to private
-  addresses (and to `OB_ALLOW` if set on its computer). When an agent comes
-  online the core re-tests its Odoo connections and asks services to re-check.
-  Services send web calls with `POST /api/v1/relay/forward` (Odoo `connection_id`
-  or the account's `agent_id`) and a terminal's raw TCP over
-  `WS /api/v1/relay/stream?account_id&agent_id&host&port`. See `agent/README.md`.
+  the way any public server is: the customer sets up a public IP or domain
+  with the port forwarded, and enters it as the address. There is no relay or
+  agent. A ZKTeco terminal that can't be forwarded can use the *Cloud push
+  device* option instead, which dials out by itself.
 
 **SSO** — the portal's "Open" button, or a service sending a signed-out visitor
 to `/app/#/open/<slug>?redirect_uri=…&state=…`:
@@ -174,13 +166,6 @@ Services & Packages, and add Stripe price ids). Production:
 `-f deploy/docker-compose.prod.yml` puts Caddy in front with HTTPS for
 `SITE_DOMAIN`, `CORE_DOMAIN` and `BIOMETRIC_DOMAIN`, plus the plain-HTTP ADMS
 port for ZKTeco push terminals.
-
-**Demo service.** To see a customer with several services, run
-`python3 deploy/make-env.py --demo` (adds `DEMO_CLIENT_SECRET`) and start with
-`docker compose -f deploy/docker-compose.yml --profile demo up -d --build`.
-"Team Desk (Demo)" appears on the website, signup and portal beside Biometric
-Attendance, on http://localhost:8002. It is one file (`services/demo/app.py`)
-and also shows what a service must implement.
 
 Without `SMTP_HOST` emails are written to the core's log (handy locally: the
 set-password link is there).

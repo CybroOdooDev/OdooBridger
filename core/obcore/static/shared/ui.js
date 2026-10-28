@@ -541,3 +541,60 @@ export function viewSwitchHtml(items, current) {
   return `<div class="view-switch" role="group" aria-label="View">${items.map(([key, label]) =>
     `<button type="button" data-view="${esc(key)}" aria-pressed="${key === current}" aria-label="${esc(label)} view" title="${esc(label)}">${key === 'list' ? LIST_ICON : TILES_ICON}</button>`).join('')}</div>`;
 }
+
+/* ---- figure cards with an icon ------------------------------------------ */
+const KPI_ICONS = {
+  users: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.8-3.2 3-5 5.5-5s4.7 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M16 14c2.4 0 4 1.5 4.6 4"/>',
+  card: '<rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="M3 10h18M7 15h4"/>',
+  money: '<path d="M12 3v18M16.5 7.5c0-1.7-2-3-4.5-3s-4.5 1.3-4.5 3 2 2.6 4.5 3 4.5 1.3 4.5 3-2 3-4.5 3-4.5-1.3-4.5-3"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  server: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
+  mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 6.5l8.5 6.5 8.5-6.5"/>',
+  device: '<rect x="6" y="3" width="12" height="18" rx="2"/><circle cx="12" cy="10" r="3"/><path d="M10 17h4"/>',
+  badge: '<circle cx="12" cy="8" r="3.2"/><path d="M5.5 20c.9-3.6 3.4-5.6 6.5-5.6s5.6 2 6.5 5.6"/>',
+  check: '<path d="M4 12.5 9 17.5 20 6.5"/>',
+  clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  trophy: '<path d="M8 4h8v5a4 4 0 0 1-8 0zM8 6H5a3 3 0 0 0 3 4M16 6h3a3 3 0 0 1-3 4M12 13v4M8.5 20h7M10 17h4"/>',
+  percent: '<path d="M19 5 5 19"/><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/>',
+  alert: '<path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4M12 17h.01"/>',
+};
+export const kpiIcon = (n) => `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${KPI_ICONS[n] || ''}</svg>`;
+
+/** A figure card with an icon (staff overview, leads). */
+export function kpi({ icon, tone, label, value, badgeHtml = '', note, href }) {
+  const inner = `<div class="kpi-ic ${tone}">${kpiIcon(icon)}</div>
+    <div class="kpi-body"><div class="kpi-k">${esc(label)}</div>
+      <div class="kpi-v">${esc(value)}${badgeHtml}</div>${note ? `<div class="kpi-n">${note}</div>` : ''}</div>`;
+  return href ? `<a class="kpi" href="${esc(href)}">${inner}</a>` : `<div class="kpi">${inner}</div>`;
+}
+
+
+
+/* ---- money input ------------------------------------------------------------ */
+/** An amount in dollars: a currency prefix, digits and one decimal point only,
+ * shown with thousands separators once you leave the box. Read it back with
+ * parseMoney(), which gives cents (or null when empty). */
+const fmtMoneyText = (cents) => (cents == null ? '' : (cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+export function moneyInput({ id, name, value_cents = null, placeholder = '0.00' }) {
+  return `<div class="money-input"><span class="money-cur" aria-hidden="true">$</span>
+    <input ${id ? `id="${esc(id)}"` : ''} ${name ? `name="${esc(name)}"` : ''} type="text" inputmode="decimal" autocomplete="off"
+      data-money value="${esc(fmtMoneyText(value_cents))}" placeholder="${esc(placeholder)}"><span class="money-code">USD</span></div>`;
+}
+export function parseMoney(text) {
+  const clean = String(text ?? '').replace(/[^0-9.]/g, '');
+  if (!clean) return null;
+  const n = Number(clean);
+  return Number.isFinite(n) ? Math.round(n * 100) : null;
+}
+document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (!el.matches?.('input[data-money]')) return;
+  let v = el.value.replace(/[^0-9.,]/g, '');
+  const first = v.indexOf('.');
+  if (first >= 0) v = v.slice(0, first + 1) + v.slice(first + 1).replace(/\./g, '').slice(0, 2);
+  if (v !== el.value) el.value = v;
+});
+document.addEventListener('focusout', (e) => {
+  const el = e.target;
+  if (el.matches?.('input[data-money]')) el.value = fmtMoneyText(parseMoney(el.value));
+});

@@ -68,7 +68,6 @@ def _ago(when: datetime | None) -> str:
 @register
 class ZKAdmsProvider(AttendanceProvider):
     slug = "zk_adms"
-    relay_capable = False
     label = "Cloud push device (ZKTeco ADMS)"
     description = (
         "A ZKTeco terminal (or eSSL, Realtime, Biomax and other ZKTeco-built "

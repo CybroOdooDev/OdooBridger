@@ -94,9 +94,6 @@ class OdooConnection(Base, UUIDPk, Timestamped):
     #: Address, database, login and key then come from OdooBridger and can't
     #: be edited here; the company switches stay BioBridge's own.
     platform_connection_id: Mapped[str | None] = mapped_column(String(32), index=True)
-    #: Platform mode, a private Odoo: reached through the customer's
-    #: OdooBridger Agent via the core's relay (app.integrations.relay).
-    relay_agent_id: Mapped[str | None] = mapped_column(String(32))
 
     @property
     def managed(self) -> bool:
@@ -181,11 +178,6 @@ class DeviceSource(Base, UUIDPk, Timestamped):
     def default_company_id(self) -> int | None:
         """Company its terminals inherit; kept in ``config`` (no column)."""
         return (self.config or {}).get("company_id")
-
-    @property
-    def relay_agent_id(self) -> str | None:
-        """The customer's OdooBridger Agent this device is reached through (platform mode)."""
-        return (self.config or {}).get("relay_agent_id") or None
 
     @property
     def default_company_name(self) -> str | None:

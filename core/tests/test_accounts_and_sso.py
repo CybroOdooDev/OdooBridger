@@ -187,22 +187,44 @@ def test_pages_are_served(client):
         assert client.get(path).status_code == 200, path
 
 
-def test_demo_service_is_registered_only_when_its_secret_is_set(client, monkeypatch):
+def test_old_demo_service_is_removed_at_boot(client, catalog):
     from sqlalchemy import select
 
+    from obcore.db import SessionLocal
+    from obcore.models import AccountService, Service, ServicePackage
+    from obcore.services.catalog import retire_demo
+
+    signup(client)
+    db = SessionLocal()
+    demo = Service(slug="demo", name="Team Desk (Demo)", base_url="http://localhost:8002")
+    db.add(demo)
+    db.flush()
+    package = ServicePackage(service_id=demo.id, name="Plus", monthly_price_cents=1900)
+    db.add(package)
+    db.flush()
+    other = db.scalars(select(AccountService)).first()
+    db.add(AccountService(account_id=other.account_id, service_id=demo.id, package_id=package.id,
+                          status="trialing"))
+    db.commit()
+
+    retire_demo(db)
+    db.commit()
+    assert db.scalar(select(Service).where(Service.slug == "demo")) is None
+    assert [r.service.slug for r in db.scalars(select(AccountService))] == ["biometric"]
+    db.close()
+
+
+def test_biometric_service_is_named_biobridge(client, monkeypatch):
     from obcore.config import settings
     from obcore.db import SessionLocal
     from obcore.models import Service
-    from obcore.services.catalog import ensure_demo
+    from obcore.services.catalog import ensure_biometric
 
+    monkeypatch.setattr(settings, "biometric_client_secret", "s3cret")
     db = SessionLocal()
-    monkeypatch.setattr(settings, "demo_client_secret", "")
-    assert ensure_demo(db) is None
-    monkeypatch.setattr(settings, "demo_client_secret", "s3cret")
-    svc = ensure_demo(db)
+    db.add(Service(slug="biometric", name="Biometric Attendance", base_url="http://x"))
     db.commit()
-    assert svc.slug == "demo" and svc.sso_callback_path == "/sso"
-    assert db.scalar(select(Service).where(Service.slug == "demo")).packages[0].entitlements == {"max_seats": 3}
+    assert ensure_biometric(db).name == "BioBridge"
     db.close()
 
 

@@ -120,8 +120,6 @@ client_factory: Callable[[], httpx.Client] = lambda: httpx.Client(
 
 def _unreachable(url: str, exc: Exception) -> OdooProbeError:
     text = str(exc)
-    if text.startswith("The OdooBridger Agent"):
-        return OdooProbeError(text)   # already says what to do
     if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, socket.timeout, TimeoutError)):
         return OdooProbeError(f"{url} did not answer in time. Check the address and that Odoo is running.")
     if "Name or service not known" in text or "getaddrinfo" in text or "nodename nor servname" in text:
@@ -213,27 +211,14 @@ def _xmlrpc(client: httpx.Client, url: str, endpoint: str, method: str, params: 
     return value
 
 
-def relay_client(agent_id: str) -> httpx.Client:
-    """A client whose every request goes through the account's OdooBridger Agent."""
-    from obcore.services.relay import RelayTransport
-
-    return httpx.Client(transport=RelayTransport(agent_id), follow_redirects=False,
-                        headers={"User-Agent": "OdooBridger (connection test)"})
-
-
-#: Tests swap this for a fake agent.
-relay_client_factory: Callable[[str], httpx.Client] = relay_client
-
-
-def probe(url: str, db: str, login: str, api_key: str, *, agent_id: str | None = None) -> ProbeResult:
+def probe(url: str, db: str, login: str, api_key: str) -> ProbeResult:
     """Run the connection test. Raises OdooProbeError with a customer-readable message."""
     url = clean_url(url)
-    if agent_id is None:
-        check_target(url)   # through an agent, private addresses are the point
+    check_target(url)
     login = (login or "").strip()
     if not db or not login or not api_key:
         raise OdooProbeError("Enter the database, the login and the API key.")
-    with (relay_client_factory(agent_id) if agent_id else client_factory()) as client:
+    with client_factory() as client:
         version = _version(client, url)
         api = "json2" if version is None or _major(version) >= JSON2_MIN_MAJOR else "xmlrpc"
         if api == "json2":
