@@ -13,6 +13,7 @@ import { $, esc, fmtAgo, toast, wireSearchSelects, wireTips } from './ui.js';
 import { renderLogin, renderPlans, renderSignup } from './pages/auth.js';
 import { render as renderOverview } from './pages/overview.js';
 import { renderActivity, renderAttendance, renderEmployees } from './pages/data.js';
+import { render as renderReports } from './pages/reports.js';
 import { renderTerminals } from './pages/terminals.js';
 import { render as renderSettings } from './pages/settings.js';
 import { render as renderPlatform } from './pages/platform.js';
@@ -59,6 +60,8 @@ const ICON = {
   overview: '<path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-4H4zM14 4v4h6V4z"/>',
   attendance: '<rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4M8.5 14.5l2 2 4-4"/>',
   activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  // Bars on a baseline.
+  reports: '<path d="M4 20h16M7 16v-5M12 16V7M17 16v-8"/>',
   employees: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.8-3.2 3-5 5.5-5s4.7 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M16 14c2.4 0 4 1.5 4.6 4"/>',
   connections: '<path d="M9 7H6a4 4 0 0 0 0 8h3M15 7h3a4 4 0 0 1 0 8h-3M8 11h8"/>',
   terminals: '<rect x="6" y="2.5" width="12" height="19" rx="2"/><rect x="8.5" y="5.5" width="7" height="5" rx="1"/><circle cx="12" cy="15.5" r="2.2"/>',
@@ -90,6 +93,7 @@ const NAV = [
       { path: '/employees', title: 'Employees', badge: 'unmapped', icon: 'employees' },
       { path: '/terminals', title: 'Terminals', icon: 'terminals' },
       { path: '/activity', title: 'Activity', icon: 'activity' },
+      { path: '/reports', title: 'Reports', icon: 'reports' },
       // Settings, with its submenus nested under it (they unfold while you're in it).
       {
         path: '/settings/general', title: 'Settings', icon: 'settings', prefix: '/settings',
@@ -147,6 +151,7 @@ const ROUTES = {
   '/': { title: 'Overview', render: renderOverview },
   '/attendance': { title: 'Attendance', render: renderAttendance },
   '/activity': { title: 'Activity', render: renderActivity },
+  '/reports': { title: 'Reports', render: renderReports },
   '/employees': { title: 'Employees', render: renderEmployees },
   '/terminals': { title: 'Terminals', render: renderTerminals },
   '/get-started': { title: 'BioBridge Setup', render: renderGetStarted },

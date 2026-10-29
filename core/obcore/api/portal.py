@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
@@ -13,7 +15,7 @@ from obcore.api.out import account_out, odoo_out, user_out
 from obcore.db import get_db
 from obcore.models import AccountService, OdooConnection, Service, ServicePackage, ServiceStatus, User, UserRole
 from obcore.services import accounts as acc
-from obcore.services import billing, closing, provisioning
+from obcore.services import billing, closing, provisioning, reports
 from obcore.services import odoo_connections as odoo
 from obcore.services import stripe_api as stripe
 from obcore.api.public import public_services
@@ -86,6 +88,11 @@ def add_service(payload: ServiceIn, request: Request, customer: Customer = Depen
     package = db.get(ServicePackage, payload.package_id) if payload.package_id else None
     try:
         billing.add_service(db, customer.account, service, package)
+        db.flush()
+    except IntegrityError as exc:
+        # Added by another request at the same moment: that one won.
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{service.name} is already on this account.") from exc
     except (billing.SubscriptionError, stripe.BillingError) as exc:
         db.rollback()
         raise _fail(exc) from exc
@@ -97,6 +104,8 @@ def add_service(payload: ServiceIn, request: Request, customer: Customer = Depen
 
 class PackageIn(BaseModel):
     package_id: str
+    #: "now", or "period_end" to wait for the end of the paid period.
+    when: Literal["now", "period_end"] = "now"
 
 
 @router.patch("/services/{slug}")
@@ -109,12 +118,24 @@ def change_package(slug: str, payload: PackageIn, request: Request,
     if row.status == ServiceStatus.cancelled.value:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add the service again first.")
     try:
-        billing.change_package(db, row, package)
+        billing.change_package(db, row, package, when=payload.when)
     except (billing.SubscriptionError, stripe.BillingError) as exc:
         db.rollback()
         raise _fail(exc) from exc
-    acc.audit(db, customer.actor, "service.package", account_id=customer.account.id,
-              detail=f"{slug} -> {package.name}", request=request)
+    scheduled = payload.when == "period_end" and row.pending_package_id is not None
+    acc.audit(db, customer.actor, "service.package_scheduled" if scheduled else "service.package",
+              account_id=customer.account.id, detail=f"{slug} -> {package.name}", request=request)
+    _sync(db, customer)
+    return account_out(customer.account)
+
+
+@router.delete("/services/{slug}/pending-change")
+def cancel_pending_change(slug: str, request: Request, customer: Customer = Depends(require_manager),
+                          db: Session = Depends(get_db)) -> dict:
+    row = _row(customer, slug)
+    billing.clear_pending_change(row)
+    acc.audit(db, customer.actor, "service.package_unscheduled", account_id=customer.account.id,
+              detail=slug, request=request)
     _sync(db, customer)
     return account_out(customer.account)
 
@@ -257,6 +278,39 @@ def checkout(payload: CheckoutIn, customer: Customer = Depends(require_manager),
         raise _fail(exc) from exc
     db.commit()
     return {"url": url}
+
+
+# --- reports ----------------------------------------------------------------------
+@router.get("/reports/billing")
+def report_billing(customer: Customer = Depends(get_customer)) -> dict:
+    return reports.billing_history(customer.account)
+
+
+@router.get("/reports/usage")
+def report_usage(customer: Customer = Depends(get_customer), db: Session = Depends(get_db)) -> dict:
+    return {"services": reports.plan_usage(db, customer.account)}
+
+
+@router.get("/reports/activity")
+def report_activity(days: int = 90, customer: Customer = Depends(require_manager),
+                    db: Session = Depends(get_db)) -> dict:
+    """Who did what on the account. Owners and admins only: it names people and addresses."""
+    return reports.activity(db, customer.account, max(1, min(days, 730)))
+
+
+@router.post("/billing/free-trial")
+def free_trial(request: Request, customer: Customer = Depends(require_manager),
+               db: Session = Depends(get_db)) -> dict:
+    """Take the free trial days a customer who paid at registration is offered."""
+    try:
+        days = billing.claim_trial_bonus(db, customer.account)
+    except (billing.SubscriptionError, stripe.BillingError) as exc:
+        db.rollback()
+        raise _fail(exc) from exc
+    acc.audit(db, customer.actor, "billing.free_trial", account_id=customer.account.id, request=request,
+              detail=f"{days} days")
+    db.commit()
+    return account_out(customer.account)
 
 
 @router.post("/billing/interval")

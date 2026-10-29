@@ -35,7 +35,11 @@ class Timestamped:
 def _engine(url: str):
     if url.startswith("sqlite"):
         return create_engine(url, connect_args={"check_same_thread": False, "timeout": 20}, future=True)
-    return create_engine(url, pool_pre_ping=True, pool_size=10, max_overflow=20, future=True)
+    from obcore.config import settings
+
+    # Per process: with N workers the database sees up to N × (size + overflow).
+    return create_engine(url, pool_pre_ping=True, pool_size=settings.db_pool_size,
+                         max_overflow=settings.db_max_overflow, pool_timeout=settings.db_pool_timeout, future=True)
 
 
 engine = _engine(settings.database_url)

@@ -58,6 +58,9 @@ def sweep_once(db: Session) -> dict[str, int]:
                      f"Hi,\n\nThe free trial of {row.service.name} for {row.account.name} has ended, so it "
                      f"has stopped working. Your data is kept. Add payment details to carry on:\n"
                      f"{settings.base}/app/#/billing\n\n— OdooBridger\n")
+    for row in billing.apply_pending_changes(db):
+        audit(db, "system", "service.package", account_id=row.account_id,
+              detail=f"{row.service.slug} -> {row.package.name}")
     pushed = provisioning.push_pending(db)
     checked = refresh_odoo_readiness(db)
     notified = odoo_connections.notify_failures(db)
@@ -100,7 +103,12 @@ async def alert_loop() -> None:
 def _alert_tick() -> None:
     from obcore.services import alerts
 
+    from obcore import locks
+
     with session_scope() as db:
+        # One process checks; the others skip this round (no double alerts).
+        if not locks.try_for_transaction(db, locks.ALERTS):
+            return
         result = alerts.check(db)
         if any(result.values()):
             log.info("Alerts: %s", result)
@@ -111,6 +119,12 @@ def _tick() -> None:
         from obcore.services import stripe_api
 
         stripe_api.load_config(db)
+        from obcore import locks
+
+        # One process sweeps; the others skip this round (no double trial
+        # emails, no two pushes of the same account at once).
+        if not locks.try_for_transaction(db, locks.SWEEP):
+            return
         result = sweep_once(db)
         try:
             from obcore.services.ops import record_snapshot

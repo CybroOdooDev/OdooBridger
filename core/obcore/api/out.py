@@ -33,13 +33,12 @@ def service_out(s: Service, *, staff: bool = False) -> dict[str, Any]:
     packages = [p for p in s.packages if staff or p.is_active]
     out = {
         "id": s.id, "slug": s.slug, "name": s.name, "tagline": s.tagline, "description": s.description,
-        "base_url": s.base_url, "is_active": s.is_active, "is_public": s.is_public,
+        "uses_odoo": s.uses_odoo, "base_url": s.base_url, "is_active": s.is_active, "is_public": s.is_public,
         "packages": [package_out(p, staff=staff) for p in packages],
     }
     if staff:
         out.update(internal_url=s.internal_url, sso_callback_path=s.sso_callback_path,
-                   has_client_secret=bool(s.client_secret_hash), sort_order=s.sort_order,
-                   uses_odoo=s.uses_odoo)
+                   has_client_secret=bool(s.client_secret_hash), sort_order=s.sort_order)
     return out
 
 
@@ -47,11 +46,13 @@ def subscription_out(row: AccountService, *, staff: bool = False) -> dict[str, A
     out = {
         "id": row.id,
         "service": {"slug": row.service.slug, "name": row.service.name, "base_url": row.service.base_url,
-                    "tagline": row.service.tagline},
+                    "tagline": row.service.tagline, "uses_odoo": row.service.uses_odoo},
         "package": package_out(row.package) if row.package else None,
         "status": row.status,
         "trial_ends_at": iso(row.trial_ends_at),
         "billed": bool(row.stripe_item_id),
+        "pending_change": ({"package": package_out(row.pending_package), "at": iso(row.pending_change_at)}
+                           if row.pending_package_id and row.pending_package else None),
         "entitlements": row.effective_entitlements(),
         "cancelled_at": iso(row.cancelled_at),
     }
@@ -72,13 +73,15 @@ def user_out(u: User) -> dict[str, Any]:
 
 
 def account_out(a: Account, *, staff: bool = False) -> dict[str, Any]:
-    from obcore.services.billing import monthly_total_cents
+    from obcore.services.billing import monthly_total_cents, trial_bonus_days
 
     out = {
         "id": a.id, "name": a.name, "slug": a.slug, "status": a.status, "country": a.country,
         "timezone": a.timezone, "billing_interval": a.billing_interval,
         "pays_online": bool(a.stripe_subscription_id), "stripe_status": a.stripe_status,
         "renews_at": iso(a.renews_at), "cancel_at_period_end": a.cancel_at_period_end,
+        "free_trial_offer": {"days": days} if (days := trial_bonus_days(a)) else None,
+        "free_trial_added_days": a.trial_bonus_days if a.trial_bonus_at else None,
         "monthly_total_cents": monthly_total_cents(a),
         "created_at": iso(a.created_at),
         "services": [subscription_out(r, staff=staff) for r in sorted(a.services, key=lambda r: r.service.sort_order)],

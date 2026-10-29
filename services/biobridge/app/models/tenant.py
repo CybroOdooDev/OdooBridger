@@ -87,6 +87,9 @@ class Tenant(Base, UUIDPk, Timestamped):
     #: The Odoo database ("host|db") the employee links belong to. When the
     #: active Odoo becomes another database they are released (app.services.odoo_switch).
     odoo_identity: Mapped[str | None] = mapped_column(String(300))
+    #: How far BioBridge's copy of Odoo's attendance is up to date (Odoo's
+    #: write_date). Each sync reads only the records changed since.
+    odoo_attendance_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 
     # --- pairing policy, tenant-wide defaults --------------------------------
     pairing_mode: Mapped[str] = mapped_column(String(20), default="alternating")

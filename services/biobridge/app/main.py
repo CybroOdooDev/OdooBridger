@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import TimeoutError as SqlPoolTimeout
 
 from app.api import adms as adms_receiver
 from app.api import platform as platform_api
@@ -162,6 +163,15 @@ async def _provider_error(_: Request, exc: ProviderError) -> JSONResponse:
 @app.exception_handler(UnsafeTargetError)
 async def _unsafe_target(_: Request, exc: UnsafeTargetError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(SqlPoolTimeout)
+async def _busy(_: Request, exc: SqlPoolTimeout) -> JSONResponse:
+    """Every database connection of this process is in use: ask the client to
+    retry shortly rather than answer 500 for a moment of overload."""
+    log.warning("Database connection pool exhausted: %s", exc)
+    return JSONResponse(status_code=503, headers={"Retry-After": "2"},
+                        content={"detail": "The service is busy. Please try again in a moment."})
 
 
 @app.exception_handler(OperationalError)

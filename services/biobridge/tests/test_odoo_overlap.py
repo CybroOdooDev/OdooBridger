@@ -9,7 +9,9 @@ the same overlap rule and raises if the engine ever tries to write one.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+import pytest
+
+from datetime import datetime, timedelta
 
 from sqlalchemy import select
 
@@ -29,6 +31,7 @@ def _state(db, external_id):
     return db.scalars(select(PunchRecord).where(PunchRecord.external_id == external_id)).one()
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_checkin_inside_a_record_closed_at_the_limit_shortens_it(db, tenant, local_day, monkeypatch):
     odoo = FakeOdoo()
     att_id, rows = _first_open(db, tenant, odoo, local_day, monkeypatch)
@@ -66,6 +69,7 @@ def test_the_shortened_record_is_mirrored_locally(db, tenant, local_day, monkeyp
     assert abs(mirror.worked_hours - 2.0) < 0.01
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_checkin_inside_a_real_record_is_settled_not_retried(db, tenant, local_day, monkeypatch):
     odoo = FakeOdoo()
     att_id, rows = _first_open(db, tenant, odoo, local_day, monkeypatch)
@@ -160,6 +164,7 @@ def test_covering_ignores_an_open_record():
 # --------------------------------------------------------------------------- #
 # A record closed in Odoo behind BioBridge's back must stop showing as Open
 # --------------------------------------------------------------------------- #
+@pytest.mark.usefixtures("no_stale_close")
 def test_a_record_closed_in_odoo_is_closed_here_too(db, tenant, local_day, monkeypatch):
     odoo = FakeOdoo()
     att_id, rows = _first_open(db, tenant, odoo, local_day, monkeypatch)
@@ -176,6 +181,7 @@ def test_a_record_closed_in_odoo_is_closed_here_too(db, tenant, local_day, monke
     assert mirror.is_auto_closed is True
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_a_record_still_open_in_odoo_stays_open_here(db, tenant, local_day, monkeypatch):
     odoo = FakeOdoo()
     att_id, rows = _first_open(db, tenant, odoo, local_day, monkeypatch)
@@ -192,12 +198,14 @@ def test_stale_sweep_closes_the_local_record_too(db, tenant, local_day, monkeypa
 
     odoo = FakeOdoo()
     rows = [punch("in1", "1001", local_day.replace(hour=1), direction=True)]
+    real_clock = engine_mod.stale_clock
+    monkeypatch.setattr(engine_mod, "stale_clock", lambda: datetime(2000, 1, 1))   # the run leaves it open
     run(db, tenant, odoo, rows, monkeypatch)
     (att_id,) = odoo.attendances.keys()
     mirror = db.scalars(select(AttendanceRecord).where(AttendanceRecord.odoo_attendance_id == att_id)).one()
     assert mirror.check_out is None
 
-    monkeypatch.setattr(engine_mod, "build_odoo_client", lambda t, c: odoo)
+    monkeypatch.setattr(engine_mod, "stale_clock", real_clock)
     assert engine_mod.close_stale_attendances(db, tenant) == 1
 
     # Odoo and the local copy agree immediately — no later sync needed.
@@ -344,3 +352,57 @@ def test_one_failing_interval_does_not_fail_the_whole_batch(db, tenant, local_da
     message = _state(db, "in1").error_message
     assert message.startswith("Interval ") and "refused for the test" in message
     assert _state(db, "in1").attempts == 1
+
+
+# --------------------------------------------------------------------------- #
+# Shifts left open past the limit are closed by every sync, not only the sweep
+# --------------------------------------------------------------------------- #
+def test_every_sync_closes_shifts_open_past_the_limit(db, tenant, local_day, monkeypatch):
+    odoo = FakeOdoo()
+    # A first run makes the employee known (a whole shift, closed).
+    rows = [punch("a", "1001", local_day.replace(hour=1), direction=True),
+            punch("b", "1001", local_day.replace(hour=2), direction=False)]
+    run(db, tenant, odoo, rows, monkeypatch)
+    # Then a check-in nobody badges out of, entered in Odoo past the limit.
+    stale = (datetime.utcnow() - timedelta(hours=tenant.max_shift_hours + 5)).replace(microsecond=0)
+    att = odoo.create_attendance(11, stale, None)                 # FakeOdoo's "1001"
+    # The next run brings no new punch for them, and still closes it.
+    result = run(db, tenant, odoo, rows, monkeypatch)
+    rec = odoo.attendances[att]
+    assert rec["check_out"] == stale + timedelta(hours=tenant.max_shift_hours)
+    assert rec["auto_closed"] is True
+    assert result.attendances_closed >= 1
+
+
+def test_a_shift_inside_the_limit_is_left_open(db, tenant, local_day, monkeypatch):
+    from app.services import sync_engine as engine_mod
+
+    odoo = FakeOdoo()
+    run(db, tenant, odoo, [punch("m", "1001", local_day.replace(hour=1), direction=True)], monkeypatch)
+    att = odoo.create_attendance(11, datetime.utcnow() - timedelta(hours=tenant.max_shift_hours - 1), None)
+    monkeypatch.setattr(engine_mod, "build_odoo_client", lambda t, c: odoo)
+    engine_mod.close_stale_attendances(db, tenant)
+    assert odoo.attendances[att]["check_out"] is None
+
+
+# --------------------------------------------------------------------------- #
+# BioBridge's copy follows Odoo: records added or changed there show up here
+# --------------------------------------------------------------------------- #
+def test_records_added_or_changed_in_odoo_are_copied_here(db, tenant, local_day, monkeypatch):
+    odoo = FakeOdoo()
+    rows = [punch("a", "1001", local_day.replace(hour=8), direction=True),
+            punch("b", "1001", local_day.replace(hour=12), direction=False)]
+    run(db, tenant, odoo, rows, monkeypatch)
+    (ours,) = odoo.attendances.keys()
+
+    # In Odoo: our record is shortened, and another is entered by hand for the same person.
+    odoo.attendances[ours]["check_out"] = odoo.attendances[ours]["check_in"] + timedelta(hours=2)
+    manual = odoo.create_attendance(11, local_day.replace(hour=18), local_day.replace(hour=20))
+    run(db, tenant, odoo, rows, monkeypatch)
+
+    copies = {r.odoo_attendance_id: r for r in db.scalars(select(AttendanceRecord))}
+    assert copies[ours].check_out == odoo.attendances[ours]["check_out"]
+    assert copies[ours].origin == "biobridge" and abs(copies[ours].worked_hours - 2.0) < 0.01
+    assert copies[manual].origin == "odoo" and copies[manual].emp_code == "1001"
+    assert copies[manual].check_in == local_day.replace(hour=18) and abs(copies[manual].worked_hours - 2.0) < 0.01
+    assert tenant.odoo_attendance_synced_at is not None

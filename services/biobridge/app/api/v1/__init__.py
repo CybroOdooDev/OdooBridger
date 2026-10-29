@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends
 
 from app.api.deps import standalone_only
-from app.api.v1 import admin, auth, billing, connections, public, sync
+from app.api.v1 import admin, auth, billing, connections, public, reports, sync
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
 api_router.include_router(connections.router)
 api_router.include_router(sync.router)
+api_router.include_router(reports.router)
 # Platform mode: billing is the OdooBridger core's.
 api_router.include_router(billing.router, dependencies=[Depends(standalone_only)])
 # The marketing website's calls — no account needed. See app/api/v1/public.py.

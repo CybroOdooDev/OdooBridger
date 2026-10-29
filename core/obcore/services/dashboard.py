@@ -201,7 +201,7 @@ def overview(db: Session, period: str = "30d", *, fresh: bool = False) -> dict[s
     oldest = min((i["since"] for i in incidents if i["since"]), default=None)
     failing_customers |= {i["account_id"] for i in incidents if i["account_id"] and i["key"].startswith(("odoo:", "int:"))}
 
-    pending_signups = db.scalars(select(PendingSignup)).all()
+    pending_signups = db.scalars(select(PendingSignup).where(PendingSignup.sent_at.isnot(None))).all()   # not yet-to-pay ones
     unverified = sum(1 for p in pending_signups if aware(p.expires_at) > now)
     week = now + timedelta(days=7)
     trials_ending = sum(1 for r in live_rows if r.status == ServiceStatus.trialing.value

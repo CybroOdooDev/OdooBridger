@@ -213,6 +213,12 @@ class AttendanceRecord(Base, UUIDPk, Timestamped):
     is_late: Mapped[bool] = mapped_column(Boolean, default=False)
     late_minutes: Mapped[int] = mapped_column(Integer, default=0)
     notes: Mapped[str | None] = mapped_column(Text)
+    #: "biobridge" (written by a sync) or "odoo" (found in Odoo for a matched
+    #: employee: entered by hand, from a kiosk, or split there). Odoo is the
+    #: record of truth, so the copy here follows it either way.
+    origin: Mapped[str] = mapped_column(
+        String(10), default="biobridge", server_default=text("'biobridge'"), nullable=False
+    )
 
 
 class SyncRun(Base, UUIDPk, Timestamped):

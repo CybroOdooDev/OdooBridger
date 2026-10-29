@@ -57,6 +57,11 @@ class Account(Base, UUIDPk, Timestamped):
     stripe_status: Mapped[str | None] = mapped_column(String(24))
     renews_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    #: Paid at registration ("Buy Now"). Such an account can ask for its free
+    #: trial days once, which move the first renewal back without a charge.
+    paid_at_signup: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    trial_bonus_days: Mapped[int | None] = mapped_column(Integer)
+    trial_bonus_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     #: The lead this account came from, when staff converted one.
     lead_id: Mapped[str | None] = mapped_column(String(32))
@@ -132,7 +137,8 @@ class PendingSignup(Base, UUIDPk, Timestamped):
     customer, nothing sent to any service. Opening the link in the email
     (and choosing a password) turns this into the account; until then it
     only holds what the form said. Signing up again with the same email
-    replaces it and sends a new link.
+    replaces it and sends a new link. For "Buy Now" the order is reversed:
+    payment first, then the link (a paid signup is never discarded).
     """
 
     __tablename__ = "pending_signup"
@@ -152,6 +158,13 @@ class PendingSignup(Base, UUIDPk, Timestamped):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ip_address: Mapped[str | None] = mapped_column(String(64))
+    #: "Buy Now": the Checkout the visitor was sent to, and, once it is paid, the
+    #: Stripe customer and subscription the account will take over. The
+    #: confirmation link is emailed only after that payment.
+    stripe_checkout_id: Mapped[str | None] = mapped_column(String(120))
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64))
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(64))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class UserSession(Base, UUIDPk, Timestamped):
@@ -276,6 +289,10 @@ class AccountService(Base, UUIDPk, Timestamped):
     #: devices"). Kept across package changes.
     entitlement_overrides: Mapped[dict | None] = mapped_column(JSON)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: A package change the customer asked to make at the next renewal, and when it takes effect.
+    pending_package_id: Mapped[str | None] = mapped_column(
+        ForeignKey("service_package.id", ondelete="SET NULL"))
+    pending_change_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # --- provisioning: what the service last acknowledged ---------------------
     provisioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -295,7 +312,8 @@ class AccountService(Base, UUIDPk, Timestamped):
 
     account: Mapped[Account] = relationship(back_populates="services")
     service: Mapped[Service] = relationship()
-    package: Mapped[ServicePackage | None] = relationship()
+    package: Mapped[ServicePackage | None] = relationship(foreign_keys=[package_id])
+    pending_package: Mapped[ServicePackage | None] = relationship(foreign_keys=[pending_package_id])
     odoo_connection: Mapped["OdooConnection | None"] = relationship()
 
     @property

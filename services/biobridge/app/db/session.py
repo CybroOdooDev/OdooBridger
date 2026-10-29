@@ -27,7 +27,9 @@ if settings.database_url.startswith("sqlite"):
     _connect_args = {"check_same_thread": False, "timeout": 20}
     _engine_kwargs = {"future": True}
 else:
-    _engine_kwargs.update(pool_size=10, max_overflow=20)
+    # Per process: with N workers the database sees up to N × (size + overflow).
+    _engine_kwargs.update(pool_size=settings.db_pool_size, max_overflow=settings.db_max_overflow,
+                          pool_timeout=settings.db_pool_timeout)
 
 engine = create_engine(settings.database_url, connect_args=_connect_args, **_engine_kwargs)
 

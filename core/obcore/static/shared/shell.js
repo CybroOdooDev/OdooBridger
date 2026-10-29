@@ -4,6 +4,8 @@
 import { $, esc } from './ui.js';
 
 const ICONS = {
+  // Bars on a baseline.
+  reports: '<path d="M4 20h16M7 16v-5M12 16V7M17 16v-8"/>',
   grid: '<rect x="3" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5"/>',
   card: '<rect x="3" y="5.5" width="18" height="13" rx="2"/><path d="M3 10h18M7 15h4"/>',
   people: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.8-3.2 3-5 5.5-5s4.7 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M16 14c2.4 0 4 1.5 4.6 4"/>',
@@ -52,18 +54,52 @@ function paintTheme() {
 }
 
 /* ---- sign-in card -------------------------------------------------------- */
+/* The customer sign-in screens are split: a dark panel saying what
+ * OdooBridger is, beside the form. The staff console keeps the plain amber
+ * card on purpose, so the two can't be mistaken for each other. */
+const AUTH_SIDE = `
+  <aside class="auth-side" aria-hidden="true">
+    <div class="auth-side-brand"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></div>
+    <div class="auth-side-copy">
+      <h2>Connect the tools around your business to Odoo.</h2>
+      <ul>
+        <li><span class="auth-tick">✓</span>One Odoo connection, shared by every service</li>
+        <li><span class="auth-tick">✓</span>Biometric attendance straight into Odoo with BioBridge</li>
+        <li><span class="auth-tick">✓</span>One account, one login and one invoice</li>
+      </ul>
+    </div>
+    <p class="auth-side-foot">Trusted connections, kept in one place.</p>
+  </aside>`;
+
 export function authCard(inner, { badge = '', foot = '' } = {}) {
   $('#app-root').classList.add('hidden');
   const root = $('#auth-root');
   root.classList.remove('hidden');
+  if (badge) {
+    root.innerHTML = `
+      <div class="auth-wrap">
+        <div class="auth-card staff">
+          ${BRAND.replace('</div>', `<span class="pill warn">${esc(badge)}</span></div>`)}
+          ${inner}
+          <p class="err" id="authError"></p>
+        </div>
+        ${foot ? `<p class="auth-foot">${foot}</p>` : ''}
+      </div>`;
+    return root;
+  }
   root.innerHTML = `
-    <div class="auth-wrap">
-      <div class="auth-card${badge ? ' staff' : ''}">
-        ${BRAND.replace('</div>', `${badge ? `<span class="pill warn">${esc(badge)}</span>` : ''}</div>`)}
-        ${inner}
-        <p class="err" id="authError"></p>
+    <div class="auth-split">
+      <div class="auth-frame">
+        ${AUTH_SIDE}
+        <section class="auth-main">
+          <div class="auth-main-inner">
+            <div class="auth-mobile-brand">${BRAND}</div>
+            ${inner}
+            <p class="err" id="authError"></p>
+            ${foot ? `<p class="auth-foot">${foot}</p>` : ''}
+          </div>
+        </section>
       </div>
-      ${foot ? `<p class="auth-foot">${foot}</p>` : ''}
     </div>`;
   return root;
 }

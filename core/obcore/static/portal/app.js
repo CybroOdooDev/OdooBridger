@@ -6,6 +6,7 @@ import { $, $$, banner, empty, esc, field, guard, loading, readForm, timezoneNam
 import { detectZone } from '/site/geo.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
 import { multiSelect } from '/site/multiselect.js';
+import { renderReports } from './reports.js';
 
 const { api, session, restore, signOut } = makeClient('customer');
 const state = { me: null, account: null, available: [], stripe: false, catalog: null };
@@ -41,8 +42,7 @@ function renderLogin(route) {
       <p class="auth-alt" style="text-align:right;margin:-4px 0 12px"><a href="#/forgot-password">Forgot password?</a></p>
       <button class="primary" style="width:100%" id="go">Sign In</button>
     </form>
-    <p class="auth-alt">No account yet? <a href="/#pricing">Start a free trial</a></p>`,
-  { foot: '<a href="/staff/">Staff sign-in</a>' });
+    <p class="auth-alt">No account yet? <a href="/#pricing">Start a free trial</a></p>`);
   $('#form', root).addEventListener('submit', (e) => {
     e.preventDefault();
     submitting($('#go', root), async () => {
@@ -85,14 +85,14 @@ async function renderSetPassword(route) {
   authCard(`
     <h1>${info.signup ? 'Create Your Account' : first ? 'Choose Your Password' : 'Choose A New Password'}</h1>
     <p class="sub">${info.signup
-      ? `Your email is confirmed. Choose a password for ${esc(info.email)} to create ${esc(info.account)}${info.mode === 'buy' ? ', then go on to payment' : ' and start your free trial'}.`
+      ? `Your email is confirmed. Choose a password for ${esc(info.email)} to create ${esc(info.account)}${info.mode === 'buy' ? ' with the services you paid for' : ' and start your free trial'}.`
       : first ? `Welcome to OdooBridger. Your email is confirmed — set a password for ${esc(info.email)} (${esc(info.account)}).`
       : `For ${esc(info.email)}.`}</p>
     <form id="form">
       ${field({ name: 'password', label: 'New password', type: 'password', required: true,
         help: 'At least 10 characters, with upper and lower case letters and a number.' })}
       ${field({ name: 'confirm', label: 'Confirm password', type: 'password', required: true })}
-      <button class="primary" style="width:100%" id="go">${info.signup ? (info.mode === 'buy' ? 'Create Account And Pay' : 'Create Account') : first ? 'Save And Sign In' : 'Save Password'}</button>
+      <button class="primary" style="width:100%" id="go">${info.signup ? ('Create Account') : first ? 'Save And Sign In' : 'Save Password'}</button>
     </form>`);
   $('#form').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -156,16 +156,21 @@ function serviceCard(row) {
     row.status === 'trialing' && row.trial_ends_at ? ['Trial ends', esc(fmtDate(row.trial_ends_at))] : null,
   ].filter(Boolean);
   const live = row.status !== 'cancelled';
+  // A service that works from Odoo can't start until an Odoo is connected.
+  const needsSetup = live && s.uses_odoo && !(state.account.odoo || []).length;
   return `
-    <div class="svc-card" data-slug="${esc(s.slug)}">
+    <div class="svc-card${needsSetup ? ' needs-setup' : ''}" data-slug="${esc(s.slug)}">
       <div class="svc-head">
         <div class="svc-name">${esc(s.name)}</div>
         ${statusPill(row.status)}
       </div>
       <dl class="svc-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+      ${row.pending_change ? `<div class="hint">Changes to <strong>${esc(row.pending_change.package.name)}</strong> on ${esc(fmtDate(row.pending_change.at))}. ${
+        canManage() ? `<a href="#" data-cancel-change="${esc(s.slug)}">Cancel Change</a>` : ''}</div>` : ''}
       ${row.status === 'past_due' ? `<div class="hint" style="color:var(--bad)">${row.billed ? 'The last payment failed.' : 'The free trial has ended.'} <a href="#/billing">Pay to carry on</a>.</div>` : ''}
       <div class="svc-actions">
-        ${live ? `<button class="primary" data-open="${esc(s.slug)}">Open</button>` : ''}
+        ${live ? `<span class="setup-start"><button class="primary" data-open="${esc(s.slug)}">Open</button>${needsSetup
+          ? '<span class="setup-pointer" role="note"><span class="setup-pointer-arrow" aria-hidden="true"></span>Complete Setup To Begin</span>' : ''}</span>` : ''}
         ${live && canManage() ? `<button data-change="${esc(s.slug)}">Change Plan</button>` : ''}
         ${live && canManage() ? `<button class="icon-btn" style="margin-left:auto" data-remove="${esc(s.slug)}" title="Remove" aria-label="Remove ${esc(s.name)}">${TRASH}</button>` : ''}
         ${!live && canManage() ? `<button data-readd="${esc(s.slug)}">Add Again</button>` : ''}
@@ -253,13 +258,20 @@ async function changePackageDialog(slug) {
     title: `${service.name} — Change Plan`,
     wide: true,
     submitLabel: 'Change Plan',
-    body: `${packagePicker(service, row.package?.id, state.account.billing_interval)}
-      <p class="hint" style="margin-top:12px">${row.billed
-        ? 'Your subscription changes now; the difference is prorated on the next invoice.'
-        : 'Applies now.'}</p>`,
+    body: `${packagePicker(service, row.pending_change?.package.id || row.package?.id, state.account.billing_interval)}
+      ${row.billed ? `<div class="section-title" style="margin-top:16px">When To Change</div>
+        <label class="row" style="gap:8px;align-items:flex-start;margin:6px 0"><input type="radio" name="when" value="now" checked>
+          <span><strong>Change now</strong><br><span class="hint">The difference for the rest of this period is added to your next invoice.</span></span></label>
+        <label class="row" style="gap:8px;align-items:flex-start;margin:6px 0"><input type="radio" name="when" value="period_end">
+          <span><strong>At the next renewal${state.account.renews_at ? ` (${esc(fmtDate(state.account.renews_at))})` : ''}</strong><br><span class="hint">You keep the current package until then. Nothing extra is charged.</span></span></label>`
+        : '<p class="hint" style="margin-top:12px">Applies now.</p>'}`,
     onSubmit: (form) => api.patch(`/portal/services/${slug}`, readForm(form)),
   });
-  if (result) { toast('Package changed.', 'ok'); route(); }
+  if (result) {
+    const later = result.services?.find((r) => r.service.slug === slug)?.pending_change;
+    toast(later ? `Package changes on ${fmtDate(later.at)}.` : 'Package changed.', 'ok');
+    route();
+  }
 }
 
 async function removeDialog(slug) {
@@ -276,11 +288,33 @@ async function removeDialog(slug) {
   if (result) { toast(result.message || 'Removed.', 'ok'); route(); }
 }
 
+/* A customer who paid at registration is offered the free trial days: the paid
+ * period runs in full, the trial days follow it, and nothing more is charged. */
+const trialOffer = () => {
+  const offer = state.account.free_trial_offer;
+  if (!offer || !canManage()) return '';
+  return `<div class="banner ok" style="display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+    <span><strong>Add Your ${offer.days}-Day Free Trial</strong>Since you paid up front, you also get ${offer.days} free trial days on top of your paid period. Your first renewal moves back by ${offer.days} days and nothing is charged for them.</span>
+    <button class="primary" data-free-trial>Add Free Trial Days</button></div>`;
+};
+
+function wireTrialOffer(mount) {
+  $('[data-free-trial]', mount)?.addEventListener('click', () => guard(async () => {
+    const days = state.account.free_trial_offer?.days;
+    state.account = await api.post('/portal/billing/free-trial');
+    toast(`${days} free trial days added. Your renewal moved back by ${days} days.`, 'ok');
+    route();
+  }));
+}
+
 async function renderServices(mount) {
   const live = state.account.services.filter((r) => r.status !== 'cancelled');
   const gone = state.account.services.filter((r) => r.status === 'cancelled');
   mount.innerHTML = `
     ${state.account.status === 'suspended' ? banner('Account Suspended', 'Your services are paused. Contact support to restore them.', 'bad') : ''}
+    ${live.some((r) => r.service.uses_odoo) && !(state.account.odoo || []).length && canManage()
+      ? banner('Connect to Odoo', 'Your services need an Odoo connection before they can start working.', 'warn', { href: '#/odoo', label: 'Connect Odoo' }) : ''}
+    ${trialOffer()}
     ${live.some((r) => r.status === 'trialing') && !state.account.pays_online && canManage()
       ? banner('You Are On A Free Trial', 'Add payment details before it ends to keep every service running.', '', { href: '#/billing', label: 'Billing' }) : ''}
     ${canManage() && state.available.length ? `
@@ -299,7 +333,14 @@ async function renderServices(mount) {
         </div>`).join('') : ''}
     </div>
     ${gone.length ? `<div class="section-title">Removed</div><div class="svc-grid">${gone.map(serviceCard).join('')}</div>` : ''}`;
+  wireTrialOffer(mount);
   mount.addEventListener('click', (e) => {
+    const undo = e.target.closest('[data-cancel-change]');
+    if (undo) {
+      e.preventDefault();
+      guard(async () => { await api.del(`/portal/services/${undo.dataset.cancelChange}/pending-change`); toast('Change cancelled.', 'ok'); route(); });
+      return;
+    }
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.open) guard(() => openService(b.dataset.open));
@@ -314,8 +355,11 @@ async function renderServices(mount) {
 /* =========================================================================
  * Billing
  * ====================================================================== */
-async function renderBilling(mount, route) {
-  mount.innerHTML = loading();
+/* ``quiet``: refresh in place, keeping the page as it is until the new one is
+ * ready, rather than blanking it to a loading line (a toggle or a button on
+ * the page itself). */
+async function renderBilling(mount, route, { quiet = false } = {}) {
+  if (!quiet) mount.innerHTML = loading();
   const data = await api.get('/portal/billing');
   const a = data.account;
   state.account = a;
@@ -328,23 +372,26 @@ async function renderBilling(mount, route) {
   const rows = billed.map((r) => {
     const cents = interval === 'year' ? r.package?.yearly_price_cents : r.package?.monthly_price_cents;
     return `<tr><td>${esc(r.service.name)}</td><td>${esc(r.package?.name || '—')}</td><td>${statusPill(r.status)}</td>
-      <td class="num">${money(cents, r.package?.currency)}<span class="muted">/${interval === 'year' ? 'yr' : 'mo'}</span></td></tr>`;
+      <td class="num" data-price data-m="${r.package?.monthly_price_cents ?? ''}" data-y="${r.package?.yearly_price_cents ?? ''}" data-cur="${esc(r.package?.currency || '')}">${money(cents, r.package?.currency)}<span class="muted">/${interval === 'year' ? 'yr' : 'mo'}</span></td></tr>`;
   }).join('');
   const pm = data.payment_method;
   mount.innerHTML = `
     ${data.error ? banner('Billing Is Unavailable Right Now', data.error, 'warn') : ''}
+    ${trialOffer()}
     <div class="card">
       <div class="card-head"><h2>Your Subscription</h2>
         <div class="actions">${a.pays_online && canManage()
           ? '<button id="portalBtn">Manage Payment Details</button>' : ''}</div></div>
       ${a.pays_online ? `<p>${a.cancel_at_period_end
         ? `Cancelled — your services stop on <strong>${esc(fmtDate(a.renews_at))}</strong>.`
-        : `Paying ${interval === 'year' ? 'yearly' : 'monthly'} · renews <strong>${esc(fmtDate(a.renews_at))}</strong>`}</p>`
+        : `Paying ${interval === 'year' ? 'yearly' : 'monthly'} · renews <strong>${esc(fmtDate(a.renews_at))}</strong>${
+          a.free_trial_added_days ? ` · includes ${a.free_trial_added_days} free trial days` : ''}`}</p>`
         : '<p>You are not paying online yet. One subscription covers every service below, on one invoice.</p>'}
-      <div class="table-wrap"><table>
+      <div class="table-wrap"><table style="table-layout:fixed;min-width:560px">
+        <colgroup><col style="width:30%"><col style="width:24%"><col style="width:16%"><col style="width:30%"></colgroup>
         <thead><tr><th>Service</th><th>Package</th><th>Status</th><th class="num">Price</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="4" class="muted">No services.</td></tr>'}</tbody>
-        <tfoot><tr><td colspan="3"><strong>Total</strong></td><td class="num"><strong>${money(a.monthly_total_cents)}</strong><span class="muted">/mo${interval === 'year' ? ' (billed yearly)' : ''}</span></td></tr></tfoot>
+        <tfoot><tr><td colspan="3"><strong>Total</strong></td><td class="num" id="billTotal"><strong>${money(a.monthly_total_cents)}</strong><span class="muted">/mo${interval === 'year' ? ' (billed yearly)' : ''}</span></td></tr></tfoot>
       </table></div>
       ${!a.pays_online && canManage() ? `
         <div class="row" style="gap:10px;margin-top:16px;flex-wrap:wrap;align-items:center">
@@ -370,12 +417,44 @@ async function renderBilling(mount, route) {
             ${i.invoice_pdf ? `<a class="btn sm" href="${esc(i.invoice_pdf)}" target="_blank" rel="noopener">PDF</a>` : ''}</td></tr>`).join('')}</tbody></table></div></div>`
         : empty('No Invoices Yet', '')}
     </div>`;
-  $$('[data-interval]', mount).forEach((b) => b.addEventListener('click', () => guard(async () => {
-    await api.post('/portal/billing/interval', { interval: b.dataset.interval });
-    renderBilling(mount, { query: {} });
-  })));
+  wireTrialOffer(mount);
+  /* Switching the interval repaints the prices from what the page already holds, then
+   * saves in the background; the table itself is never rebuilt, so nothing jumps. */
+  const paint = (to) => {
+    let total = 0;
+    let cur;
+    $$('[data-price]', mount).forEach((td) => {
+      const m = Number(td.dataset.m);
+      const y = Number(td.dataset.y);
+      const c = to === 'year' ? y : m;
+      cur = td.dataset.cur || cur;
+      total += to === 'year' ? Math.floor(y / 12) : m;
+      td.innerHTML = `${money(c, td.dataset.cur || undefined)}<span class="muted">/${to === 'year' ? 'yr' : 'mo'}</span>`;
+    });
+    const t = $('#billTotal', mount);
+    if (t) t.innerHTML = `<strong>${money(total, cur)}</strong><span class="muted">/mo${to === 'year' ? ' (billed yearly)' : ''}</span>`;
+    $$('[data-interval]', mount).forEach((x) => x.classList.toggle('on', x.dataset.interval === to));
+  };
+  let current = interval;
+  $$('[data-interval]', mount).forEach((b) => b.addEventListener('click', () => {
+    const to = b.dataset.interval;
+    if (to === current) return;
+    const before = current;
+    current = to;
+    paint(to);
+    guard(async () => {
+      try {
+        await api.post('/portal/billing/interval', { interval: to });
+        if (state.account) state.account.billing_interval = to;
+      } catch (error) {
+        current = before;
+        paint(before);
+        throw error;
+      }
+    });
+  }));
   $('#payBtn', mount)?.addEventListener('click', () => guard(async () => {
-    const r = await api.post('/portal/billing/checkout', { interval });
+    const r = await api.post('/portal/billing/checkout', { interval: current });
     window.location.href = r.url;
   }));
   $('#portalBtn', mount)?.addEventListener('click', () => guard(async () => {
@@ -387,11 +466,11 @@ async function renderBilling(mount, route) {
       body: `<p>Every service keeps working until <strong>${esc(fmtDate(a.renews_at))}</strong>, then stops. Nothing more is charged. Your account and data stay until you delete them.</p>`,
       onSubmit: () => api.post('/portal/billing/cancel'),
     });
-    if (ok) { toast('Subscription cancelled.', 'ok'); renderBilling(mount, { query: {} }); }
+    if (ok) { toast('Subscription cancelled.', 'ok'); renderBilling(mount, { query: {} }, { quiet: true }); }
   });
   $('#resumeBtn', mount)?.addEventListener('click', () => guard(async () => {
     await api.post('/portal/billing/resume');
-    renderBilling(mount, { query: {} });
+    await renderBilling(mount, { query: {} }, { quiet: true });
   }, 'Your subscription continues.'));
 }
 
@@ -587,9 +666,9 @@ async function renderOdoo(mount) {
   const waiting = data.services_without.map((s) => esc(s.name)).join(', ');
   if (!conn) {
     mount.innerHTML = `
-      ${waiting ? banner('Connect Your Odoo', `${waiting} ${data.services_without.length > 1 ? 'need' : 'needs'} it to work.`, 'warn') : ''}
+      ${waiting ? banner('Connect to Odoo', `${waiting} ${data.services_without.length > 1 ? 'need' : 'needs'} it to work.`, 'warn') : ''}
       <div class="card">
-        <div class="card-head"><h2>Connect Your Odoo</h2></div>
+        <div class="card-head"><h2>Connect to Odoo</h2></div>
         ${canManage() ? `<form id="odooForm">${odooFields()}
             <p class="err" id="odooErr"></p>
             <button class="primary" id="odooGo">Test And Connect</button></form>`
@@ -656,6 +735,7 @@ const PAGES = [
   { path: '/account', title: 'Company', render: renderCompany, group: 'account' },
   { path: '/odoo', title: 'Odoo', render: renderOdoo, group: 'account' },
   { path: '/billing', title: 'Billing', render: renderBilling, group: 'account' },
+  { path: '/reports', title: 'Reports', render: (mount, route) => renderReports(mount, route, { api, canManage }) },
 ];
 /** The Company tab: the company's details, then its people. */
 async function renderCompany(mount) {
@@ -666,6 +746,7 @@ const ACCOUNT_TABS = PAGES.filter((p) => p.group === 'account');
 /** The sidebar: Services, and Account holding company, people, Odoo and billing as tabs. */
 const NAV = [
   { path: '/services', title: 'Services', icon: 'grid' },
+  { path: '/reports', title: 'Reports', icon: 'reports' },
   { path: '/account', title: 'Account', icon: 'account', paths: [...ACCOUNT_TABS.map((p) => p.path), '/team'] },
 ];
 const accountTabs = (path) => `<nav class="tabs" aria-label="Account">${ACCOUNT_TABS.map((p) =>

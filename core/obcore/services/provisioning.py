@@ -34,8 +34,8 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import case, inspect, select, update
+from sqlalchemy.orm import Session, object_session
 
 from obcore import keys
 from obcore.config import settings
@@ -118,12 +118,38 @@ def _call(method: str, url: str, headers: dict[str, str], body: bytes = b"") -> 
 
 
 def mark_changed(row: AccountService) -> None:
-    row.revision = (row.revision or 0) + 1
+    """Bump the row's revision. The row is locked (SELECT … FOR UPDATE) and the
+    revision read from the database, so two requests changing the same
+    account at once get two revisions in order rather than the same one; the
+    lock lasts until the transaction ends, so the changes queue up."""
+    current = row.revision or 0
+    db = object_session(row)
+    if db is not None and row.id is not None and inspect(row).persistent:
+        locked = db.execute(select(AccountService.revision).where(AccountService.id == row.id)
+                            .with_for_update()).scalar()
+        if locked is not None:
+            current = max(current, locked)
+    row.revision = current + 1
 
 
 def mark_account_changed(account: Account) -> None:
     for row in account.services:
         mark_changed(row)
+
+
+def _ack(db: Session, row: AccountService, acked: int) -> None:
+    """Record that the service has the row's state up to revision ``acked``.
+    Never lowered: a push of an older revision can finish after a newer one
+    when two changes overlap."""
+    row.provisioned_at = utcnow()
+    row.provision_error = None
+    if row.id is not None and inspect(row).persistent:
+        db.execute(update(AccountService).where(AccountService.id == row.id).values(
+            provisioned_revision=case((AccountService.provisioned_revision > acked,
+                                       AccountService.provisioned_revision), else_=acked)))
+        db.expire(row, ["provisioned_revision"])
+    else:
+        row.provisioned_revision = max(row.provisioned_revision or 0, acked)
 
 
 def push(db: Session, row: AccountService) -> bool:
@@ -132,22 +158,38 @@ def push(db: Session, row: AccountService) -> bool:
     if not service.is_active:
         return False
     body = keys.dumps(payload_for(row))
+    revision = row.revision
     try:
         _call("PUT", _url(service, row.account_id), _auth(service, row.account_id, body, db), body)
     except ProvisionError as exc:
         row.provision_error = str(exc)[:400]
         log.warning("Provisioning %s on %s failed: %s", row.account_id, service.slug, exc)
         return False
-    row.provisioned_at = utcnow()
-    row.provisioned_revision = row.revision
-    row.provision_error = None
+    _ack(db, row, revision)
     return True
 
 
 def push_account(db: Session, account: Account) -> None:
+    """Send the account's changed services their new state, after a request
+    committed the change. The database connection is handed back while the
+    services are called, so a slow service never holds one up."""
+    jobs = []
     for row in account.services:
-        if row.provisioned_revision < row.revision:
-            push(db, row)
+        if row.provisioned_revision < row.revision and row.service.is_active:
+            body = keys.dumps(payload_for(row))
+            jobs.append((row, row.revision, _url(row.service, row.account_id),
+                         _auth(row.service, row.account_id, body, db), body))
+    if not jobs:
+        return
+    db.commit()
+    for row, revision, url, headers, body in jobs:
+        try:
+            _call("PUT", url, headers, body)
+        except ProvisionError as exc:
+            row.provision_error = str(exc)[:400]
+            log.warning("Provisioning %s on %s failed: %s", row.account_id, row.service.slug, exc)
+            continue
+        _ack(db, row, revision)
 
 
 def push_pending(db: Session, limit: int = 100) -> int:

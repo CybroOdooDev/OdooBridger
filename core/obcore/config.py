@@ -98,6 +98,11 @@ class Settings(BaseSettings):
 
     http_timeout_seconds: int = 20
     registration_rate_per_hour: int = 10
+    #: Database connections per process (each uvicorn worker has its own pool).
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    #: Seconds a request waits for a free connection before answering 503.
+    db_pool_timeout: int = 30
     contact_rate_per_hour: int = 5
     cors_origins: str = ""
 

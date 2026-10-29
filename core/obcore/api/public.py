@@ -89,18 +89,43 @@ def signup(payload: SignupIn, request: Request, db: Session = Depends(get_db)) -
                                     f"{service.name} can't be bought {'yearly' if interval == 'year' else 'monthly'} online. "
                                     "Start a free trial, or contact us.")
     try:
-        signups.start(db, email=payload.email, company=payload.company, full_name=payload.full_name,
-                      country=payload.country, timezone_name=payload.timezone,
-                      services=[{"service": svc.slug, "package_id": pkg.id if pkg else None} for svc, pkg in picks],
-                      interval=interval, mode=payload.mode, ip=acc.client_ip(request))
+        pending = signups.start(
+            db, email=payload.email, company=payload.company, full_name=payload.full_name,
+            country=payload.country, timezone_name=payload.timezone,
+            services=[{"service": svc.slug, "package_id": pkg.id if pkg else None} for svc, pkg in picks],
+            interval=interval, mode=payload.mode, ip=acc.client_ip(request))
+        if buying and pending.paid_at is None:
+            # Pay first: the confirmation link is emailed once Stripe has the payment.
+            done = {"checkout_url": signups.checkout_url(db, pending),
+                    "message": "Taking you to payment. Your confirmation link is emailed once it goes through."}
     except signups.SignupError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except stripe.BillingError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Payment could not be started. Please try again.") from exc
     db.commit()
-    if buying:
-        done["message"] = (f"Check {payload.email} for a link to confirm it and set your password. "
-                           "You'll go on to payment once it's confirmed.")
+    if buying and pending.paid_at is not None:
+        done = {"message": f"You've already paid. We've sent a new link to {payload.email} to confirm it and set your password."}
     return done
+
+
+@router.post("/signup/paid")
+def signup_paid(payload: dict, request: Request, db: Session = Depends(get_db)) -> dict:
+    """Where Stripe sends the visitor back after paying. Checks the Checkout with Stripe
+    (the webhook may be a moment behind) and emails the confirmation link."""
+    session_id = str(payload.get("session_id") or "")
+    if not session_id.startswith("cs_") or not acc.rate_ok("signup-paid", acc.client_ip(request), 30):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This payment could not be found.")
+    try:
+        session = stripe.request("GET", f"checkout/sessions/{session_id}")
+    except stripe.BillingError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Could not check the payment just now. Please try again shortly.") from exc
+    pending = signups.mark_paid(db, session)
+    if pending is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This payment has not gone through yet.")
+    db.commit()
+    return {"email": pending.email}
 
 
 @router.post("/resend")

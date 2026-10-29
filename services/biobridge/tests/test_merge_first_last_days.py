@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import importlib.util
 import pathlib
 from datetime import datetime
@@ -90,6 +92,7 @@ def test_skips_a_day_that_would_overlap_another_record(db, tenant, local_day, mo
     assert len(odoo.attendances) == 2  # nothing deleted
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_open_last_record_leaves_the_day_open(db, tenant, local_day, monkeypatch):
     tenant.pairing_mode = "alternating"
     db.commit()

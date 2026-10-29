@@ -23,10 +23,12 @@ Two invariants make a run safe to interrupt:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -75,6 +77,7 @@ from app.services.pairing import (
     day_of,
     pair_punches,
 )
+from app.services.run_lock import TenantRunLock
 from app.services.timeutils import local_to_utc, utc_to_local, utcnow_naive
 
 log = logging.getLogger(__name__)
@@ -120,6 +123,25 @@ class AllSourcesUnreachable(SyncAborted):
 RUN_STALE_AFTER = timedelta(hours=1)
 
 
+def close_abandoned_runs(db: Session, tenant_id: str, keep_id: str | None = None) -> int:
+    """Mark the tenant's "running" runs failed. Only call while holding its
+    TenantRunLock: then no cycle is alive, so any such run was left behind by
+    a process that stopped (deploy, crash) mid-cycle."""
+    query = update(SyncRun).where(SyncRun.tenant_id == tenant_id, SyncRun.status == SyncStatus.running.value)
+    if keep_id is not None:
+        query = query.where(SyncRun.id != keep_id)
+    done = db.execute(query.values(
+        status=SyncStatus.failed.value, finished_at=datetime.now(timezone.utc),
+        error_message="Interrupted: the process running this sync stopped before it finished.",
+    )).rowcount or 0
+    return done
+
+
+def latest_run(db: Session, tenant_id: str) -> SyncRun | None:
+    return db.scalars(select(SyncRun).where(SyncRun.tenant_id == tenant_id)
+                      .order_by(SyncRun.started_at.desc()).limit(1)).first()
+
+
 def active_run(db: Session, tenant_id: str, exclude_id: str | None = None) -> SyncRun | None:
     """The tenant's cycle in progress, if any (one started within the last hour
     and not finished)."""
@@ -144,6 +166,7 @@ class SyncEngine:
         triggered_by: str = "schedule",
         only_source_id: str | None = None,
         run: SyncRun | None = None,
+        lock: TenantRunLock | None = None,
     ) -> None:
         self.db = db
         self.tenant = tenant
@@ -166,6 +189,8 @@ class SyncEngine:
             log=[],
         )
         self._adopted = run is not None
+        #: Held by whoever created ``run`` (see /sync/start); released here.
+        self._lock = lock
         if run is not None and run.started_at is not None:
             started = run.started_at
             self._started_at = started if started.tzinfo else started.replace(tzinfo=timezone.utc)
@@ -199,18 +224,55 @@ class SyncEngine:
 
     # -- entry point -------------------------------------------------------
     def run_cycle(self) -> SyncRun:
-        # One cycle per account at a time. Two at once (the schedule and a
-        # "Sync Now", say) would read the same punches and wait on each other's
-        # rows; the second one is not needed anyway.
-        if not self._adopted:
+        """Run one cycle, unless one is already running for this account (the
+        schedule and a "Sync Now", say, or two BioBridge processes): then the
+        running one is returned and nothing else happens. Two at once would
+        read the same punches and wait on each other's rows."""
+        lock = self._lock or TenantRunLock(self.tenant.id)
+        if not lock.held and not lock.acquire():
+            log.info("[tenant=%s] A sync is already running; not starting another", self.tenant.slug)
+            return self._the_running_one()
+        try:
+            if not TenantRunLock.supported() and not self._adopted:
+                other = active_run(self.db, self.tenant.id)
+                if other is not None:
+                    return other
+            if not self._adopted:
+                # Started now that it may run (it may have waited for a database connection).
+                self._started_at = datetime.now(timezone.utc)
+                self.run.started_at = self._started_at
+            if TenantRunLock.supported():
+                closed = close_abandoned_runs(self.db, self.tenant.id, keep_id=self.run.id)
+                if closed:
+                    log.warning("[tenant=%s] Closed %d sync run(s) left running by a stopped process",
+                                self.tenant.slug, closed)
+            self.db.add(self.run)
+            # Committed now, so the run shows as running everywhere.
+            self.db.commit()
+            return self._cycle()
+        finally:
+            lock.release()
+
+    def _the_running_one(self) -> SyncRun:
+        """The cycle holding the lock. Its run row may not be committed yet
+        (it was claimed a moment ago), so wait a little for it."""
+        for _ in range(20):
             other = active_run(self.db, self.tenant.id)
             if other is not None:
-                log.info("[tenant=%s] A sync is already running (%s); not starting another",
-                         self.tenant.slug, other.id)
                 return other
-        self.db.add(self.run)
-        # Committed now, so the run is visible to the check above elsewhere.
-        self.db.commit()
+            # Ends the read transaction (and hands the connection back) while waiting.
+            self.db.commit()
+            time.sleep(0.25)
+        return latest_run(self.db, self.tenant.id) or self.run
+
+    def _recover(self) -> None:
+        """A failed flush (another process stored the same row at the same
+        moment, say) leaves the transaction unusable; start a clean one so the
+        run can still be recorded."""
+        if not self.db.is_active:
+            self.db.rollback()
+
+    def _cycle(self) -> SyncRun:
         odoo_conn: OdooConnection | None = None
 
         try:
@@ -350,6 +412,12 @@ class SyncEngine:
             self._sync_odoo_devices(odoo, odoo_conn)
             self._refresh_open_mirror(odoo)
             self._push(odoo, odoo_conn)
+            # Shifts nobody badged out of: closed at the limit on every run,
+            # not only by the hourly sweep, so they never outlive a sync.
+            self.run.attendances_closed += self.close_stale_shifts(odoo)
+            # Then bring in what Odoo has that this copy doesn't: records entered
+            # there by hand, from a kiosk, or split or edited there.
+            self._follow_odoo_attendance(odoo)
 
             self.tenant.consecutive_failures = 0
             odoo_conn.status = ConnectionStatus.connected.value
@@ -359,6 +427,7 @@ class SyncEngine:
             )
 
         except AllSourcesUnreachable as exc:
+            self._recover()
             # Ordered before SyncAborted: it is a subclass, so the broader
             # handler below would swallow it and skip the streak.
             self.tenant.consecutive_failures += 1
@@ -367,10 +436,12 @@ class SyncEngine:
             self._log(str(exc), "error")
             self._mark_degraded_if_needed()
         except SyncAborted as exc:
+            self._recover()
             self.run.status = SyncStatus.failed.value
             self.run.error_message = str(exc)
             self._log(str(exc), "warning")
         except (ProviderError, OdooError) as exc:
+            self._recover()
             self.tenant.consecutive_failures += 1
             self.run.status = SyncStatus.failed.value
             self.run.error_message = str(exc)
@@ -385,12 +456,14 @@ class SyncEngine:
                 odoo_conn.last_checked_at = datetime.now(timezone.utc)
             self._mark_degraded_if_needed()
         except Exception as exc:  # noqa: BLE001 — a worker must never die silently
+            self._recover()
             self.tenant.consecutive_failures += 1
             self.run.status = SyncStatus.failed.value
             self.run.error_message = f"Unexpected error: {exc}"
             self._log(f"Unexpected error: {exc}", "exception")
             self._mark_degraded_if_needed()
         finally:
+            self._recover()
             if self.only_source_id and self.run.status == SyncStatus.failed.value:
                 self.tenant.consecutive_failures = self._failures_before
             finished = datetime.now(timezone.utc)
@@ -726,7 +799,7 @@ class SyncEngine:
     ) -> int:
         """Store the new punches in one buffer, and report how many were new."""
         seen = self._known_external_ids(source, [event.external_id for event, _ in batch])
-        created = 0
+        fresh = []
         for event, punch_utc in batch:
             # The in-batch check matters as much as the database one: the fetch
             # window overlaps the previous run deliberately, and a provider may
@@ -735,8 +808,9 @@ class SyncEngine:
             if event.external_id in seen:
                 continue
             seen.add(event.external_id)
-            self._ingest(event, source, devices, punch_utc)
-            created += 1
+            fresh.append((event, punch_utc))
+        created = insert_punches(self.db, fresh, lambda e, t: self._ingest(e, source, devices, t),
+                                 refresh_devices=lambda: _reload_devices(self.db, source, devices))
         # Each batch is committed: the punches are safe in the ledger as soon as
         # they are read (a re-read is deduplicated), and the terminals' counters
         # aren't locked for the rest of a long first sync.
@@ -1476,6 +1550,56 @@ class SyncEngine:
             "ended this one there", "warning",
         )
 
+    def close_stale_shifts(self, odoo: OdooClient) -> int:
+        """Close every Odoo record of this account's matched employees still
+        open longer than the shift limit. Returns how many were closed.
+
+        One search for all of them (``open_attendances``), oldest first, and
+        every open record — not just each person's latest, since an old one can
+        sit open behind a newer one. Each ends at the shift limit, or earlier
+        where the employee's next record begins (Odoo refuses an overlap).
+        """
+        mappings: dict[int, EmployeeMapping] = {}
+        for m in self.db.scalars(select(EmployeeMapping).where(
+                EmployeeMapping.tenant_id == self.tenant.id,
+                EmployeeMapping.status == MappingStatus.mapped.value,
+                EmployeeMapping.odoo_employee_id.is_not(None))):
+            mappings[m.odoo_employee_id] = m
+        if not mappings:
+            return 0
+        config = self.pairing_config()
+        now = stale_clock()
+        closed = 0
+        for rec in odoo.open_attendances(list(mappings), now - timedelta(hours=config.max_shift_hours)):
+            emp = rec.get("employee_id")
+            emp_id = int(emp[0] if isinstance(emp, (list, tuple)) else emp)
+            mapping = mappings.get(emp_id)
+            check_in = parse_dt(rec.get("check_in"))
+            end = close_stale_at(check_in, now, config) if check_in else None
+            if mapping is None or end is None:
+                continue
+            try:
+                blocked = self._blocked_end(odoo, emp_id, check_in, config)
+                if blocked is not None:
+                    end = min(end, blocked)
+                odoo.close_attendance(rec["id"], end, auto_closed=True)
+            except OdooError as exc:
+                self._log(f"{mapping.emp_code}: could not close attendance {rec['id']} left open since "
+                          f"{utc_to_local(check_in, self.tenant.timezone):%Y-%m-%d %H:%M}: {exc}", "warning")
+                continue
+            self._mirror_close(rec["id"], end, auto_closed=True)
+            if mapping.open_attendance_id == rec["id"]:
+                mapping.open_attendance_id = None
+                mapping.open_check_in = None
+            self._log(
+                f"{mapping.emp_code}: attendance open since "
+                f"{utc_to_local(check_in, self.tenant.timezone):%Y-%m-%d %H:%M} passed the "
+                f"{config.max_shift_hours}h shift limit; closed it automatically at "
+                f"{utc_to_local(end, self.tenant.timezone):%Y-%m-%d %H:%M}", "warning")
+            closed += 1
+        self.db.flush()
+        return closed
+
     def _blocked_end(self, odoo: OdooClient, employee_id: int, check_in: datetime,
                      config: PairingConfig) -> datetime | None:
         """Where an open record that starts at ``check_in`` has to end because
@@ -1591,6 +1715,71 @@ class SyncEngine:
                 punch.error_message = message
         self._log(f"{mapping.emp_code}: {message}", "warning")
         return True
+
+    #: How far back the copy follows Odoo on an account's first read.
+    FOLLOW_ODOO_DAYS = 35
+    #: Re-read this much before the last read: Odoo's clock and ours may differ.
+    FOLLOW_ODOO_OVERLAP = timedelta(minutes=10)
+
+    def _follow_odoo_attendance(self, odoo: OdooClient) -> None:
+        """Bring BioBridge's copy of the attendance in line with Odoo, for the
+        matched employees: records changed in Odoo since the last read are
+        updated here, and ones that exist only in Odoo are added (as "Added in
+        Odoo"). Odoo is the record of truth; this copy is what the Attendance
+        page and Reports read. A failure here never fails the sync.
+        """
+        try:
+            mappings = {m.odoo_employee_id: m for m in self.db.scalars(select(EmployeeMapping).where(
+                EmployeeMapping.tenant_id == self.tenant.id,
+                EmployeeMapping.status == MappingStatus.mapped.value,
+                EmployeeMapping.odoo_employee_id.is_not(None)))}
+            if not mappings:
+                return
+            started = utcnow_naive()
+            floor = started - timedelta(days=self.FOLLOW_ODOO_DAYS)
+            last = self.tenant.odoo_attendance_synced_at
+            since = (last - self.FOLLOW_ODOO_OVERLAP) if last else floor
+            rows = odoo.attendances_changed_since(list(mappings), since, floor)
+            with self.db.begin_nested():   # a database error here undoes only this step
+                known = {r.odoo_attendance_id: r for r in self.db.scalars(select(AttendanceRecord).where(
+                    AttendanceRecord.tenant_id == self.tenant.id,
+                    AttendanceRecord.odoo_attendance_id.in_([int(r["id"]) for r in rows] or [0])))}
+                tz = self.tenant.timezone or "UTC"
+                added = updated = 0
+                for rec in rows:
+                    emp = rec.get("employee_id")
+                    mapping = mappings.get(int(emp[0] if isinstance(emp, (list, tuple)) else emp))
+                    check_in = parse_dt(rec.get("check_in"))
+                    if mapping is None or check_in is None:
+                        continue
+                    check_out = parse_dt(rec.get("check_out"))
+                    row = known.get(int(rec["id"]))
+                    if row is not None and row.check_in == check_in and row.check_out == check_out:
+                        continue
+                    if row is None:
+                        row = AttendanceRecord(tenant_id=self.tenant.id, odoo_attendance_id=int(rec["id"]),
+                                               emp_code=mapping.emp_code, origin="odoo",
+                                               pairing_mode=None)
+                        self.db.add(row)
+                        added += 1
+                    else:
+                        updated += 1
+                    row.employee_name = mapping.odoo_employee_name or mapping.source_name
+                    row.department = mapping.department
+                    row.odoo_employee_id = mapping.odoo_employee_id
+                    row.check_in = check_in
+                    row.check_out = check_out
+                    row.check_in_local = utc_to_local(check_in, tz)
+                    row.check_out_local = utc_to_local(check_out, tz) if check_out else None
+                    row.shift_date = row.check_in_local.strftime("%Y-%m-%d")
+                    row.worked_hours = (check_out - check_in).total_seconds() / 3600 if check_out else None
+                self.tenant.odoo_attendance_synced_at = started
+                self.db.flush()
+                if added or updated:
+                    self._log(f"Attendance from Odoo: {added} record(s) added here, {updated} updated to match Odoo",
+                              "info")
+        except Exception as exc:  # noqa: BLE001 — a copy for display must never fail a sync
+            log.warning("following Odoo's attendance skipped for %s: %s", self.tenant.slug, exc)
 
     def _refresh_open_mirror(self, odoo: OdooClient) -> None:
         """Bring records BioBridge shows as open in step with Odoo.
@@ -2038,6 +2227,41 @@ class SyncEngine:
         )
 
 
+def _reload_devices(db: Session, source: DeviceSource, devices: dict) -> None:
+    devices.clear()
+    devices.update({d.serial_number: d for d in db.scalars(select(Device).where(Device.source_id == source.id))})
+
+
+def insert_punches(db: Session, items: list, store, *, refresh_devices=None) -> int:
+    """Store ``items`` with ``store(event, punch_utc)``; return how many were new.
+
+    In one savepoint first. If another process stored some of these punches in
+    the meantime (an ADMS terminal re-sending a batch, two cycles' overlapping
+    reads), the savepoint is rolled back and the punches go in one by one,
+    each in its own savepoint, skipping the ones already there — so a
+    duplicate costs a retry, never the whole batch or the sync."""
+    if not items:
+        return 0
+    try:
+        with db.begin_nested():
+            for event, punch_utc in items:
+                store(event, punch_utc)
+        return len(items)
+    except IntegrityError:
+        if refresh_devices:
+            refresh_devices()
+    created = 0
+    for event, punch_utc in items:
+        try:
+            with db.begin_nested():
+                store(event, punch_utc)
+            created += 1
+        except IntegrityError:
+            if refresh_devices:
+                refresh_devices()
+    return created
+
+
 def store_punch(
     db: Session, tenant: Tenant, source: DeviceSource, devices: dict,
     event, punch_utc: datetime, *, run_id: str | None = None, register_unknown: bool = True,
@@ -2062,13 +2286,10 @@ def store_punch(
         # First punch from a terminal nobody imported: record it, so it
         # shows on the Terminals page, reaches Odoo's device list, and
         # counts toward the plan's device allowance like any other.
-        device = Device(
-            tenant_id=tenant.id, source_id=source.id,
-            serial_number=event.terminal_sn,
-            alias=getattr(event, "terminal_alias", None) or None,
-        )
-        db.add(device)
-        db.flush()
+        from app.services.device_links import device_for_serial
+
+        device, _ = device_for_serial(db, tenant.id, source.id, event.terminal_sn,
+                                      alias=getattr(event, "terminal_alias", None) or None)
         devices[event.terminal_sn] = device
     record = PunchRecord(
         tenant_id=tenant.id,
@@ -2100,47 +2321,34 @@ def store_punch(
     return record
 
 
-def close_stale_attendances(db: Session, tenant: Tenant) -> int:
-    """Close shifts left open past max_shift_hours.
+def stale_clock() -> datetime:
+    """"Now", for deciding a shift has been open too long. Its own function so
+    tests replaying yesterday's punches as if live can stand still."""
+    return utcnow_naive()
 
-    Without this, one employee who forgets to badge out holds an ever-growing
-    open record that blocks every subsequent check-in for that person.
+
+def close_stale_attendances(db: Session, tenant: Tenant) -> int:
+    """Close shifts left open past max_shift_hours, between syncs.
+
+    Every sync does this too (``SyncEngine.close_stale_shifts``); this sweep
+    covers an account whose syncs are off or failing. Without it, one employee
+    who forgets to badge out holds an ever-growing open record that blocks
+    every later check-in for that person.
     """
     engine = SyncEngine(db, tenant, "maintenance")
     conn = engine._active_odoo_connection()  # noqa: SLF001
     if conn is None:
         return 0
-
-    closed = 0
-    odoo = build_odoo_client(tenant, conn)
-    config = engine.pairing_config()
-    mappings = db.scalars(
-        select(EmployeeMapping).where(
-            EmployeeMapping.tenant_id == tenant.id,
-            EmployeeMapping.status == MappingStatus.mapped.value,
-        )
-    ).all()
-
-    for mapping in mappings:
-        try:
-            live = odoo.get_open_attendance(mapping.odoo_employee_id)
-            if not live:
-                continue
-            check_in = parse_dt(live["check_in"])
-            if check_in is None:
-                continue
-            auto_close = close_stale_at(check_in, utcnow_naive(), config)
-            if auto_close:
-                # Never past where the next record starts: Odoo refuses it.
-                blocked = engine._blocked_end(odoo, mapping.odoo_employee_id, check_in, config)  # noqa: SLF001
-                if blocked is not None:
-                    auto_close = min(auto_close, blocked)
-                odoo.close_attendance(live["id"], auto_close, auto_closed=True)
-                engine._mirror_close(live["id"], auto_close, auto_closed=True)  # noqa: SLF001
-                mapping.open_attendance_id = None
-                mapping.open_check_in = None
-                closed += 1
-        except OdooError as exc:
-            log.warning("Stale-close failed for %s: %s", tenant.slug, exc)
-
-    return closed
+    lock = TenantRunLock(tenant.id)
+    if not lock.acquire():
+        return 0      # a sync is running for this account, and it closes them itself
+    try:
+        closed = engine.close_stale_shifts(build_odoo_client(tenant, conn))
+        db.commit()
+        return closed
+    except OdooError as exc:
+        db.rollback()
+        log.warning("Stale-close failed for %s: %s", tenant.slug, exc)
+        return 0
+    finally:
+        lock.release()

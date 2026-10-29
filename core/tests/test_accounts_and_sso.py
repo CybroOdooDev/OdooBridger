@@ -239,16 +239,166 @@ def test_contact_page_details_come_from_settings(client, monkeypatch):
     assert set(info) == {"company", "email", "phone", "address", "hours", "website"}
 
 
-def test_buy_now_goes_to_checkout_once_the_email_is_confirmed(client, catalog, fake_stripe):
-    r = client.post("/api/v1/public/signup", json={
-        "company": "Buyer Ltd", "full_name": "Bea Buyer", "email": "bea@buyer.io", "mode": "buy",
+def _buy(client, email="bea@buyer.io"):
+    return client.post("/api/v1/public/signup", json={
+        "company": "Buyer Ltd", "full_name": "Bea Buyer", "email": email, "mode": "buy",
         "interval": "year", "services": [{"service": "biometric"}]})
-    assert r.status_code == 201
-    assert "checkout_url" not in r.json() and "payment" in r.json()["message"]
-    assert not any(path == "checkout/sessions" for _, path, _ in fake_stripe.calls)
+
+
+def _webhook(client, event):
+    import json
+    from obcore.services import stripe_api
+
+    body = json.dumps(event).encode()
+    return client.post("/api/v1/billing/webhook", content=body,
+                       headers={"stripe-signature": stripe_api.sign_for_tests(body, "whsec_test")})
+
+
+def test_buy_now_pays_first_then_gets_the_confirmation_link(client, catalog, fake_stripe):
+
+    r = _buy(client)
+    assert r.status_code == 201, r.text
+    # Straight to Stripe Checkout, no email yet, and nothing created.
+    assert r.json()["checkout_url"].startswith("https://checkout.stripe.test/")
+    assert not [m for m in OUTBOX if m["to"] == "bea@buyer.io"]
+    from obcore.models import Account, User
+    assert _count(Account) == 0 and _count(User) == 0
+    session_id = next(iter(fake_stripe.sessions))
+    assert fake_stripe.sessions[session_id]["customer_email"] == "bea@buyer.io"
+    # Asking for a link before paying sends nothing; signing in explains why.
+    client.post("/api/v1/public/resend", json={"email": "bea@buyer.io"})
+    assert not [m for m in OUTBOX if m["to"] == "bea@buyer.io"]
+    r = client.post("/api/v1/auth/login", json={"email": "bea@buyer.io", "password": "whatever-1"})
+    assert r.status_code == 403 and "paying" in r.json()["detail"].lower()
+    # Paying (the webhook) emails the link...
+    assert _webhook(client, fake_stripe.complete_checkout(session_id, "year")).json()["result"] == "signup paid"
+    mails = [m for m in OUTBOX if m["to"] == "bea@buyer.io"]
+    assert len(mails) == 1 and "payment has been received" in mails[0]["body"]
+    # ...and confirming it creates the account with the paid subscription, no second checkout.
     r = client.post("/api/v1/auth/link/use", json={"token": link_token("bea@buyer.io"), "password": "Secret-Pass-1"})
     assert r.status_code == 200, r.text
-    assert r.json()["checkout_url"].startswith("https://checkout.stripe.test/") and r.json()["access_token"]
+    assert "checkout_url" not in r.json() and r.json()["access_token"]
+    me = client.get("/api/v1/portal/account", headers={"Authorization": f"Bearer {r.json()['access_token']}"}).json()
+    assert [row["status"] for row in me["account"]["services"]] == ["active"]
+    assert sum(1 for _, path, _ in fake_stripe.calls if path == "checkout/sessions") == 1
+
+
+def test_buy_now_return_page_emails_the_link_without_the_webhook(client, catalog, fake_stripe):
+
+    _buy(client)
+    session_id = next(iter(fake_stripe.sessions))
+    # Back from Stripe before the payment has gone through: told to wait, no email.
+    assert client.post("/api/v1/public/signup/paid", json={"session_id": session_id}).status_code == 409
+    assert not [m for m in OUTBOX if m["to"] == "bea@buyer.io"]
+    fake_stripe.complete_checkout(session_id, "year")
+    r = client.post("/api/v1/public/signup/paid", json={"session_id": session_id})
+    assert r.status_code == 200 and r.json() == {"email": "bea@buyer.io"}
+    assert len([m for m in OUTBOX if m["to"] == "bea@buyer.io"]) == 1
+    # The webhook arriving as well, or the page reloaded, changes nothing: still one email.
+    client.post("/api/v1/public/signup/paid", json={"session_id": session_id})
+    assert len([m for m in OUTBOX if m["to"] == "bea@buyer.io"]) == 1
+    assert client.post("/api/v1/auth/link/use", json={
+        "token": link_token("bea@buyer.io"), "password": "Secret-Pass-1"}).status_code == 200
+
+
+def test_a_paid_signup_is_never_charged_twice_or_cleared(client, catalog, fake_stripe):
+    from obcore.db import SessionLocal
+    from obcore.models import PendingSignup
+    from obcore.security import utcnow
+    from obcore.services import signups
+    from datetime import timedelta
+
+    _buy(client)
+    session_id = next(iter(fake_stripe.sessions))
+    _webhook(client, fake_stripe.complete_checkout(session_id, "year"))
+    # Signing up again with the same email: the link is sent again, no second Checkout.
+    r = _buy(client)
+    assert r.status_code == 201 and "checkout_url" not in r.json() and "already paid" in r.json()["message"]
+    assert sum(1 for _, path, _ in fake_stripe.calls if path == "checkout/sessions") == 1
+    assert len([m for m in OUTBOX if m["to"] == "bea@buyer.io"]) == 2
+    # Even long after the link expired, the sweep keeps it, and a new link can be asked for.
+    db = SessionLocal()
+    for row in db.query(PendingSignup):
+        row.expires_at = utcnow() - timedelta(days=30)
+    db.commit()
+    assert signups.clear_expired(db) == 0
+    db.close()
+    client.post("/api/v1/public/resend", json={"email": "bea@buyer.io"})
+    assert client.post("/api/v1/auth/link/use", json={
+        "token": link_token("bea@buyer.io"), "password": "Secret-Pass-1"}).status_code == 200
+
+
+def test_an_unpaid_buy_signup_is_cleared_once_checkout_has_expired(client, catalog, fake_stripe):
+    from obcore.db import SessionLocal
+    from obcore.models import PendingSignup
+    from obcore.security import utcnow
+    from obcore.services import signups
+    from datetime import timedelta
+
+    _buy(client)
+    db = SessionLocal()
+    assert signups.clear_expired(db) == 0   # still inside the checkout window
+    for row in db.query(PendingSignup):
+        row.expires_at = utcnow() - timedelta(minutes=1)
+    db.commit()
+    assert signups.clear_expired(db) == 1
+    db.close()
+
+
+def _paid_signup(client, fake_stripe, email="bea@buyer.io"):
+    _buy(client, email)
+    session_id = next(reversed(fake_stripe.sessions))
+    _webhook(client, fake_stripe.complete_checkout(session_id, "year"))
+    r = client.post("/api/v1/auth/link/use", json={"token": link_token(email), "password": "Secret-Pass-1"})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+def test_a_customer_who_paid_up_front_can_add_the_free_trial_days_once(client, catalog, fake_stripe):
+    from datetime import datetime, timezone
+
+    headers = _paid_signup(client, fake_stripe)
+    account = client.get("/api/v1/portal/account", headers=headers).json()["account"]
+    days = account["free_trial_offer"]["days"]
+    assert days > 0 and account["free_trial_added_days"] is None
+    sub = next(iter(fake_stripe.subscriptions.values()))
+    paid_until = sub["current_period_end"]
+
+    r = client.post("/api/v1/portal/billing/free-trial", headers=headers)
+    assert r.status_code == 200, r.text
+    # Stripe is told to start the next charge `days` after the paid period ends, with no proration:
+    call = next(d for m, p, d in fake_stripe.calls if m == "POST" and p == f"subscriptions/{sub['id']}")
+    assert call["trial_end"] == paid_until + days * 86400 and call["proration_behavior"] == "none"
+    out = r.json()
+    assert out["free_trial_offer"] is None and out["free_trial_added_days"] == days
+    assert [row["status"] for row in out["services"]] == ["active"]      # still just active: paid
+    assert datetime.fromisoformat(out["renews_at"]) == datetime.fromtimestamp(paid_until + days * 86400, tz=timezone.utc)
+    # Only once.
+    assert client.post("/api/v1/portal/billing/free-trial", headers=headers).status_code == 400
+    assert sum(1 for m, p, d in fake_stripe.calls if m == "POST" and "trial_end" in d) == 1
+
+
+def test_nobody_else_is_offered_free_trial_days(client, catalog, fake_stripe):
+    # A trial signup, and an account that bought later from Billing: neither paid at registration.
+    headers = signup(client, email="t@trial.io")
+    assert client.get("/api/v1/portal/account", headers=headers).json()["account"]["free_trial_offer"] is None
+    assert client.post("/api/v1/portal/billing/free-trial", headers=headers).status_code == 400
+
+
+def test_the_free_trial_offer_ends_after_the_window(client, catalog, fake_stripe):
+    from datetime import timedelta
+    from obcore.db import SessionLocal
+    from obcore.models import Account
+    from obcore.security import utcnow
+
+    headers = _paid_signup(client, fake_stripe)
+    db = SessionLocal()
+    for a in db.query(Account):
+        a.created_at = utcnow() - timedelta(days=45)
+    db.commit()
+    db.close()
+    assert client.get("/api/v1/portal/account", headers=headers).json()["account"]["free_trial_offer"] is None
+    assert client.post("/api/v1/portal/billing/free-trial", headers=headers).status_code == 400
 
 
 def test_buy_now_without_stripe_or_yearly_price_is_refused_before_creating_anything(client, catalog):

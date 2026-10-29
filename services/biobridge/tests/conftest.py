@@ -227,6 +227,25 @@ class FakeOdoo:
                 }
         return None
 
+    def attendances_changed_since(self, employee_ids, since, check_in_from):
+        wanted = set(employee_ids)
+        fmt = lambda v: v.strftime("%Y-%m-%d %H:%M:%S") if v else False  # noqa: E731
+        return [
+            {"id": rec["id"], "employee_id": [rec["employee_id"], "x"],
+             "check_in": fmt(rec["check_in"]), "check_out": fmt(rec["check_out"])}
+            for rec in sorted(self.attendances.values(), key=lambda r: r["id"])
+            if rec["employee_id"] in wanted and rec["check_in"] >= check_in_from
+        ]
+
+    def open_attendances(self, employee_ids, started_before):
+        wanted = set(employee_ids)
+        return [
+            {"id": rec["id"], "employee_id": [rec["employee_id"], "x"],
+             "check_in": rec["check_in"].strftime("%Y-%m-%d %H:%M:%S")}
+            for rec in sorted(self.attendances.values(), key=lambda r: r["check_in"])
+            if rec["employee_id"] in wanted and rec["check_out"] is None and rec["check_in"] < started_before
+        ]
+
     def attendance_exists(self, employee_id, check_in):
         for rec in self.attendances.values():
             if rec["employee_id"] == employee_id and rec["check_in"] == check_in:
@@ -523,6 +542,16 @@ def tenant(db):
     )
     db.commit()
     return row
+
+
+@pytest.fixture
+def no_stale_close(monkeypatch):
+    """For tests that replay yesterday's punches across several cycles as if
+    they were live: no shift counts as open past the limit, so the per-sync
+    stale close leaves their open records alone."""
+    from app.services import sync_engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "stale_clock", lambda: datetime(2000, 1, 1))
 
 
 @pytest.fixture

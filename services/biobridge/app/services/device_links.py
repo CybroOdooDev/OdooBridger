@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import timezone
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.integrations.odoo import OdooClient, OdooError
@@ -166,6 +167,29 @@ def link_attendance_devices(
     return report
 
 
+def device_for_serial(db: Session, tenant_id: str, source_id: str, serial: str, **fields) -> tuple[Device, bool]:
+    """The source's terminal with this serial, created if missing.
+    Returns (device, created).
+
+    Safe when another request or process adds the same terminal at the same
+    moment (Import Terminals during a sync, two pushes from one terminal):
+    the insert runs in a savepoint, and losing the race means using the row
+    the other one stored."""
+    existing = db.scalars(select(Device).where(Device.source_id == source_id,
+                                               Device.serial_number == serial)).first()
+    if existing is not None:
+        return existing, False
+    try:
+        with db.begin_nested():
+            device = Device(tenant_id=tenant_id, source_id=source_id, serial_number=serial, **fields)
+            db.add(device)
+        return device, True
+    except IntegrityError:
+        other = db.scalars(select(Device).where(Device.source_id == source_id,
+                                                Device.serial_number == serial)).one()
+        return other, False
+
+
 # Punches that never became (and will not become) attendance: they do not
 # make a deleted terminal worth bringing back.
 _NOT_HISTORY = ("unmapped", "skipped", "deleted")
@@ -196,10 +220,9 @@ def sync_inventory(db: Session, tenant: Tenant, source: DeviceSource, terminals)
         serials.add(serial)
         device = existing.get(serial)
         if device is None:
-            device = Device(tenant_id=tenant.id, source_id=source.id, serial_number=serial)
-            db.add(device)
+            device, created = device_for_serial(db, tenant.id, source.id, serial)
             existing[serial] = device
-            added += 1
+            added += int(created)
         device.alias = terminal.alias or device.alias
         device.area = terminal.area or device.area
         device.ip_address = terminal.ip_address or device.ip_address
@@ -267,13 +290,10 @@ def restore_terminals_from_punches(db: Session, tenant: Tenant, source: DeviceSo
     for serial, count, newest in rows:
         if serial in known or (only is not None and serial not in only):
             continue   # a source with an inventory only gets back terminals it still lists
-        device = Device(
-            tenant_id=tenant.id, source_id=source.id, serial_number=serial,
-            punch_count=count,
+        device, _ = device_for_serial(
+            db, tenant.id, source.id, serial, punch_count=count,
             last_seen_at=newest.replace(tzinfo=newest.tzinfo or timezone.utc) if newest else None,
         )
-        db.add(device)
-        db.flush()
         db.execute(
             update(PunchRecord)
             .where(PunchRecord.tenant_id == tenant.id, PunchRecord.source_id == source.id,

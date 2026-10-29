@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import timedelta
 from urllib.parse import urlencode, urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from obcore import keys
@@ -81,7 +81,13 @@ def exchange(db: Session, client_id: str, client_secret: str, code: str) -> str:
         raise SsoError("This sign-in code was already used.")
     if aware(row.expires_at) < utcnow():
         raise SsoError("This sign-in code has expired. Open the service again from OdooBridger.")
-    row.used_at = utcnow()
+    # Spent in one statement, so two exchanges of the same code at once can't
+    # both see it unused: only the one whose update matched goes on.
+    spent = db.execute(update(SsoCode).where(SsoCode.id == row.id, SsoCode.used_at.is_(None))
+                       .values(used_at=utcnow()))
+    if spent.rowcount != 1:
+        raise SsoError("This sign-in code was already used.")
+    db.expire(row, ["used_at"])
     user = db.get(User, row.user_id)
     if user is None or not user.is_active:
         raise SsoError("This user can no longer sign in.")

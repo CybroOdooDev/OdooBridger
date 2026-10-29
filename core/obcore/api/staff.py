@@ -7,6 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from obcore.api.deps import get_staff, stripe_config
@@ -234,6 +235,10 @@ def add_service(account_id: str, payload: ChoiceIn, request: Request, staff: Sta
     package = db.get(ServicePackage, payload.package_id) if payload.package_id else None
     try:
         billing.add_service(db, account, service, package, trial_days=payload.trial_days)
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{service.name} is already on this account.") from exc
     except (billing.SubscriptionError, stripe.BillingError) as exc:
         db.rollback()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

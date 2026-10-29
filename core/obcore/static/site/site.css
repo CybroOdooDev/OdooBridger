@@ -197,3 +197,7 @@ footer.site-foot { padding: 48px 0 36px; margin-top: 24px; color: var(--muted); 
 .bill-pill .save[hidden] { display: none; }
 .bill-pill button.on .save { background: rgba(255, 255, 255, .22); color: inherit; }
 .bill-pill button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Light / dark switch in the top bar. */
+.site-nav .site-theme { margin: 0 6px 0 0; }
+.site-nav .site-theme .switch { border-color: var(--rule); }

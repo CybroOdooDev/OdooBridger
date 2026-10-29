@@ -7,10 +7,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import TimeoutError as SqlPoolTimeout
 
 from obcore import keys
 from obcore.api import auth, billing_hook, portal, public, sso, staff
@@ -36,7 +37,11 @@ async def lifespan(app: FastAPI):
     _check_production()
     # Migrations: builds, upgrades or adopts the database (obcore/migrations.py).
     create_schema()
-    with session_scope() as db:
+    # Several core processes start together (workers, replicas): the
+    # bootstrap below writes rows each would otherwise race to create.
+    from obcore import locks
+
+    with locks.held(locks.BOOT), session_scope() as db:
         from obcore.services.jobs import ensure_static_staff
 
         from obcore.services.catalog import ensure_biometric, retire_demo
@@ -70,6 +75,15 @@ app = FastAPI(title="OdooBridger Core", version="1.0.0", lifespan=lifespan, docs
 if settings.cors_origin_list:
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(SqlPoolTimeout)
+async def _busy(_: Request, exc: SqlPoolTimeout) -> JSONResponse:
+    """Every database connection of this process is in use: ask the client to
+    retry shortly rather than answer 500 for a moment of overload."""
+    log.warning("Database connection pool exhausted: %s", exc)
+    return JSONResponse(status_code=503, headers={"Retry-After": "2"},
+                        content={"detail": "The service is busy. Please try again in a moment."})
+
 
 api = APIRouter(prefix="/api/v1")
 for module in (auth, public, portal, sso, staff, billing_hook):

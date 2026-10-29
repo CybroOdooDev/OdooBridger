@@ -896,6 +896,49 @@ class OdooClient:
         )
         return {int(r["id"]): r for r in rows}
 
+    def open_attendances(self, employee_ids: list[int], started_before: datetime) -> list[dict[str, Any]]:
+        """Every record still open for these employees that began before
+        ``started_before``, oldest first: one call per 500 employees, rather
+        than one per employee. All of them, not just each person's latest —
+        an old record can stay open behind a newer one."""
+        company_domain = self._company_domain(self.fields_of("hr.attendance"))
+        out: list[dict[str, Any]] = []
+        ids = sorted({int(i) for i in employee_ids if i})
+        for start in range(0, len(ids), 500):
+            out.extend(self.execute(
+                "hr.attendance",
+                "search_read",
+                [[("employee_id", "in", ids[start:start + 500]), ("check_out", "=", False),
+                  ("check_in", "<", fmt_dt(started_before)), *company_domain]],
+                {"fields": ["id", "employee_id", "check_in"], "order": "check_in asc"},
+            ))
+        return out
+
+    def attendances_changed_since(self, employee_ids: list[int], since: datetime,
+                                  check_in_from: datetime) -> list[dict[str, Any]]:
+        """Records of these employees created or changed in Odoo since ``since``
+        (write_date), that start on or after ``check_in_from``. Paged, oldest
+        change first."""
+        company_domain = self._company_domain(self.fields_of("hr.attendance"))
+        out: list[dict[str, Any]] = []
+        ids = sorted({int(i) for i in employee_ids if i})
+        for start in range(0, len(ids), 500):
+            offset = 0
+            while True:
+                page = self.execute(
+                    "hr.attendance",
+                    "search_read",
+                    [[("employee_id", "in", ids[start:start + 500]), ("write_date", ">=", fmt_dt(since)),
+                      ("check_in", ">=", fmt_dt(check_in_from)), *company_domain]],
+                    {"fields": ["id", "employee_id", "check_in", "check_out", "write_date"],
+                     "order": "write_date asc, id asc", "limit": 2000, "offset": offset},
+                )
+                out.extend(page)
+                if len(page) < 2000:
+                    break
+                offset += 2000
+        return out
+
     def attendance_after(self, employee_id: int, moment: datetime) -> dict[str, Any] | None:
         """The earliest record that starts after ``moment``, if any.
 

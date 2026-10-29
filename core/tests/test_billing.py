@@ -175,3 +175,52 @@ def test_checkout_without_stripe_says_so(client, catalog):
     headers = signup(client)
     r = client.post("/api/v1/portal/billing/checkout", headers=headers, json={})
     assert r.status_code == 400 and "not set up" in r.json()["detail"]
+
+
+def test_package_change_can_wait_for_the_next_renewal(client, catalog, fake_stripe, service_app):
+    from datetime import timedelta
+
+    from obcore.db import SessionLocal
+    from obcore.security import utcnow
+    from obcore.services import billing
+
+    headers = signup(client)
+    _pay(client, headers, fake_stripe)
+    r = client.patch("/api/v1/portal/services/biometric", headers=headers,
+                     json={"package_id": catalog["growth"], "when": "period_end"})
+    assert r.status_code == 200, r.text
+    row = r.json()["services"][0]
+    assert row["package"]["id"] == catalog["starter"] and row["pending_change"]["package"]["id"] == catalog["growth"]
+    (sub,) = fake_stripe.subscriptions.values()
+    assert sub["items"]["data"][0]["price"]["id"] == "price_starter_m"      # Stripe is untouched until then
+
+    db = SessionLocal()
+    assert billing.apply_pending_changes(db) == []                           # the period has not ended
+    assert billing.apply_pending_changes(db, now=utcnow() + timedelta(days=400))
+    db.commit()
+    db.close()
+    assert sub["items"]["data"][0]["price"]["id"] == "price_growth_m"
+    assert any(str(c[1]).startswith("subscription_items") and c[2].get("proration_behavior") == "none" for c in fake_stripe.calls)
+    row = client.get("/api/v1/portal/account", headers=headers).json()["account"]["services"][0]
+    assert row["package"]["id"] == catalog["growth"] and row["pending_change"] is None
+
+
+def test_a_scheduled_change_can_be_cancelled_or_replaced_by_changing_now(client, catalog, fake_stripe, service_app):
+    headers = signup(client)
+    _pay(client, headers, fake_stripe)
+    client.patch("/api/v1/portal/services/biometric", headers=headers,
+                 json={"package_id": catalog["growth"], "when": "period_end"})
+    r = client.delete("/api/v1/portal/services/biometric/pending-change", headers=headers)
+    assert r.json()["services"][0]["pending_change"] is None
+    client.patch("/api/v1/portal/services/biometric", headers=headers,
+                 json={"package_id": catalog["growth"], "when": "period_end"})
+    r = client.patch("/api/v1/portal/services/biometric", headers=headers, json={"package_id": catalog["growth"]})
+    row = r.json()["services"][0]
+    assert row["package"]["id"] == catalog["growth"] and row["pending_change"] is None
+
+
+def test_waiting_for_renewal_needs_a_paid_period(client, catalog, service_app):
+    headers = signup(client)
+    r = client.patch("/api/v1/portal/services/biometric", headers=headers,
+                     json={"package_id": catalog["growth"], "when": "period_end"})
+    assert r.status_code in (400, 409, 422)

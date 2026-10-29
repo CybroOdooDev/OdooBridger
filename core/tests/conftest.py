@@ -127,6 +127,7 @@ class FakeStripe:
         self.customers: dict[str, dict] = {}
         self.subscriptions: dict[str, dict] = {}
         self.sessions: dict[str, dict] = {}
+        self.completed: dict[str, dict] = {}
         self.calls: list[tuple[str, str, dict]] = []
 
     def _id(self, prefix: str) -> str:
@@ -146,6 +147,10 @@ class FakeStripe:
             sid = self._id("cs")
             self.sessions[sid] = {"id": sid, **data}
             return {"id": sid, "url": f"https://checkout.stripe.test/{sid}"}
+        if method == "GET" and path.startswith("checkout/sessions/"):
+            sid = path.split("/")[2]
+            return self.completed.get(sid) or {"id": sid, "mode": "subscription", "payment_status": "unpaid",
+                                              "metadata": self.sessions[sid].get("metadata") or {}}
         if method == "POST" and path == "billing_portal/sessions":
             return {"url": "https://billing.stripe.test/portal"}
         if path.startswith("subscriptions/"):
@@ -153,6 +158,10 @@ class FakeStripe:
             if method == "POST":
                 if "cancel_at_period_end" in data:
                     sub["cancel_at_period_end"] = data["cancel_at_period_end"]
+                if "trial_end" in data:   # a trial ends later: no charge until then
+                    sub["trial_end"] = int(data["trial_end"])
+                    sub["current_period_end"] = int(data["trial_end"])
+                    sub["status"] = "trialing"
             if method == "DELETE":
                 sub["status"] = "canceled"
                 sub["items"]["data"] = []
@@ -191,9 +200,12 @@ class FakeStripe:
                                 "price": {"id": li["price"], "recurring": {"interval": interval}}}
                                for li in session["line_items"]]},
         }
-        return {"id": f"evt_{sid}", "type": "checkout.session.completed", "data": {"object": {
-            "mode": "subscription", "subscription": sid, "customer": session["customer"],
-            "client_reference_id": session["client_reference_id"]}}}
+        customer = session.get("customer") or self._id("cus")   # a pay-first signup has none yet
+        done = {"id": session_id, "mode": "subscription", "subscription": sid, "customer": customer,
+                "payment_status": "paid", "metadata": session.get("metadata") or {},
+                "client_reference_id": session["client_reference_id"]}
+        self.completed[session_id] = done
+        return {"id": f"evt_{sid}", "type": "checkout.session.completed", "data": {"object": done}}
 
 
 @pytest.fixture(autouse=True)

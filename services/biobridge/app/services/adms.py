@@ -276,7 +276,7 @@ def parse_users(text: str) -> dict[str, str]:
 def store_punches(db: Session, device: AdmsDevice, events: list[PunchEvent]) -> int:
     """Put a terminal's pushed punches into its tenant's ledger. Returns how
     many were new. Assumes the device is claimed (see claimed_source)."""
-    from app.services.sync_engine import store_punch
+    from app.services.sync_engine import _reload_devices, insert_punches, store_punch
 
     owner = claimed_source(db, device)
     if owner is None or not events:
@@ -298,7 +298,7 @@ def store_punches(db: Session, device: AdmsDevice, events: list[PunchEvent]) -> 
             PunchRecord.tenant_id == tenant.id, PunchRecord.source_id == source.id,
             PunchRecord.external_id.in_(ids[start:start + 500]))).all())
 
-    created = 0
+    fresh = []
     for event in events:
         if event.external_id in seen:
             continue
@@ -307,11 +307,12 @@ def store_punches(db: Session, device: AdmsDevice, events: list[PunchEvent]) -> 
         if punch_utc < floor:
             continue
         event.terminal_alias = source.name
-        store_punch(db, tenant, source, devices, event, punch_utc)
-        created += 1
-    if created:
-        db.flush()
-    return created
+        fresh.append((event, punch_utc))
+    # A terminal re-sends a batch it got no answer for, sometimes while the
+    # first send is still being stored: duplicates are skipped, not an error.
+    return insert_punches(
+        db, fresh, lambda e, t: store_punch(db, tenant, source, devices, e, t),
+        refresh_devices=lambda: _reload_devices(db, source, devices))
 
 
 def remember_users(device: AdmsDevice, users: dict[str, str]) -> None:

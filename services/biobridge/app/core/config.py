@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     max_pages_per_run: int = 100
     max_consecutive_failures: int = 5
     http_timeout_seconds: int = 30
+    #: Database connections per process (each uvicorn worker has its own pool).
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    #: Seconds a request waits for a free connection before answering 503.
+    db_pool_timeout: int = 30
 
     # --- subscriptions ---------------------------------------------------------
     #: Length of a self-signup trial, in days. Applied once, at signup — see

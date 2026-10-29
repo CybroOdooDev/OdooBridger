@@ -30,7 +30,7 @@ function renderLogin() {
       ${field({ name: 'email', label: 'Email', type: 'email', required: true })}
       ${field({ name: 'password', label: 'Password', type: 'password', required: true })}
       <button class="primary" style="width:100%" id="go">Sign In To Console</button>
-    </form>`, { badge: 'staff console', foot: '<a href="/app/">Customer sign-in</a>' });
+    </form>`, { badge: 'staff console' });
   $('#form', root).addEventListener('submit', (e) => {
     e.preventDefault();
     submitting($('#go', root), async () => {
@@ -441,8 +441,7 @@ async function renderAccount(mount, route, { id }) {
           <td class="right nowrap">
             ${r.in_sync ? '' : `<span class="pill warn" title="${esc(r.provision_error || 'The service has not confirmed the latest change yet.')}">Not Synced</span>`}
             <button class="sm" data-manage="${esc(r.service.slug)}">Manage</button>
-            ${r.in_sync ? `<a class="btn sm" href="#/service/${esc(r.service.slug)}">Open Dashboard</a>`
-              : `<button class="sm" data-resync="${esc(r.service.slug)}">Resend</button>`}</td></tr>`).join('')
+            ${r.in_sync ? '' : `<button class="sm" data-resync="${esc(r.service.slug)}">Resend</button>`}</td></tr>`).join('')
           || `<tr><td colspan="6">${empty('No Services', '')}</td></tr>`}</tbody>
       </table></div>
     </div>
@@ -972,8 +971,9 @@ const PAGES = [
   { path: '/closed', title: 'Closed Accounts', icon: 'closed', render: renderClosures },
   { path: '/team', title: 'Staff', icon: 'people', render: renderTeam },
 ];
-const DETAIL = [{ pattern: '/accounts/:id', title: 'Account', render: renderAccount },
-  { pattern: '/service/:slug', title: 'Service', render: renderServiceDashboard }];
+// The per-service dashboard (renderServiceDashboard) is switched off for now:
+// add { pattern: '/service/:slug', ... } here and the nav entries back to restore it.
+const DETAIL = [{ pattern: '/accounts/:id', title: 'Account', render: renderAccount }];
 
 let running = false;
 let again = false;
@@ -994,11 +994,8 @@ async function route() {
         if (m) { page = d; params = m; break; }
       }
     }
-    let navServices = [];
-    try { navServices = (await services()).map((sv) => ({ path: `/service/${sv.slug}`, title: sv.name, icon: 'grid' })); } catch { /* the nav still works without them */ }
     mountShell({
-      nav: [{ label: 'Console', items: PAGES },
-        ...(navServices.length ? [{ label: 'Services', items: navServices }] : [])],
+      nav: [{ label: 'Console', items: PAGES }],
       user: state.me.email,
       pill: staffChip(state.me),
       onSignOut: async () => { await signOut(); state.me = null; unmountShell(); route(); },

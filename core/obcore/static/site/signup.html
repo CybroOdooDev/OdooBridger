@@ -15,6 +15,7 @@
     <a class="brand" href="/"><span class="brand-mark">O</span><span class="brand-word"><b>Odoo</b><span>Bridger</span></span></a>
     <div class="links"><a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a><a href="/site/contact.html">Contact</a></div>
     <span class="spacer"></span>
+    <span class="theme-toggle site-theme" data-site-theme></span>
     <a class="signin" href="/app/" target="_blank" rel="noopener">Sign In</a>
     <a class="btn-lg primary btn-sm" href="/site/signup.html">Start Free Trial</a>
   </div></nav>
@@ -177,6 +178,8 @@
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : 'Please check the form and try again.');
+        // Buy Now: payment first. The confirmation link is emailed once it goes through.
+        if (payload.checkout_url) { window.location.href = payload.checkout_url; return; }
         $('#card').innerHTML = `<div class="done"><h3>Check Your Email</h3><p>${esc(payload.message)}</p>
           <p class="muted" style="font-size:13px">Nothing arrived? Check spam, or <a href="#" id="resend">send it again</a>.</p></div>`;
         $('#resend').addEventListener('click', async (ev) => {
@@ -190,7 +193,32 @@
       }
     });
 
+    // Back from Stripe after paying: confirm the payment, which emails the link.
+    async function afterPayment(sessionId) {
+      $('#card').innerHTML = '<div class="done"><h3>Confirming Your Payment…</h3></div>';
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await fetch('/api/v1/public/signup/paid', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) });
+        const result = await response.json().catch(() => ({}));
+        if (response.ok) {
+          $('#card').innerHTML = `<div class="done"><h3>Payment Received</h3>
+            <p>Check ${esc(result.email)} for a link to confirm it and set your password. Your account is created then.</p>
+            <p class="muted" style="font-size:13px">Nothing arrived? Check spam, or <a href="#" id="resend">send it again</a>.</p></div>`;
+          $('#resend').addEventListener('click', async (ev) => {
+            ev.preventDefault();
+            await fetch('/api/v1/public/resend', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: result.email }) });
+            ev.target.textContent = 'sent';
+          });
+          return;
+        }
+        if (response.status !== 409) { $('#card').innerHTML = `<div class="done"><h3>We Could Not Confirm Your Payment</h3><p>${esc(typeof result.detail === 'string' ? result.detail : 'Please contact us.')}</p></div>`; return; }
+        await new Promise((r) => setTimeout(r, 2000));   // Stripe may be a moment behind
+      }
+      $('#card').innerHTML = '<div class="done"><h3>Payment Is Processing</h3><p>Your confirmation link will be emailed as soon as the payment goes through.</p></div>';
+    }
+
     (async () => {
+      if (params.get('paid') && params.get('session_id')) { afterPayment(params.get('session_id')); return; }
       try { catalog = await (await fetch('/api/v1/public/catalog')).json(); } catch { /* shown empty */ }
       build();
       saveBadge();
@@ -207,7 +235,7 @@
       <nav class="foot-col" aria-label="Product"><h4>Product</h4>
         <a href="/#services">Services</a><a href="/#pricing">Pricing</a><a href="/#how">How It Works</a></nav>
       <nav class="foot-col" aria-label="Company"><h4>Company</h4>
-        <a href="/site/contact.html">Contact Sales</a><a href="/site/contact.html?topic=demo">Book A Demo</a><a href="/app/" target="_blank" rel="noopener">Sign In</a></nav>
+        <a href="/site/contact.html">Contact Sales</a><a href="/site/contact.html?topic=demo">Book A Demo</a><a href="/staff/" target="_blank" rel="noopener">Staff Sign In</a></nav>
       <nav class="foot-col" aria-label="Legal"><h4>Legal</h4>
         <a href="/site/terms.html">Terms</a><a href="/site/privacy.html">Privacy</a></nav>
     </div>

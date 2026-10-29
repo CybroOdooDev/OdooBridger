@@ -45,6 +45,7 @@ def punch(pid, emp, moment, direction=None):
 # --------------------------------------------------------------------------- #
 # The case the whole design turns on
 # --------------------------------------------------------------------------- #
+@pytest.mark.usefixtures("no_stale_close")
 def test_checkout_in_a_later_cycle_closes_the_same_record(db, tenant, local_day, monkeypatch):
     """Check-in in cycle 1, check-out in cycle 2 — the normal polling case."""
     odoo = FakeOdoo()
@@ -72,6 +73,7 @@ def test_checkout_in_a_later_cycle_closes_the_same_record(db, tenant, local_day,
     assert not [r for r in odoo.attendances.values() if r["check_out"] is None]
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_three_cycles_one_shift_stays_one_record(db, tenant, local_day, monkeypatch):
     """A third empty cycle must not disturb what the first two settled."""
     odoo = FakeOdoo()

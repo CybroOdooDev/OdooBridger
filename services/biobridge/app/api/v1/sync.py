@@ -57,7 +57,8 @@ from app.services.scheduling import (
     scheduler_health,
 )
 from app.services.alerts import tenant_alerts
-from app.services.sync_engine import SyncEngine, active_run
+from app.services.run_lock import TenantRunLock
+from app.services.sync_engine import SyncEngine, active_run, close_abandoned_runs
 from app.services.timeutils import utcnow_naive
 
 log = logging.getLogger(__name__)
@@ -275,19 +276,23 @@ def trigger_sync_inline(
     return SyncEngine(db, principal.tenant, "manual").run_cycle()
 
 
-def _run_started(tenant_id: str, run_id: str) -> None:
-    """The background half of /sync/start, with its own session."""
+def _run_started(tenant_id: str, run_id: str, lock: TenantRunLock) -> None:
+    """The background half of /sync/start, with its own session. Takes over
+    the account's sync lock /sync/start took, and releases it."""
     from app.db.session import session_scope
 
-    with session_scope() as db:
-        tenant = db.get(Tenant, tenant_id)
-        run = db.get(SyncRun, run_id)
-        if tenant is None or run is None:
-            return
-        try:
-            SyncEngine(db, tenant, run.triggered_by or "manual", run=run).run_cycle()
-        except Exception:  # noqa: BLE001 — the run row records what it can
-            log.exception("Background sync %s failed", run_id)
+    try:
+        with session_scope() as db:
+            tenant = db.get(Tenant, tenant_id)
+            run = db.get(SyncRun, run_id)
+            if tenant is None or run is None:
+                return
+            try:
+                SyncEngine(db, tenant, run.triggered_by or "manual", run=run, lock=lock).run_cycle()
+            except Exception:  # noqa: BLE001 — the run row records what it can
+                log.exception("Background sync %s failed", run_id)
+    finally:
+        lock.release()
 
 
 @router.post("/sync/start", response_model=SyncRunOut, status_code=status.HTTP_202_ACCEPTED)
@@ -303,15 +308,29 @@ def start_sync(
     for one request (Firefox gives up after five minutes). A cycle already in
     progress is returned instead of starting a second one.
     """
-    running = active_run(db, principal.tenant.id)
-    if running is not None:
-        return running
-    run = SyncRun(tenant_id=principal.tenant.id, status=SyncStatus.running.value, triggered_by="manual",
-                  started_at=datetime.now(timezone.utc), log=[])
-    db.add(run)
-    audit(db, principal, "sync.manual", None, None, request)
-    db.commit()
-    background.add_task(_run_started, principal.tenant.id, run.id)
+    tenant_id = principal.tenant.id
+    lock = TenantRunLock(tenant_id)
+    if not lock.acquire():
+        # A cycle is running (in this process or another): follow that one.
+        return SyncEngine(db, principal.tenant, "manual")._the_running_one()  # noqa: SLF001
+    try:
+        if TenantRunLock.supported():
+            close_abandoned_runs(db, tenant_id)
+        else:
+            running = active_run(db, tenant_id)
+            if running is not None:
+                lock.release()
+                return running
+        run = SyncRun(tenant_id=tenant_id, status=SyncStatus.running.value, triggered_by="manual",
+                      started_at=datetime.now(timezone.utc), log=[])
+        db.add(run)
+        audit(db, principal, "sync.manual", None, None, request)
+        db.commit()
+    except Exception:
+        lock.release()
+        raise
+    # The lock goes with the run to the background task, which releases it.
+    background.add_task(_run_started, tenant_id, run.id, lock)
     return run
 
 

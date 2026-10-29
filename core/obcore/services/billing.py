@@ -121,21 +121,80 @@ def add_service(db: Session, account: Account, service: Service,
     return row
 
 
-def change_package(db: Session, row: AccountService, package: ServicePackage) -> None:
+def change_package(db: Session, row: AccountService, package: ServicePackage, *, when: str = "now") -> None:
+    """Move a service to another package.
+
+    ``when="now"`` changes it at once (a paying account is billed the difference, prorated, on
+    its next invoice). ``when="period_end"`` keeps the current package until the paid period
+    ends, then switches without any proration.
+    """
     if package.service_id != row.service_id:
         raise SubscriptionError("That package belongs to another service.")
     if not package.is_active:
         raise SubscriptionError("That package is no longer sold.")
-    if row.stripe_item_id and stripe.enabled():
+    paying = bool(row.stripe_item_id and stripe.enabled())
+    if when == "period_end":
+        if not paying or not row.account.renews_at:
+            raise SubscriptionError("There is no paid period to wait for. Change the package now.")
+        if package.id == row.package_id:
+            clear_pending_change(row)
+        else:
+            if not package.price_id_for(row.account.billing_interval):
+                raise SubscriptionError(f"{package.name} can't be bought online on this billing interval.")
+            row.pending_package_id = package.id
+            row.pending_package = package
+            row.pending_change_at = row.account.renews_at
+        db.flush()
+        return
+    if paying:
         price = package.price_id_for(row.account.billing_interval)
         if not price:
             raise SubscriptionError(f"{package.name} can't be bought online on this billing interval.")
         stripe.request("POST", f"subscription_items/{row.stripe_item_id}", {
             "price": price, "proration_behavior": "create_prorations"})
+    clear_pending_change(row)
     row.package_id = package.id
     row.package = package
     mark_changed(row)
     db.flush()
+
+
+def clear_pending_change(row: AccountService) -> None:
+    row.pending_package_id = None
+    row.pending_package = None
+    row.pending_change_at = None
+
+
+def apply_pending_changes(db: Session, *, now: datetime | None = None) -> list[AccountService]:
+    """Make the package changes that were waiting for a renewal, once it has come."""
+    now = now or utcnow()
+    done: list[AccountService] = []
+    for row in db.scalars(select(AccountService).where(AccountService.pending_package_id.is_not(None))):
+        if row.status == ServiceStatus.cancelled.value or not row.stripe_item_id:
+            clear_pending_change(row)
+            continue
+        if aware(row.pending_change_at) > now:
+            continue
+        package = row.pending_package
+        if package is None or not package.is_active or not row.account.stripe_subscription_id:
+            clear_pending_change(row)
+            continue
+        price = package.price_id_for(row.account.billing_interval)
+        try:
+            if not price:
+                raise stripe.BillingError("no price")
+            stripe.request("POST", f"subscription_items/{row.stripe_item_id}", {
+                "price": price, "proration_behavior": "none"})
+        except stripe.BillingError:
+            log.warning("Could not apply the scheduled package change for %s; will retry", row.id)
+            continue
+        row.package_id = package.id
+        row.package = package
+        clear_pending_change(row)
+        mark_changed(row)
+        done.append(row)
+    db.flush()
+    return done
 
 
 def remove_service(db: Session, row: AccountService) -> str:
@@ -152,6 +211,7 @@ def remove_service(db: Session, row: AccountService) -> str:
         stripe.request("DELETE", f"subscription_items/{row.stripe_item_id}",
                        {"proration_behavior": "create_prorations"})
         row.stripe_item_id = None
+    clear_pending_change(row)
     _set_status(row, ServiceStatus.cancelled.value)
     db.flush()
     return f"{row.service.name} has been removed."
@@ -214,6 +274,57 @@ def start_checkout(db: Session, account: Account, email: str | None, interval: s
         "cancel_url": f"{base}/app/#/billing?checkout=cancelled",
     })
     return session["url"]
+
+
+#: How long after registering a customer who paid up front can still ask for
+#: their free trial days.
+TRIAL_BONUS_WINDOW_DAYS = 30
+
+
+def trial_bonus_days(account: Account) -> int:
+    """Free trial days this account can still ask for; 0 when there is nothing to offer.
+
+    Only for an account that paid at registration, once, while its first paid
+    period is running: the days are the longest trial among its paid packages.
+    """
+    if not (account.paid_at_signup and account.stripe_subscription_id) or account.trial_bonus_at:
+        return 0
+    if account.cancel_at_period_end or account.stripe_status not in ("active", None):
+        return 0
+    created = aware(account.created_at)
+    if created is None or utcnow() > created + timedelta(days=TRIAL_BONUS_WINDOW_DAYS):
+        return 0
+    days = [r.package.trial_days if r.package.trial_days is not None else settings.default_trial_days
+            for r in account.services if r.package and r.stripe_item_id and r.status != ServiceStatus.cancelled.value]
+    return max(days, default=0)
+
+
+def claim_trial_bonus(db: Session, account: Account) -> int:
+    """Give the free trial days: the first renewal moves back by that many days, nothing is charged.
+
+    The year (or month) already paid for runs in full, and then the trial days
+    follow before the next charge. So the customer gets the trial days *on top
+    of* the paid period, not out of it. Once only.
+    """
+    db.refresh(account, with_for_update=True)   # two clicks at once must not give the days twice
+    days = trial_bonus_days(account)
+    if days <= 0:
+        raise SubscriptionError("There are no free trial days to add to this account.")
+    subscription = stripe.request("GET", f"subscriptions/{account.stripe_subscription_id}")
+    end = _period_end(subscription)
+    if end is None:
+        raise SubscriptionError("Your subscription's renewal date isn't available yet. Try again shortly.")
+    trial_end = end + timedelta(days=days)
+    updated = stripe.request("POST", f"subscriptions/{account.stripe_subscription_id}", {
+        "trial_end": int(trial_end.timestamp()),
+        "proration_behavior": "none",
+    }, idempotency_key=f"trial-bonus-{account.id}")
+    account.trial_bonus_days = days
+    account.trial_bonus_at = utcnow()
+    apply_subscription(db, account, updated)
+    account.renews_at = trial_end
+    db.flush()
+    return days
 
 
 def portal_url(account: Account, flow: str | None = None) -> str:
@@ -377,6 +488,17 @@ def handle_event(db: Session, event: dict[str, Any]) -> str:
     db.add(StripeEvent(id=event_id, type=kind))
     db.flush()
     obj = (event.get("data") or {}).get("object") or {}
+
+    if kind in ("checkout.session.completed", "checkout.session.async_payment_succeeded") \
+            and (obj.get("metadata") or {}).get("pending_signup_id"):
+        # A pay-first signup: no account yet. The confirmation link goes out now.
+        from obcore.services import signups
+        pending = signups.mark_paid(db, obj)
+        if pending is None:
+            log.warning("Paid checkout %s has no matching signup (%s)", obj.get("id"),
+                        (obj.get("metadata") or {}).get("pending_signup_id"))
+            return "unknown signup"
+        return "signup paid"
 
     if kind == "checkout.session.completed":
         if obj.get("mode") != "subscription" or not obj.get("subscription"):

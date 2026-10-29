@@ -80,10 +80,12 @@ def _check(person, password: str) -> None:
 @router.post("/login")
 def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> dict:
     user = db.scalar(select(User).where(User.email == acc.normalise_email(payload.email)))
-    if user is None and db.scalar(select(PendingSignup.id).where(
-            PendingSignup.email == acc.normalise_email(payload.email))):
+    waiting = db.scalar(select(PendingSignup).where(PendingSignup.email == acc.normalise_email(payload.email)))
+    if user is None and waiting is not None:
         raise HTTPException(status.HTTP_403_FORBIDDEN,
-                            "Confirm your email first — open the link we sent you. Your account is created then.")
+                            "Confirm your email first — open the link we sent you. Your account is created then."
+                            if waiting.sent_at else
+                            "Finish paying to create your account — your confirmation link is sent once the payment goes through.")
     if user is not None and user.is_active and not user.hashed_password:
         raise HTTPException(status.HTTP_403_FORBIDDEN,
                             "Confirm your email first — open the link we sent you to choose your password.")
@@ -219,12 +221,16 @@ def _confirm_signup(db: Session, pending, password: str, request: Request) -> di
     if problem:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
     stripe_api.load_config(db)
-    buying = pending.mode == "buy"
     try:
         account, user = signups.complete(db, pending, password)
     except signups.SignupError as exc:
         db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except stripe_api.BillingError as exc:
+        # The link isn't used up: nothing was created, so they can try again.
+        db.rollback()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Could not reach payments just now. Please try this link again in a minute.") from exc
     acc.audit(db, f"user:{user.email}", "account.signup", account_id=account.id, request=request,
               detail=", ".join(r.service.slug for r in account.services) or None)
     db.commit()
@@ -232,11 +238,4 @@ def _confirm_signup(db: Session, pending, password: str, request: Request) -> di
     provisioning.push_account(db, account)
     db.commit()
     out = issue(db, SCOPE_CUSTOMER, user.id, request)
-    if buying:
-        try:
-            out["checkout_url"] = billing.start_checkout(db, account, user.email, account.billing_interval)
-            db.commit()
-        except (billing.SubscriptionError, stripe_api.BillingError):
-            db.rollback()
-            out["notice"] = "Payment could not be started, so your free trial is running. You can pay from Billing."
     return out

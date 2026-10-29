@@ -14,6 +14,8 @@ if the engine ever tries — so this is a strict check, not just a count.
 """
 from __future__ import annotations
 
+import pytest
+
 from sqlalchemy import select
 
 from app.models import AttendanceRecord, PunchRecord, PunchState
@@ -119,14 +121,17 @@ def _crash_after_close_scenario(db, tenant, odoo, local_day, monkeypatch, pairin
     print(f"[{pairing_mode}] retry calls after simulated crash: {new_calls}")
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_crash_after_close_alternating_mode(db, tenant, local_day, monkeypatch):
     _crash_after_close_scenario(db, tenant, FakeOdoo(), local_day, monkeypatch, "alternating")
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_crash_after_close_state_based_mode(db, tenant, local_day, monkeypatch):
     _crash_after_close_scenario(db, tenant, FakeOdoo(), local_day, monkeypatch, "state_based")
 
 
+@pytest.mark.usefixtures("no_stale_close")
 def test_crash_after_close_first_last_mode(db, tenant, local_day, monkeypatch):
     _crash_after_close_scenario(db, tenant, FakeOdoo(), local_day, monkeypatch, "first_last")
 

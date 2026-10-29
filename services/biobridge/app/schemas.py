@@ -996,6 +996,7 @@ class AttendanceOut(ORMModel):
     is_auto_closed: bool
     is_orphan_out: bool
     notes: str | None
+    origin: str = "biobridge"
 
 
 class ScheduleOut(BaseModel):

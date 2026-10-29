@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.core.config import settings
 from app.db.session import session_scope
@@ -47,6 +47,7 @@ log = logging.getLogger(__name__)
 #: out holds an open record that blocks every later check-in for that person, so
 #: it has to happen without anyone asking — but hourly is plenty.
 STALE_CLOSE_EVERY_SECONDS = 3600
+STALE_CLOSE_FIRST_AFTER_SECONDS = 300
 
 #: Renewal dates do not move minute to minute, so the subscription sweep runs
 #: on the same unhurried cadence as the stale-close housekeeping above rather
@@ -216,7 +217,9 @@ class Scheduler:
     def _stale_close_due(self) -> bool:
         now = datetime.now(timezone.utc)
         if self._last_stale_close is None:
-            self._last_stale_close = now  # not on the first tick — let a sync run first
+            # Five minutes after start — let a sync run first — not a full hour:
+            # a process restarted more often than hourly would never get to it.
+            self._last_stale_close = now - timedelta(seconds=STALE_CLOSE_EVERY_SECONDS - STALE_CLOSE_FIRST_AFTER_SECONDS)
             return False
         if (now - self._last_stale_close).total_seconds() < STALE_CLOSE_EVERY_SECONDS:
             return False
