@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from obcore.config import settings
 from obcore.db import session_scope
 from obcore.mailer import try_send
-from obcore.models import OdooConnection, StaffUser
+from obcore.models import AccountService, OdooConnection, StaffUser
 from obcore.security import aware, hash_password, utcnow, verify_password
 from obcore.services import billing, odoo_connections, provisioning, signups
 from obcore.services.accounts import audit, owner_of
@@ -78,6 +78,17 @@ def refresh_odoo_readiness(db: Session, *, now=None) -> int:
         if rows and any(r.odoo_readiness_at is None or aware(r.odoo_readiness_at) < due for r in rows):
             odoo_connections.refresh_readiness(db, conn)
             checked += 1
+    # Services working from an Odoo that was set up inside the service itself have no
+    # connection here, but their setup state is still worth knowing.
+    for row in db.scalars(select(AccountService)):
+        if (row.usable and row.service.uses_odoo and row.odoo_connection_id is None
+                and (row.odoo_readiness_at is None or aware(row.odoo_readiness_at) < due)):
+            try:
+                odoo_connections.record_setup(row, provisioning.usage(db, row))
+            except provisioning.ProvisionError:
+                continue
+            row.odoo_readiness_at = now
+            checked += 1
     return checked
 
 
@@ -127,7 +138,9 @@ def _tick() -> None:
             return
         result = sweep_once(db)
         try:
-            from obcore.services.ops import record_snapshot
+            from obcore.services.ops import note_sweep, record_snapshot
+
+            note_sweep(db)
 
             record_snapshot(db)
         except Exception:  # noqa: BLE001 — a figure for the overview, never worth failing the sweep

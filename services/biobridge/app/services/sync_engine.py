@@ -77,6 +77,16 @@ from app.services.pairing import (
     day_of,
     pair_punches,
 )
+from app.services.name_match import (
+    clear_suggestion,
+    compatible as names_compatible,
+    dismissed,
+    hold_dismissed_badge,
+    name_candidates,
+    suggest_badge_only,
+    suggest_name_only,
+    usable_name,
+)
 from app.services.run_lock import TenantRunLock
 from app.services.timeutils import local_to_utc, utc_to_local, utcnow_naive
 
@@ -1047,6 +1057,8 @@ class SyncEngine:
 
     # -- stage 5 -----------------------------------------------------------
     def _resolve_mappings(self, odoo: OdooClient) -> None:
+        self._roster_cache: list[dict] | None = None   # read once per run, only if a name lookup needs it
+        self._taken_ids: set[int] | None = None
         pending = set(
             self.db.scalars(
                 select(PunchRecord.emp_code).where(
@@ -1125,12 +1137,23 @@ class SyncEngine:
                 mapping.match_note = f"Lookup failed: {exc}"
                 continue
 
+            device_name = usable_name(self._name_for(code), code)
+            if emp_id and device_name and not names_compatible(device_name, emp_name):
+                # The badge is on someone else by name: a person decides.
+                if dismissed(mapping):
+                    hold_dismissed_badge(mapping, code, device_name, emp_name)
+                else:
+                    suggest_badge_only(mapping, code, device_name, emp_id, emp_name)
+                continue
             if emp_id:
                 mapping.odoo_employee_id = emp_id
                 mapping.odoo_employee_name = emp_name
                 mapping.status = MappingStatus.mapped.value
                 mapping.match_method = method
                 mapping.match_note = None
+                clear_suggestion(mapping)
+                if self._taken_ids is not None:
+                    self._taken_ids.add(emp_id)
                 matched += 1
                 mapped_count += 1
             elif method and method.startswith("ambiguous:"):
@@ -1140,6 +1163,8 @@ class SyncEngine:
                     "Pick one in the dashboard."
                 )
             elif self._in_switched_off_company(odoo, code, mapping):
+                continue
+            elif device_name and not dismissed(mapping) and self._suggest_by_name(odoo, code, device_name, mapping):
                 continue
             elif self.tenant.auto_create_employees:
                 name = self._name_for(code) or f"Employee {code}"
@@ -1154,6 +1179,7 @@ class SyncEngine:
                 matched += 1
                 mapped_count += 1
             else:
+                clear_suggestion(mapping)
                 mapping.status = MappingStatus.unmapped.value
                 mapping.source_name = self._name_for(code)
                 mapping.match_note = (
@@ -1165,6 +1191,33 @@ class SyncEngine:
         self.db.flush()
         if matched:
             self._log(f"Matched {matched} new employee(s) to Odoo")
+
+    def _suggest_by_name(self, odoo: OdooClient, code: str, device_name: str,
+                         mapping: EmployeeMapping) -> bool:
+        """A badge found nowhere in Odoo whose name is: suggest that employee
+        instead of creating a duplicate. True when the badge was dealt with
+        (suggested, or held because Odoo's roster could not be read), False when
+        nobody by that name exists and the usual path (create / leave) goes on."""
+        try:
+            if self._roster_cache is None:
+                self._roster_cache = [r for r in odoo.list_employees() if r.get("active", True)]
+        except OdooError as exc:
+            # Creating blind could duplicate someone who is there: wait instead.
+            mapping.match_note = f"Lookup failed: {exc}"
+            return True
+        if self._taken_ids is None:
+            self._taken_ids = set(self.db.scalars(
+                select(EmployeeMapping.odoo_employee_id).where(
+                    EmployeeMapping.tenant_id == self.tenant.id,
+                    EmployeeMapping.status == MappingStatus.mapped.value,
+                    EmployeeMapping.odoo_employee_id.is_not(None),
+                )
+            ).all())
+        found = name_candidates(device_name, self._roster_cache, self._taken_ids)
+        if not found:
+            return False
+        suggest_name_only(mapping, code, device_name, found[0], len(found) - 1)
+        return True
 
     def _in_switched_off_company(
         self, odoo: OdooClient, code: str, mapping: EmployeeMapping

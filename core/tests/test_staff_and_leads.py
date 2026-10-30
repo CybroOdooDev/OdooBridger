@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from obcore.mailer import OUTBOX
 from tests.conftest import signup, staff_headers
 
@@ -77,7 +79,7 @@ def test_staff_lists_and_filters_accounts(client, catalog):
     by_email = client.get("/api/v1/staff/accounts?q=a@one", headers=staff).json()
     assert [a["name"] for a in by_email] == ["One"]
     overview = client.get("/api/v1/staff/overview", headers=staff).json()
-    assert overview["kpis"]["customers"]["value"] == 2
+    assert overview["kpis"]["new_customers"]["value"] == 2
 
 
 def test_staff_creates_an_account_with_a_comped_service(client, catalog, service_app):
@@ -185,3 +187,55 @@ def test_a_won_lead_is_closed(client, catalog):
     r = client.post(f"/api/v1/staff/leads/{lead_id}/notes", headers=staff, json={"note": "Signed the contract"})
     assert r.status_code == 201
     assert client.get(f"/api/v1/staff/leads/{lead_id}", headers=staff).json()["stage"] == "won"
+
+
+# --- the accounts list: one Billing pill however many services -------------------------
+def _state(statuses, *, trial_in_days=None, account_status="active"):
+    """Billing state of an account whose services have the given statuses."""
+    from types import SimpleNamespace as NS
+
+    from obcore.security import utcnow
+    from obcore.services import dashboard
+
+    now = utcnow()
+    rows = [NS(status=s, trial_ends_at=(now + timedelta(days=trial_in_days, hours=-1)) if s == "trialing" and trial_in_days is not None else None)
+            for s in statuses]
+    return dashboard.billing_state(NS(services=rows, status=account_status, renews_at=now + timedelta(days=20)), now)
+
+
+def test_billing_pill_is_worst_wins_whatever_the_number_of_services():
+    assert _state([])["key"] == "none"
+    assert _state(["cancelled"])["key"] == "none"
+    paying = _state(["active"])
+    assert (paying["label"], paying["renews_at"]) == ("Paying", paying["renews_at"]) and paying["renews_at"]
+    assert _state(["active", "active", "active"])["key"] == "paying"
+    trial = _state(["trialing"], trial_in_days=12)
+    assert (trial["key"], trial["label"], trial["note"]) == ("trial", "Trial · ends in 12 d", None)
+    mixed = _state(["active", "trialing"], trial_in_days=20)
+    assert (mixed["key"], mixed["label"], mixed["note"]) == ("mixed", "Paying + Trial", "1 paying · 1 on trial")
+    ending = _state(["active", "trialing"], trial_in_days=3)
+    assert (ending["key"], ending["label"], ending["tone"]) == ("trial_ending", "Trial · ends in 3 d", "warn")
+    assert ending["note"] == "1 paying · 1 on trial"
+    assert _state(["trialing"], trial_in_days=0)["label"] == "Trial · ends today"
+    due = _state(["active", "trialing", "past_due"], trial_in_days=2)       # past due beats a trial about to end
+    assert (due["key"], due["label"], due["note"]) == ("past_due", "Payment Due", "1 of 3 services")
+
+
+def test_urgency_order_is_payment_due_then_suspended_then_trials_by_end():
+    rank = lambda *a, **k: _state(*a, **k)["rank"]          # noqa: E731
+    order = [rank(["past_due"]), rank(["active"], account_status="suspended"), rank(["trialing"], trial_in_days=2),
+             rank(["trialing"], trial_in_days=12), rank(["active", "trialing"], trial_in_days=20), rank(["active"]), rank([])]
+    assert order == sorted(order) and len(set(order)) == len(order)
+
+
+def test_accounts_list_carries_billing_and_filters_by_it(client, catalog, service_app):
+    signup(client)
+    signup(client, email="b@beta.io", company="Beta")
+    headers = staff_headers(client)
+    rows = client.get("/api/v1/staff/accounts", headers=headers).json()
+    assert {r["billing"]["key"] for r in rows} <= {"trial", "trial_ending", "none"}
+    assert all("paying_cents" in r and "after_trial_cents" in r for r in rows)
+    none = client.get("/api/v1/staff/accounts", params={"billing_filter": "past_due"}, headers=headers).json()
+    assert none == []
+    trial = client.get("/api/v1/staff/accounts", params={"billing_filter": "trial"}, headers=headers).json()
+    assert len(trial) == len(rows) - sum(r["billing"]["key"] == "none" for r in rows)

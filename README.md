@@ -11,6 +11,7 @@ odoobridger/
 │   └── tests/            core tests (fake Stripe, fake service)
 ├── services/
 │   └── biobridge/        the biometric service — BioBridge, with platform mode
+├── mock-biotime/         a stand-in BioTime server in one Docker image, for development
 ├── tests_e2e/            core + BioBridge in one process, the whole journey
 └── deploy/               docker compose, Caddy (three hostnames), .env example
 ```

@@ -62,6 +62,11 @@ class Account(Base, UUIDPk, Timestamped):
     paid_at_signup: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     trial_bonus_days: Mapped[int | None] = mapped_column(Integer)
     trial_bonus_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When the account first paid online (trial conversion, new revenue).
+    first_paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: The monthly recurring revenue last recorded for it; a change writes a BillingEvent.
+    #: None until first measured (no event is written for that first reading).
+    recorded_mrr_cents: Mapped[int | None] = mapped_column(Integer)
 
     #: The lead this account came from, when staff converted one.
     lead_id: Mapped[str | None] = mapped_column(String(32))
@@ -470,6 +475,40 @@ class StripeEvent(Base, Timestamped):
     type: Mapped[str] = mapped_column(String(80))
 
 
+class BillingEvent(Base, UUIDPk, Timestamped):
+    """Something that moved money or recurring revenue, for the staff revenue figures.
+
+    kinds: ``new`` (first paid subscription), ``reactivation``, ``upgrade``, ``downgrade``,
+    ``churn`` (stopped paying), ``payment`` (an invoice paid), ``payment_failed``.
+    """
+
+    __tablename__ = "billing_event"
+    __table_args__ = (Index("ix_billing_event_kind_created", "kind", "created_at"),)
+
+    account_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    account_name: Mapped[str | None] = mapped_column(String(160))
+    kind: Mapped[str] = mapped_column(String(20))
+    #: Money moved (payments), in the smallest currency unit.
+    amount_cents: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str | None] = mapped_column(String(8))
+    #: Monthly recurring revenue before and after (revenue changes).
+    mrr_before_cents: Mapped[int | None] = mapped_column(Integer)
+    mrr_after_cents: Mapped[int | None] = mapped_column(Integer)
+    #: The Stripe object behind it (an invoice), so a webhook delivered twice counts once.
+    external_id: Mapped[str | None] = mapped_column(String(80), unique=True)
+
+
+class ServiceCheck(Base, UUIDPk, Timestamped):
+    """One health check of a service, kept 30 days for availability and response time."""
+
+    __tablename__ = "service_check"
+    __table_args__ = (Index("ix_service_check_slug_created", "service_slug", "created_at"),)
+
+    service_slug: Mapped[str] = mapped_column(String(64))
+    ok: Mapped[bool] = mapped_column(Boolean)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+
+
 class AuditLog(Base, UUIDPk, Timestamped):
     __tablename__ = "audit_log"
     __table_args__ = (Index("ix_audit_account_created", "account_id", "created_at"),)
@@ -507,6 +546,12 @@ class MetricSnapshot(Base, Timestamped):
     mrr_cents: Mapped[int] = mapped_column(Integer, default=0)
     customers: Mapped[int] = mapped_column(Integer, default=0)
     subscriptions: Mapped[int] = mapped_column(Integer, default=0)
+    #: Customers paying online, open leads, failing integrations, accounts with an unpaid invoice.
+    paying: Mapped[int | None] = mapped_column(Integer)
+    open_leads: Mapped[int | None] = mapped_column(Integer)
+    failed_integrations: Mapped[int | None] = mapped_column(Integer)
+    outstanding: Mapped[int | None] = mapped_column(Integer)
+    outstanding_cents: Mapped[int | None] = mapped_column(Integer)
 
 
 class AlertState(Base, Timestamped):

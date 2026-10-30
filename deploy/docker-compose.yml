@@ -104,5 +104,26 @@ services:
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
 
+  # --- development: a mock BioTime server (profile "mock") --------------------
+  # Self-contained: no tenant, no BioBridge database, no Odoo. Sample people and
+  # a week of punches, plus a live simulator. Started only on request:
+  #   docker compose -f deploy/docker-compose.yml --profile mock up -d --build mock-biotime
+  # BioBridge reaches it on the compose network as http://mock-biotime:8100 (login
+  # admin / admin, Server Timezone Asia/Kolkata). That address is private, so
+  # BioBridge only accepts it with BIOBRIDGE_ALLOW_PRIVATE_TARGETS=true.
+  mock-biotime:
+    <<: *restart
+    profiles: [mock]
+    build: {context: ../mock-biotime}
+    image: ${MOCK_BIOTIME_IMAGE:-mock-biotime:latest}
+    ports: ["${MOCK_BIOTIME_PORT:-8100}:8100"]
+    environment:
+      MOCK_TZ: ${MOCK_TZ:-Asia/Kolkata}
+      MOCK_USERNAME: ${MOCK_USERNAME:-admin}
+      MOCK_PASSWORD: ${MOCK_PASSWORD:-admin}
+      MOCK_INTERVAL: ${MOCK_INTERVAL:-20}
+    volumes: [mockdata:/data]
+
 volumes:
   pgdata:
+  mockdata:

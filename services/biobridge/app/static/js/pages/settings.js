@@ -458,10 +458,10 @@ async function renderPairing(mount) {
 
   mount.innerHTML = `
     ${topBanners(ctx)}
-    <div class="card pairing-help-card">${pairingGuide(tenant.pairing_mode)}</div>
     <form id="form" ${readonly ? 'inert' : ''}>
       <div class="card">
         ${cardHead('Pairing', '', saveButton(readonly))}
+        <div class="pairing-help-box">${pairingGuide(tenant.pairing_mode)}</div>
         ${field({
           name: 'pairing_mode', label: 'Mode', value: tenant.pairing_mode, required: true,
           options: [
@@ -737,7 +737,7 @@ async function renderOdoo(mount, route) {
   // Platform mode with a connection made here before OdooBridger owned it:
   // it keeps syncing, read-only, until the same Odoo is connected there.
   const locked = managed || platform.on;
-  const portalOdoo = `${platform.info?.portal_url || '/'}#/odoo`;
+  const portalOdoo = `${platform.info?.portal_url || '/'}#/odoo?from=biobridge`;
   if (platform.on && !odoo) {
     mount.innerHTML = `<div class="card">${cardHead('Odoo', '')}
       ${banner('Connect Odoo In OdooBridger',

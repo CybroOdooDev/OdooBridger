@@ -76,6 +76,19 @@ if settings.cors_origin_list:
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
 
+@app.middleware("http")
+async def _count_requests(request: Request, call_next):
+    from obcore import request_meter
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_meter.note(500, request.url.path)
+        raise
+    request_meter.note(response.status_code, request.url.path)
+    return response
+
+
 @app.exception_handler(SqlPoolTimeout)
 async def _busy(_: Request, exc: SqlPoolTimeout) -> JSONResponse:
     """Every database connection of this process is in use: ask the client to

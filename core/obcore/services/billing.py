@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from obcore.config import settings
 from obcore.models import (
-    Account, AccountService, Service, ServicePackage, ServiceStatus, StripeEvent,
+    Account, AccountService, BillingEvent, Service, ServicePackage, ServiceStatus, StripeEvent,
 )
 from obcore.security import aware, utcnow
 from obcore.services import stripe_api as stripe
@@ -107,6 +107,7 @@ def add_service(db: Session, account: Account, service: Service,
         row.stripe_item_id = item["id"]
         row.trial_ends_at = None
         row.status = ServiceStatus.active.value
+        note_revenue(db, account)
     else:
         days = trial_days if trial_days is not None else (
             package.trial_days if package.trial_days is not None else settings.default_trial_days)
@@ -155,6 +156,8 @@ def change_package(db: Session, row: AccountService, package: ServicePackage, *,
     clear_pending_change(row)
     row.package_id = package.id
     row.package = package
+    if paying:
+        note_revenue(db, row.account)
     mark_changed(row)
     db.flush()
 
@@ -191,6 +194,7 @@ def apply_pending_changes(db: Session, *, now: datetime | None = None) -> list[A
         row.package_id = package.id
         row.package = package
         clear_pending_change(row)
+        note_revenue(db, row.account)
         mark_changed(row)
         done.append(row)
     db.flush()
@@ -213,6 +217,7 @@ def remove_service(db: Session, row: AccountService) -> str:
         row.stripe_item_id = None
     clear_pending_change(row)
     _set_status(row, ServiceStatus.cancelled.value)
+    note_revenue(db, account)
     db.flush()
     return f"{row.service.name} has been removed."
 
@@ -396,6 +401,60 @@ def payment_method(account: Account) -> dict[str, Any] | None:
             "exp_month": card.get("exp_month"), "exp_year": card.get("exp_year")}
 
 
+def paid_mrr_cents(account: Account) -> int:
+    """Recurring revenue the account pays online, per month (yearly prices / 12)."""
+    total = 0
+    for row in account.services:
+        if not row.stripe_item_id or not row.package or row.status not in (
+                ServiceStatus.active.value, ServiceStatus.past_due.value):
+            continue
+        cents = row.package.price_cents_for(account.billing_interval) or 0
+        total += cents // 12 if account.billing_interval == "year" else cents
+    return total
+
+
+def note_revenue(db: Session, account: Account) -> BillingEvent | None:
+    """Record a change in the account's recurring revenue (new, upgrade, churn …)."""
+    now_mrr = paid_mrr_cents(account)
+    first = False
+    if now_mrr and account.first_paid_at is None:
+        account.first_paid_at = utcnow()
+        first = True
+    recorded = account.recorded_mrr_cents
+    account.recorded_mrr_cents = now_mrr
+    if recorded is None and not first:
+        return None   # first reading of an account that was paying before this was tracked
+    before = recorded or 0
+    if before == now_mrr:
+        return None
+    if before == 0:
+        kind = "new" if first else "reactivation"
+    elif now_mrr == 0:
+        kind = "churn"
+    else:
+        kind = "upgrade" if now_mrr > before else "downgrade"
+    event = BillingEvent(account_id=account.id, account_name=account.name, kind=kind,
+                         mrr_before_cents=before, mrr_after_cents=now_mrr)
+    db.add(event)
+    return event
+
+
+def note_payment(db: Session, account: Account | None, invoice: dict[str, Any], *, failed: bool) -> None:
+    """An invoice paid, or a payment attempt that failed, once per Stripe object."""
+    inv_id = invoice.get("id")
+    if not inv_id:
+        return
+    external = f"{'fail' if failed else 'pay'}:{inv_id}" + (f":{invoice.get('attempt_count') or 0}" if failed else "")
+    if db.scalar(select(BillingEvent).where(BillingEvent.external_id == external)):
+        return
+    amount = invoice.get("amount_due") if failed else invoice.get("amount_paid")
+    if not failed and not amount:
+        return
+    db.add(BillingEvent(account_id=account.id if account else None, account_name=account.name if account else None,
+                        kind="payment_failed" if failed else "payment", amount_cents=amount or 0,
+                        currency=invoice.get("currency"), external_id=external))
+
+
 def monthly_total_cents(account: Account) -> int:
     """What the account's services add up to per month (yearly prices / 12)."""
     total = 0
@@ -405,6 +464,22 @@ def monthly_total_cents(account: Account) -> int:
         cents = row.package.price_cents_for(account.billing_interval) or 0
         total += cents // 12 if account.billing_interval == "year" else cents
     return total
+
+
+def split_monthly_cents(account: Account) -> tuple[int, int]:
+    """(paying, after_trial): what the account is billed per month now, and what its
+    services still on a free trial will add once they start paying."""
+    paying = trial = 0
+    for row in account.services:
+        if not row.package or row.status in (ServiceStatus.cancelled.value, ServiceStatus.suspended.value):
+            continue
+        cents = row.package.price_cents_for(account.billing_interval) or 0
+        cents = cents // 12 if account.billing_interval == "year" else cents
+        if row.status == ServiceStatus.trialing.value:
+            trial += cents
+        else:
+            paying += cents
+    return paying, trial
 
 
 # =============================================================================
@@ -477,6 +552,7 @@ def apply_subscription(db: Session, account: Account, subscription: dict[str, An
     if ended:
         account.stripe_subscription_id = None
         account.cancel_at_period_end = False
+    note_revenue(db, account)
     db.flush()
 
 
@@ -528,6 +604,10 @@ def handle_event(db: Session, event: dict[str, Any]) -> str:
             return "stale subscription"
         account.stripe_subscription_id = sub_id
         apply_subscription(db, account, subscription)
+        if kind in ("invoice.paid", "invoice.payment_succeeded"):
+            note_payment(db, account, obj, failed=False)
+        elif kind == "invoice.payment_failed":
+            note_payment(db, account, obj, failed=True)
         return "applied"
     return "ignored"
 

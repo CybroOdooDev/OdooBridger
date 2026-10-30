@@ -561,11 +561,12 @@ const KPI_ICONS = {
 export const kpiIcon = (n) => `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${KPI_ICONS[n] || ''}</svg>`;
 
 /** A figure card with an icon (staff overview, leads). */
-export function kpi({ icon, tone, label, value, badgeHtml = '', note, href }) {
+export function kpi({ icon, tone, label, value, badgeHtml = '', note, href, title = '' }) {
   const inner = `<div class="kpi-ic ${tone}">${kpiIcon(icon)}</div>
     <div class="kpi-body"><div class="kpi-k">${esc(label)}</div>
       <div class="kpi-v">${esc(value)}${badgeHtml}</div>${note ? `<div class="kpi-n">${note}</div>` : ''}</div>`;
-  return href ? `<a class="kpi" href="${esc(href)}">${inner}</a>` : `<div class="kpi">${inner}</div>`;
+  const hover = title ? ` title="${esc(title)}"` : '';
+  return href ? `<a class="kpi" href="${esc(href)}"${hover}>${inner}</a>` : `<div class="kpi"${hover}>${inner}</div>`;
 }
 
 

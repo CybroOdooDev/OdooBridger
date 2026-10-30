@@ -406,5 +406,7 @@ def usage(db: Session, tenant: Tenant, *, check_odoo: bool = False) -> dict[str,
         "sync_interval_minutes": tenant.sync_interval_minutes,
         "last_sync": {"status": last.status, "started_at": last.started_at.isoformat() if last.started_at else None}
         if last else None,
+        # Initial setup is done once a sync has run: that needs Odoo and a source of punches.
+        "setup_complete": last is not None,
         "odoo": odoo_readiness(db, tenant, live=check_odoo),
     }

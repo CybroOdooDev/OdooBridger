@@ -71,12 +71,23 @@ def service_dashboard(slug: str, fresh: bool = False, _: StaffUser = Depends(get
     return out
 
 
+@router.get("/services/{slug}/health-history")
+def service_health_history(slug: str, _: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    """The last 24 hours of the core's checks of one service (the Service Health dialog)."""
+    from obcore.models import Service
+    from obcore.services import ops
+
+    if db.scalar(select(Service.id).where(Service.slug == slug)) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such service.")
+    return ops.history_detail(db, slug)
+
+
 # =============================================================================
 # Accounts
 # =============================================================================
 @router.get("/accounts")
 def list_accounts(q: str | None = None, status_filter: str | None = None, service: str | None = None,
-                  _: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> list[dict]:
+                  billing_filter: str | None = None, _: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> list[dict]:
     stmt = select(Account).order_by(Account.created_at.desc())
     if q:
         like = f"%{q.strip().lower()}%"
@@ -84,11 +95,19 @@ def list_accounts(q: str | None = None, status_filter: str | None = None, servic
             select(User.account_id).where(func.lower(User.email).like(like)))))
     if status_filter:
         stmt = stmt.where(Account.status == status_filter)
+    from obcore.services import dashboard
+
+    now = utcnow()
     out = []
     for account in db.scalars(stmt).all():
         if service and not any(r.service.slug == service for r in account.services):
             continue
+        state = dashboard.billing_state(account, now)
+        if billing_filter and state["key"] not in dashboard.BILLING_FILTERS.get(billing_filter, {billing_filter}):
+            continue
         row = account_out(account)
+        row["billing"] = state
+        row["paying_cents"], row["after_trial_cents"] = billing.split_monthly_cents(account)
         owner = acc.owner_of(account)
         row["owner_email"] = owner.email if owner else None
         row["users_count"] = len(account.users)

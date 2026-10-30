@@ -70,3 +70,19 @@ def test_reports_show_only_the_signed_in_account(client, catalog):
     client.patch("/api/v1/portal/account", headers=a, json={"name": "One Holdings"})
     events_b = client.get("/api/v1/portal/reports/activity", headers=b).json()["events"]
     assert all(e["who"] != "a@one.io" for e in events_b)
+
+
+def test_setup_state_comes_from_the_service(client, catalog, service_app):
+    from obcore.db import SessionLocal
+    from obcore.models import AccountService
+    from obcore.services import odoo_connections
+
+    headers = signup(client)
+    row = client.get("/api/v1/portal/account", headers=headers).json()["account"]["services"][0]
+    assert row["setup_complete"] is None
+    db = SessionLocal()
+    odoo_connections.record_setup(db.query(AccountService).one(), {"setup_complete": True})
+    db.commit()
+    db.close()
+    row = client.get("/api/v1/portal/account", headers=headers).json()["account"]["services"][0]
+    assert row["setup_complete"] is True

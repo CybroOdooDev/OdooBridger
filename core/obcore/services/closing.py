@@ -7,7 +7,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from obcore.models import Account, AccountClosure
+from obcore.models import Account, AccountClosure, BillingEvent
 from obcore.services import billing, provisioning
 from obcore.services.accounts import audit, owner_of
 
@@ -31,7 +31,12 @@ def delete_account(db: Session, account: Account, *, actor: str, reason: str | N
     if failures and not force:
         raise ClosingError("Not deleted — these services could not delete the account's data: "
                            + "; ".join(failures))
+    lost = billing.paid_mrr_cents(account)
     billing.cancel_now(account)
+    if lost:
+        db.add(BillingEvent(account_id=account.id, account_name=account.name, kind="churn",
+                            mrr_before_cents=account.recorded_mrr_cents if account.recorded_mrr_cents is not None else lost,
+                            mrr_after_cents=0))
     owner = owner_of(account)
     db.add(AccountClosure(account_id=account.id, account_name=account.name,
                           owner_email=owner.email if owner else None,

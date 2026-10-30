@@ -142,6 +142,20 @@ if settings.cors_origin_list:
         allow_headers=["*"],
     )
 
+@app.middleware("http")
+async def _count_requests(request, call_next):
+    """Requests answered and failed, for the platform's service health (in memory)."""
+    from app.services import request_meter
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_meter.note(500, request.url.path)
+        raise
+    request_meter.note(response.status_code, request.url.path)
+    return response
+
+
 app.include_router(api_router, prefix=settings.api_v1_prefix)
 # ZKTeco push terminals call fixed paths at the root — see app/api/adms.py.
 app.include_router(adms_receiver.router)

@@ -255,12 +255,32 @@ def provision_block(row: AccountService) -> dict[str, Any] | None:
 
 
 # --- readiness, reported by the services ---------------------------------------------
-def record_readiness(db: Session, row: AccountService, report: dict[str, Any] | None) -> None:
+def record_setup(row: AccountService, usage: dict[str, Any] | None) -> None:
+    """Remember whether the service says its initial setup is finished."""
+    if isinstance(usage, dict) and "setup_complete" in usage:
+        row.odoo_readiness = {**(row.odoo_readiness or {}), "setup_complete": bool(usage["setup_complete"])}
+        row.odoo_readiness_at = utcnow()
+        mark_changed_json(row)
+
+
+def mark_changed_json(row: AccountService) -> None:
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(row, "odoo_readiness")
+
+
+def record_readiness(db: Session, row: AccountService, report: dict[str, Any] | None,
+                     usage: dict[str, Any] | None = None) -> None:
     """Store a service's own check; an auth failure it saw marks the connection failed."""
     if not isinstance(report, dict):
+        record_setup(row, usage)
         return
+    setup = (row.odoo_readiness or {}).get("setup_complete")
     row.odoo_readiness = {k: report.get(k) for k in ("ready", "message", "checks", "auth_failed", "checked_at")}
+    if setup is not None:
+        row.odoo_readiness["setup_complete"] = setup
     row.odoo_readiness_at = utcnow()
+    record_setup(row, usage)
     conn = row.odoo_connection
     if conn is not None and report.get("auth_failed") and conn.status != OdooConnectionStatus.failed.value:
         _fail(conn, report.get("message") or f"{row.service.name} could not sign in to Odoo.")
@@ -279,7 +299,7 @@ def refresh_readiness(db: Session, conn: OdooConnection, *, live: bool = False) 
         except provisioning.ProvisionError as exc:
             log.info("Readiness of %s for %s unavailable: %s", row.service.slug, row.account_id, exc)
             continue
-        record_readiness(db, row, (usage or {}).get("odoo"))
+        record_readiness(db, row, (usage or {}).get("odoo"), usage)
     db.flush()
 
 

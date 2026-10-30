@@ -1,0 +1,43 @@
+# The mock BioTime on its own:
+#
+#   docker compose up -d --build
+#   curl localhost:8100/mock/state
+#
+# Point a BioBridge connection at it:
+#   Server URL        http://host.docker.internal:8100   (BioBridge in Docker, mock on this machine)
+#                     http://localhost:8100              (BioBridge run directly on this machine)
+#   Username/Password admin / admin
+#   Server Timezone   the MOCK_TZ below
+#
+# Every setting is optional. Put them in a .env file next to this one, or
+# export them. See README.md for what each one does.
+
+name: mock-biotime
+
+services:
+  mock-biotime:
+    build: .
+    image: mock-biotime:latest
+    ports: ["${MOCK_HOST_PORT:-8100}:8100"]
+    environment:
+      MOCK_TZ: ${MOCK_TZ:-Asia/Kolkata}
+      MOCK_USERNAME: ${MOCK_USERNAME:-admin}
+      MOCK_PASSWORD: ${MOCK_PASSWORD:-admin}
+      MOCK_AUTH: ${MOCK_AUTH:-strict}
+      MOCK_INTERVAL: ${MOCK_INTERVAL:-20}
+      MOCK_SEED_DAYS: ${MOCK_SEED_DAYS:-7}
+      MOCK_TOKEN_TTL: ${MOCK_TOKEN_TTL:-0}
+      MOCK_UPLOAD_FILTER: ${MOCK_UPLOAD_FILTER:-from}
+      MOCK_MAX_PAGE_SIZE: ${MOCK_MAX_PAGE_SIZE:-100}
+      MOCK_FIXTURES: ${MOCK_FIXTURES:-}
+    volumes:
+      - mockdata:/data
+      # Your own people and terminals instead of the built-in ones:
+      #   MOCK_FIXTURES=/fixtures.json  and  - ./fixtures.json:/fixtures.json:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  mockdata:

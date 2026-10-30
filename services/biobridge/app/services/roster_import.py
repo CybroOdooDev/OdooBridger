@@ -19,6 +19,16 @@ from app.integrations.base import Capability, get_provider_class
 from app.integrations.odoo import MATCH_FIELDS, OdooClient, OdooError
 from app.models import DeviceSource, EmployeeMapping, MappingStatus, OdooConnection, Tenant
 from app.services.connections import build_odoo_client, build_source_provider
+from app.services.name_match import (
+    clear_suggestion,
+    compatible,
+    dismissed,
+    hold_dismissed_badge,
+    name_candidates,
+    suggest_badge_only,
+    suggest_name_only,
+    usable_name,
+)
 
 log = logging.getLogger(__name__)
 
@@ -103,10 +113,11 @@ def import_matched_employees(
             )
         ) or 0
 
+    taken = {m.odoo_employee_id for m in existing.values()
+             if m.status == MappingStatus.mapped.value and m.odoo_employee_id is not None}
     imported = 0
+    review = 0
     for code, name in sorted(todo.items()):
-        if cap is not None and mapped_count >= cap:
-            break
         hit = None
         for field_name, method in MATCH_FIELDS:
             rows = index.get((field_name, code), [])
@@ -115,14 +126,45 @@ def import_matched_employees(
                 break
             if len(rows) > 1:
                 break  # ambiguous: leave it for a human, as find_employee does
+        device_name = usable_name(name, code)
+        mapping = existing.get(code)
         if hit is None:
+            # Not found by badge. Someone in Odoo with this person's name, and a
+            # different or no badge, is worth a person's look: the badge is listed
+            # with that employee suggested. Rows already waiting on a choice
+            # between several employees are left as they are.
+            if device_name and not dismissed(mapping) and (
+                    mapping is None or mapping.status == MappingStatus.unmapped.value):
+                found = name_candidates(device_name, roster, taken)
+                if found:
+                    if mapping is None:
+                        mapping = EmployeeMapping(tenant_id=tenant.id, emp_code=code)
+                        db.add(mapping)
+                        existing[code] = mapping
+                    suggest_name_only(mapping, code, device_name, found[0], len(found) - 1)
+                    review += 1
             continue
         row, method = hit
-        mapping = existing.get(code)
+        if device_name and not compatible(device_name, row.get("name")):
+            # The badge is on someone with another name: a person decides.
+            if mapping is None:
+                mapping = EmployeeMapping(tenant_id=tenant.id, emp_code=code)
+                db.add(mapping)
+                existing[code] = mapping
+            if dismissed(mapping):
+                hold_dismissed_badge(mapping, code, device_name, row.get("name"))
+            else:
+                suggest_badge_only(mapping, code, device_name, row["id"], row.get("name"))
+                review += 1
+            continue
+        if cap is not None and mapped_count >= cap:
+            continue          # the plan is full; people still get their review rows
         if mapping is None:
             mapping = EmployeeMapping(tenant_id=tenant.id, emp_code=code)
             db.add(mapping)
             existing[code] = mapping
+        clear_suggestion(mapping)
+        taken.add(row["id"])
         mapping.odoo_employee_id = row["id"]
         mapping.odoo_employee_name = row.get("name")
         apply_details(mapping, row)  # bare-id names are filled by refresh_companies
@@ -133,9 +175,12 @@ def import_matched_employees(
         imported += 1
         mapped_count += 1
 
-    if imported:
+    if imported or review:
         db.flush()
+    if imported:
         say(f"Imported {imported} device user(s) already matched to Odoo employees")
+    if review:
+        say(f"{review} device user(s) need a person to confirm the Odoo employee (name and badge disagree)")
     return imported
 
 

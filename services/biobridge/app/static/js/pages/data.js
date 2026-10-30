@@ -133,14 +133,19 @@ export function unmappedCard(attention) {
         ${empty('Every Badge Is Matched', 'New badges show up here after a sync, until they are matched.')}
       </div>`;
   }
+  // Badges where the badge and the name disagree come first: a person has to
+  // decide those (the server sends them first too; this keeps any caller right).
+  attention = [...attention].sort((a, b) => Number(!!b.suggested_employee_id) - Number(!!a.suggested_employee_id));
+  const review = attention.filter((m) => m.suggested_employee_id).length;
   return `
     <div class="card" id="unmapped" style="margin-top:18px">
-      <h2>Unmapped Employees <span class="hint">${attention.length} badge${attention.length === 1 ? '' : 's'} holding attendance</span></h2>
+      <h2>Unmapped Employees <span class="hint">${attention.length} badge${attention.length === 1 ? '' : 's'} holding attendance${review ? ` · ${review} to review` : ''}</span></h2>
       <p style="color:var(--muted);margin:0 0 12px;font-size:13px">
         These badges have punched but no Odoo employee carries them, so their
         attendance is held. Pick the employee each one belongs to — or, for
         good, set the badge as that employee's <strong>Badge ID</strong> in Odoo
         and matching becomes automatic.
+        ${review ? `Badges marked <strong>Needs Review</strong> are listed first: the badge and the name point at different people, so they are not matched until you confirm.` : ''}
       </p>
       <div class="scroll" style="overflow:visible">
         <table>
@@ -150,8 +155,16 @@ export function unmappedCard(attention) {
               <tr>
                 <td class="mono">${esc(m.emp_code)}</td>
                 <td>${esc(m.source_name || '—')}${m.match_note ? `<div class="hint">${esc(m.match_note)}</div>` : ''}</td>
-                <td>${pill(m.status === 'unmapped' ? 'unmapped' : m.status, m.status === 'unmapped' ? 'not matched' : m.status)}</td>
+                <td>${m.suggested_employee_id
+                    ? `${pill('unmapped', 'needs review')}<div class="hint">${esc(SUGGESTION_KIND[m.suggestion_kind] || '')}</div>`
+                    : pill(m.status === 'unmapped' ? 'unmapped' : m.status, m.status === 'unmapped' ? 'not matched' : m.status)}</td>
                 <td>
+                  ${auth.canWrite && m.suggested_employee_id ? `
+                    <div class="suggest-box">
+                      <span class="hint">Suggested</span> <strong>${esc(m.suggested_employee_name || `Employee #${m.suggested_employee_id}`)}</strong>
+                      <button class="sm primary" data-confirm="${esc(m.id)}" data-emp="${esc(m.suggested_employee_id)}" data-name="${esc(m.suggested_employee_name || '')}">Confirm Match</button>
+                      <button class="sm link" data-notsame="${esc(m.id)}" title="Not the same person: stop suggesting this employee for this badge.">Not The Same Person</button>
+                    </div>` : ''}
                   ${auth.canWrite ? `
                     <div class="match-row">
                       <div class="picker" data-picker="${esc(m.id)}">
@@ -172,8 +185,36 @@ export function unmappedCard(attention) {
     </div>`;
 }
 
+const SUGGESTION_KIND = {
+  badge_only: 'Same badge, different name',
+  name_only: 'Same name, different badge',
+};
+
 export function wireUnmapped(mount, rerender) {
   mount.querySelectorAll('[data-picker]').forEach((box) => wirePicker(box, mount, rerender));
+  mount.querySelectorAll('[data-confirm]').forEach((button) => {
+    button.addEventListener('click', () =>
+      busy(button, () =>
+        guard(async () => {
+          await api.patch(`/mappings/${button.dataset.confirm}`, {
+            odoo_employee_id: Number(button.dataset.emp),
+            ...(button.dataset.name ? { odoo_employee_name: button.dataset.name } : {}),
+          });
+          await rerender();
+        }, `Matched${button.dataset.name ? ` to ${button.dataset.name}` : ''} — held punches sync on the next run`)
+      )
+    );
+  });
+  mount.querySelectorAll('[data-notsame]').forEach((button) => {
+    button.addEventListener('click', () =>
+      busy(button, () =>
+        guard(async () => {
+          await api.patch(`/mappings/${button.dataset.notsame}`, { dismiss_suggestion: true });
+          await rerender();
+        }, 'Suggestion Dismissed')
+      )
+    );
+  });
   mount.querySelectorAll('[data-ignore]').forEach((button) => {
     button.addEventListener('click', () =>
       busy(button, () =>

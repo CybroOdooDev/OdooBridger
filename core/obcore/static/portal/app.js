@@ -157,7 +157,8 @@ function serviceCard(row) {
   ].filter(Boolean);
   const live = row.status !== 'cancelled';
   // A service that works from Odoo can't start until an Odoo is connected.
-  const needsSetup = live && s.uses_odoo && !(state.account.odoo || []).length;
+  const needsSetup = live && s.uses_odoo && (row.setup_complete === false
+    || (row.setup_complete === undefined || row.setup_complete === null) && !(state.account.odoo || []).length);
   return `
     <div class="svc-card${needsSetup ? ' needs-setup' : ''}" data-slug="${esc(s.slug)}">
       <div class="svc-head">
@@ -312,7 +313,7 @@ async function renderServices(mount) {
   const gone = state.account.services.filter((r) => r.status === 'cancelled');
   mount.innerHTML = `
     ${state.account.status === 'suspended' ? banner('Account Suspended', 'Your services are paused. Contact support to restore them.', 'bad') : ''}
-    ${live.some((r) => r.service.uses_odoo) && !(state.account.odoo || []).length && canManage()
+    ${live.some((r) => r.service.uses_odoo && r.setup_complete !== true) && !(state.account.odoo || []).length && canManage()
       ? banner('Connect to Odoo', 'Your services need an Odoo connection before they can start working.', 'warn', { href: '#/odoo', label: 'Connect Odoo' }) : ''}
     ${trialOffer()}
     ${live.some((r) => r.status === 'trialing') && !state.account.pays_online && canManage()
@@ -640,7 +641,7 @@ function odooCard(conn) {
   return `
     <div class="card">
       <div class="card-head"><h2>${esc(conn.name)}</h2>
-        <div class="actions">${odooPill(conn.status)}
+        <div class="actions">${backToBioBridge()}${odooPill(conn.status)}
           <button class="sm" data-odoo-test="${esc(conn.id)}">Test Connection</button>
           ${canManage() ? `<button class="sm" data-odoo-edit="${esc(conn.id)}">Edit</button>
             <button class="icon-btn" data-odoo-remove="${esc(conn.id)}" title="Disconnect" aria-label="Disconnect Odoo">${TRASH}</button>` : ''}</div></div>
@@ -659,21 +660,26 @@ function odooCard(conn) {
 }
 
 
-async function renderOdoo(mount) {
+/* Set only when BioBridge sent the person here; keeps the way back for the visit. */
+let cameFromBioBridge = false;
+const backToBioBridge = () => (cameFromBioBridge
+  ? '<a href="#" class="banner-action" data-back-bio style="text-decoration:underline">Continue With BioBridge Setup &rarr;</a>' : '');
+
+async function renderOdoo(mount, route) {
+  if (route) cameFromBioBridge = route.query?.from === 'biobridge';
   mount.innerHTML = loading();
   const data = await api.get('/portal/odoo');
   const conn = data.connections[0] || null;
-  const waiting = data.services_without.map((s) => esc(s.name)).join(', ');
   if (!conn) {
     mount.innerHTML = `
-      ${waiting ? banner('Connect to Odoo', `${waiting} ${data.services_without.length > 1 ? 'need' : 'needs'} it to work.`, 'warn') : ''}
       <div class="card">
         <div class="card-head"><h2>Connect to Odoo</h2></div>
         ${canManage() ? `<form id="odooForm">${odooFields()}
             <p class="err" id="odooErr"></p>
-            <button class="primary" id="odooGo">Test And Connect</button></form>`
+            <div class="row" style="gap:10px"><button class="primary" id="odooGo">Test And Connect</button>${backToBioBridge()}</div></form>`
           : '<p class="muted">Ask your account owner or an admin to connect Odoo.</p>'}
       </div>`;
+    $('[data-back-bio]', mount)?.addEventListener('click', (e) => { e.preventDefault(); guard(() => openService('biometric')); });
     $('#odooForm', mount)?.addEventListener('submit', (e) => {
       e.preventDefault();
       $('#odooErr', mount).textContent = '';
@@ -692,6 +698,7 @@ async function renderOdoo(mount) {
   }
   mount.innerHTML = odooCard(conn);
   mount.onclick = (e) => {
+    if (e.target.closest('[data-back-bio]')) { e.preventDefault(); guard(() => openService('biometric')); return; }
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.odooTest) {

@@ -51,6 +51,7 @@ def subscription_out(row: AccountService, *, staff: bool = False) -> dict[str, A
         "status": row.status,
         "trial_ends_at": iso(row.trial_ends_at),
         "billed": bool(row.stripe_item_id),
+        "setup_complete": (row.odoo_readiness or {}).get("setup_complete"),
         "pending_change": ({"package": package_out(row.pending_package), "at": iso(row.pending_change_at)}
                            if row.pending_package_id and row.pending_package else None),
         "entitlements": row.effective_entitlements(),

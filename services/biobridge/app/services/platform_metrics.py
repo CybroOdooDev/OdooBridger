@@ -142,11 +142,18 @@ def collect(db: Session) -> dict[str, Any]:
         pending, oldest, last_success = 0, None, None
 
     health = scheduler_health(db)
+    day_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+    running = db.scalar(select(func.count(SyncRun.id)).where(SyncRun.status == SyncStatus.running.value)) or 0
+    failed_runs = db.scalar(select(func.count(SyncRun.id)).where(
+        SyncRun.status == SyncStatus.failed.value, SyncRun.started_at >= day_ago)) or 0
     active = sum(r["active"] for r in per.values())
     failed = sum(r["failed"] for r in per.values())
-    status = "operational"
-    if not health["running"] or (failed and failed / max(active, 1) >= DEGRADED_SHARE):
+    status, reason = "operational", None
+    if not health["running"]:
+        status, reason = "degraded", "The scheduler has stopped, so automatic syncs are not running."
+    elif failed and failed / max(active, 1) >= DEGRADED_SHARE:
         status = "degraded"
+        reason = f"{failed} of {active} integrations are failing (the limit is {int(DEGRADED_SHARE * 100)}%)."
 
     dashboard = _dashboard(db, tenant_rows, per, first_bad, odoo_bad, int(pending or 0))
 
@@ -156,13 +163,40 @@ def collect(db: Session) -> dict[str, Any]:
         "service": settings.platform_service_slug,
         "version": getattr(fastapi_app, "version", None),
         "status": status,
+        "status_reason": reason,
         "integrations": {"active": active, "failed": failed},
-        "jobs": {"pending": int(pending or 0), "oldest_pending_at": _iso(oldest)},
+        "jobs": {"pending": int(pending or 0), "oldest_pending_at": _iso(oldest),
+                 "running": int(running), "failed_24h": int(failed_runs)},
         "last_success_at": _iso(last_success),
-        "workers": {"scheduler": {"ok": bool(health["running"]), "last_run_at": _iso(health["last_tick_at"])}},
+        "workers": {"scheduler": {
+            "ok": bool(health["running"]), "last_run_at": _iso(health["last_tick_at"]),
+            "next_run_at": _iso(health["last_tick_at"] + timedelta(seconds=settings.scheduler_tick_seconds))
+            if health["last_tick_at"] else None}},
+        "requests": _requests(),
+        "database": _database(db),
         "accounts": [r for r in per.values() if r["active"] or r["failures"]],
         "dashboard": dashboard,
     }
+
+
+def _requests() -> dict[str, int]:
+    from app.services import request_meter
+
+    return request_meter.summary()
+
+
+def _database(db: Session) -> dict[str, Any]:
+    """Can BioBridge reach its database, and how quickly."""
+    import time
+
+    from sqlalchemy import text
+
+    started = time.monotonic()
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "latency_ms": None}
+    return {"ok": True, "latency_ms": round((time.monotonic() - started) * 1000, 1)}
 
 
 def _plan(tenant: Tenant) -> str | None:

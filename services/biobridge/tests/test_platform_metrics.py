@@ -73,6 +73,7 @@ def test_metrics_count_platform_tenants_only(client):  # noqa: F811
     assert m["last_success_at"] is not None
     assert m["workers"]["scheduler"]["ok"] is True
     assert m["status"] == "degraded"          # 1 of 2 failing
+    assert "1 of 2 integrations are failing" in m["status_reason"]
     [account] = m["accounts"]
     assert account["account_id"] == ACCOUNT and (account["active"], account["failed"]) == (2, 1)
     [failure] = account["failures"]
@@ -148,9 +149,12 @@ def test_dashboard_health_values(client):  # noqa: F811
 def test_metrics_with_nothing_yet(client):  # noqa: F811
     m = get(client).json()
     assert m["integrations"] == {"active": 0, "failed": 0}
-    assert m["jobs"] == {"pending": 0, "oldest_pending_at": None}
+    assert m["jobs"] == {"pending": 0, "oldest_pending_at": None, "running": 0, "failed_24h": 0}
     assert m["accounts"] == [] and m["workers"]["scheduler"]["ok"] is False
+    assert m["database"]["ok"] is True and m["requests"]["window_hours"] == 24
     assert m["status"] == "degraded"          # nothing has ticked
+    assert "scheduler has stopped" in m["status_reason"]
+    assert m["requests"]["scope"] == "this process" and m["requests"]["started_at"]
 
 
 def test_metrics_404_outside_platform_mode(client, monkeypatch):  # noqa: F811
@@ -158,3 +162,16 @@ def test_metrics_404_outside_platform_mode(client, monkeypatch):  # noqa: F811
 
     monkeypatch.setattr(settings, "platform_mode", False)
     assert get(client).status_code == 404
+
+
+def test_monitoring_polls_are_not_counted_as_traffic(client):  # noqa: F811
+    from app.services import request_meter
+
+    request_meter.reset()
+    for _ in range(5):
+        client.get("/health")
+        get(client)                                   # the core's metrics read
+    assert request_meter.summary()["total"] == 0
+    client.get("/api/v1/nothing-here")                # real traffic (a 404) is counted
+    assert request_meter.summary()["total"] == 1
+    request_meter.reset()

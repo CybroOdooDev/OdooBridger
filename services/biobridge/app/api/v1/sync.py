@@ -8,7 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from time import monotonic
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -57,6 +57,7 @@ from app.services.scheduling import (
     scheduler_health,
 )
 from app.services.alerts import tenant_alerts
+from app.services.name_match import clear_suggestion, dismiss_suggestion
 from app.services.run_lock import TenantRunLock
 from app.services.sync_engine import SyncEngine, active_run, close_abandoned_runs
 from app.services.timeutils import utcnow_naive
@@ -583,9 +584,12 @@ def list_mappings(
                     EmployeeMapping.odoo_company_id.is_(None)
                     | (EmployeeMapping.odoo_company_id == conn.company_id)
                 )
+    # Badges where the badge and the name disagree come first: a person has to
+    # decide those, and they are the likeliest to be matched to the wrong one.
+    needs_review = case((EmployeeMapping.suggested_employee_id.is_not(None), 0), else_=1)
     return list(
         db.scalars(
-            stmt.order_by(EmployeeMapping.status, EmployeeMapping.emp_code).limit(limit)
+            stmt.order_by(needs_review, EmployeeMapping.status, EmployeeMapping.emp_code).limit(limit)
         ).all()
     )
 
@@ -626,6 +630,7 @@ def update_mapping(
         mapping.status = MappingStatus.mapped.value
         mapping.match_method = "manual"
         mapping.match_note = None
+        clear_suggestion(mapping)
 
         # Give previously-unmapped punches another chance on the next run.
         db.query(PunchRecord).filter(
@@ -636,6 +641,11 @@ def update_mapping(
 
     if "status" in data and not data.get("odoo_employee_id"):
         mapping.status = data["status"]
+        if data["status"] == MappingStatus.ignored.value:
+            clear_suggestion(mapping)
+
+    if data.get("dismiss_suggestion") and mapping.suggested_employee_id is not None:
+        dismiss_suggestion(mapping)
 
     audit(db, principal, "mapping.update", mapping.emp_code, str(data), request)
     db.commit()

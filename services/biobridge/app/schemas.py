@@ -936,6 +936,11 @@ class MappingOut(ORMModel):
     status: str
     match_method: str | None
     match_note: str | None
+    #: A likely Odoo employee for a badge that was not matched on its own
+    #: because the badge and the name disagree (see services/name_match.py).
+    suggested_employee_id: int | None = None
+    suggested_employee_name: str | None = None
+    suggestion_kind: str | None = None
     open_attendance_id: int | None
     last_punch_at: datetime | None
 
@@ -946,6 +951,8 @@ class MappingUpdate(BaseModel):
     #: a name rather than a bare id until the next sync refreshes it.
     odoo_employee_name: str | None = Field(default=None, max_length=200)
     status: Literal["mapped", "unmapped", "ignored", "ambiguous"] | None = None
+    #: "Not the same person": drop the suggestion and do not make it again.
+    dismiss_suggestion: bool = False
 
 
 class PunchOut(ORMModel):

@@ -105,6 +105,16 @@ class EmployeeMapping(Base, UUIDPk, Timestamped):
     match_method: Mapped[str | None] = mapped_column(String(32))
     match_note: Mapped[str | None] = mapped_column(Text)
 
+    #: A likely Odoo employee for a badge that is NOT matched on its own because
+    #: the evidence disagrees: the badge is on an Odoo employee with a different
+    #: name ("badge_only"), or an Odoo employee has the same name but another
+    #: badge, or none ("name_only"). A person confirms or corrects it; these
+    #: rows are listed first. Kept apart from odoo_employee_id on purpose: that
+    #: column means "matched", and the sync keys on it.
+    suggested_employee_id: Mapped[int | None] = mapped_column(Integer)
+    suggested_employee_name: Mapped[str | None] = mapped_column(String(200))
+    suggestion_kind: Mapped[str | None] = mapped_column(String(24))
+
     #: The shift currently open in Odoo for this person, if any. Carrying it
     #: here is what lets a check-out arriving in a later cycle close the record
     #: its check-in opened, instead of being re-paired on its own.

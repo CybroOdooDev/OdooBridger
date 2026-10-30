@@ -48,7 +48,7 @@ const SVC_STATUS = {
   operational: ['ok', 'Operational'], degraded: ['warn', 'Degraded'], unavailable: ['bad', 'Unavailable'],
   maintenance: ['warn', 'Maintenance'], disabled: ['mute', 'Disabled'], not_deployed: ['mute', 'Not Deployed'],
 };
-const SEVERITY = { critical: ['bad', 'Critical'], high: ['bad', 'High'], medium: ['warn', 'Medium'] };
+const SEVERITY = { critical: ['bad', 'Critical'], high: ['bad', 'High'], medium: ['warn', 'Medium'], low: ['mute', 'Low'] };
 const SUB_LABEL = { paying: ['ok', 'Paying'], trial: ['trialing', 'Trial'], past_due: ['bad', 'Past Due'], suspended: ['bad', 'Suspended'] };
 const MIX = [['paying', 'Paying', 'var(--ok)'], ['trial', 'Free trial', 'var(--accent)'],
   ['past_due', 'Past due', 'var(--warn)'], ['suspended', 'Suspended', 'var(--bad)'], ['no_service', 'No service', 'var(--faint)']];
@@ -66,127 +66,332 @@ function since(iso) {
   return `${d} day${d === 1 ? '' : 's'}`;
 }
 
-/** Total customers at each month's end: one line, a point per month, a tooltip on hover. */
-function growthChart(points) {
-  const W = 340; const H = 270; const L = 32; const B = 26; const T = 14; const R = 12;
-  const max = Math.max(4, ...points.map((p) => p.total));
-  const step = Math.ceil(max / 4);
-  const top = step * 4;
-  const x = (i) => L + 8 + (i * (W - L - R - 8)) / Math.max(1, points.length - 1);
-  const y = (v) => H - B - ((H - B - T) * v) / top;
-  const month = (m) => new Date(`${m}-01T00:00:00`).toLocaleDateString(undefined, { month: 'short' });
-  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.total).toFixed(1)}`).join(' ');
-  const area = `${line} L${x(points.length - 1).toFixed(1)},${H - B} L${x(0).toFixed(1)},${H - B} Z`;
-  const grid = [0, 1, 2, 3, 4].map((g) => `<line x1="${L}" x2="${W - R}" y1="${y(g * step)}" y2="${y(g * step)}" class="ch-grid"/>
-    <text x="${L - 8}" y="${y(g * step) + 4}" text-anchor="end" class="ch-ax">${g * step}</text>`).join('');
-  const labels = points.map((p, i) => (i % 2 === 1 ? `<text x="${x(i)}" y="${H - 7}" text-anchor="middle" class="ch-ax">${esc(month(p.month))}</text>` : '')).join('');
-  const dots = points.map((p, i) => `<circle cx="${x(i)}" cy="${y(p.total)}" r="4" class="ch-dot"/>`).join('');
-  const hits = points.map((p, i) => `<rect x="${x(i) - (W - L) / points.length / 2}" y="${T}" width="${(W - L) / points.length}" height="${H - B - T}"
-    fill="transparent" data-i="${i}"/>`).join('');
-  return `<div class="ch-wrap"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Total customers, last 12 months">
-    <defs><linearGradient id="chFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".18"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
-    ${grid}<path d="${area}" fill="url(#chFill)"/><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>
-    <line class="ch-cross" y1="${T}" y2="${H - B}" x1="0" x2="0" hidden/>${dots}${labels}${hits}</svg>
-    <div class="ch-tip" hidden></div></div>`;
+/* ---- overview helpers ---------------------------------------------------- */
+const RANGES = [['30d', 'Last 30 Days'], ['6m', 'Last 6 Months'], ['12m', 'Last 12 Months'], ['all', 'All Time']];
+let overviewRange = '30d';
+const pct = (v) => (v == null ? '—' : `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`);
+const bucketLabel = (key, unit, long = false) => (unit === 'day'
+  ? new Date(`${key}T00:00:00`).toLocaleDateString(undefined, long ? { weekday: 'short', day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short' })
+  : new Date(`${key}-01T00:00:00`).toLocaleDateString(undefined, long ? { month: 'long', year: 'numeric' } : { month: 'short' }));
+
+/** "▲ 12% vs previous 30 days". ``upIsGood`` decides the colour; ``fmt`` formats the
+ *  numbers shown when the earlier figure was 0 (a percentage of 0 means nothing). */
+function compare(m, upIsGood = true, fmt = (v) => String(v)) {
+  if (!m || !m.basis) return '';
+  if (m.change_pct == null) {
+    return m.previous === 0 && m.value
+      ? `<span class="cmp up ${upIsGood ? 'good' : 'bad'}">+${esc(fmt(m.value))}</span> <span class="cmp-b">vs ${esc(fmt(0))} ${esc(m.basis)}</span>` : '';
+  }
+  if (m.change_pct === 0) return `<span class="cmp flat">No change</span> <span class="cmp-b">vs ${esc(m.basis)}</span>`;
+  const up = m.change_pct > 0;
+  return `<span class="cmp ${up ? 'up' : 'down'} ${up === upIsGood ? 'good' : 'bad'}">${up ? '▲' : '▼'} ${pct(Math.abs(m.change_pct))}</span> <span class="cmp-b">vs ${esc(m.basis)}</span>`;
 }
 
-function wireGrowth(root, points) {
-  const wrap = $('.ch-wrap', root);
+/** Bars, one per day or month, with a tooltip. ``cents`` draws the axis in dollars. */
+function bucketBars(points, { unit, value, label, cents = false, height = 220 }) {
+  const W = 480; const H = height; const L = cents ? 46 : 30; const B = 26; const T = 12; const R = 6;
+  const max = Math.max(cents ? 1000 : 4, ...points.map((p) => value(p) || 0));
+  let step = Math.ceil(max / 4);
+  if (cents) { const mag = 10 ** Math.floor(Math.log10(max / 4)); step = Math.ceil(max / 4 / mag) * mag; }
+  const top = step * 4;
+  const short = (c) => { const d = c / 100; return d >= 1000 ? `$${+(d / 1000).toFixed(1)}k` : `$${+d.toFixed(2)}`.replace(/\.00$/, ''); };
+  const bw = (W - L - R) / Math.max(1, points.length);
+  const y = (v) => H - B - ((H - B - T) * v) / top;
+  const grid = [0, 1, 2, 3, 4].map((g) => `<line x1="${L}" x2="${W - R}" y1="${y(g * step)}" y2="${y(g * step)}" class="ch-grid"/>
+    <text x="${L - 8}" y="${y(g * step) + 4}" text-anchor="end" class="ch-ax">${cents ? short(g * step) : g * step}</text>`).join('');
+  const barW = Math.min(bw * 0.7, 44);
+  const bars = points.map((p, i) => {
+    const v = value(p) || 0; const x = L + i * bw + (bw - barW) / 2; const w = barW;
+    const top2 = y(v); const h = H - B - top2; const r = Math.min(3, w / 2, h);
+    return h > 0 ? `<path d="M${x},${H - B} V${top2 + r} q0,-${r} ${r},-${r} h${w - 2 * r} q${r},0 ${r},${r} V${H - B} Z" class="ch-bar"/>` : '';
+  }).join('');
+  const n = points.length;
+  const every = unit === 'day' ? (n > 21 ? 7 : n > 10 ? 3 : 1) : n > 14 ? 3 : n > 7 ? 2 : 1;
+  const last = n - 1;
+  const labels = points.map((p, i) => ((i % every === 0 && last - i >= every / 2) || i === last
+    ? `<text x="${L + i * bw + bw / 2}" y="${H - 7}" text-anchor="middle" class="ch-ax">${esc(bucketLabel(p.key, unit))}</text>` : '')).join('');
+  const hits = points.map((p, i) => `<rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - B - T}" fill="transparent" data-i="${i}"/>`).join('');
+  return `<div class="ch-wrap" data-chart="${esc(label)}"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${esc(label)}">
+    ${grid}${bars}${labels}${hits}</svg><div class="ch-tip" hidden></div></div>`;
+}
+
+function wireChart(root, name, points, tipHtml) {
+  const wrap = root.querySelector(`[data-chart="${name}"]`);
   if (!wrap) return;
   const tip = $('.ch-tip', wrap);
-  const cross = $('.ch-cross', wrap);
-  const month = (m) => new Date(`${m}-01T00:00:00`).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   wrap.addEventListener('mousemove', (e) => {
     const hit = e.target.closest('[data-i]');
     if (!hit) return;
-    const p = points[Number(hit.dataset.i)];
-    const dot = wrap.querySelectorAll('.ch-dot')[Number(hit.dataset.i)];
-    const cx = Number(dot.getAttribute('cx'));
-    cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.hidden = false;
-    tip.innerHTML = `<b>${esc(month(p.month))}</b><span>New: ${p.added}</span><span>Closed: ${p.closed ?? 0}</span>`;
+    tip.innerHTML = tipHtml(points[Number(hit.dataset.i)]);
     tip.hidden = false;
-    const box = wrap.getBoundingClientRect();
-    const dbox = dot.getBoundingClientRect();
-    const left = Math.min(box.width - tip.offsetWidth, Math.max(0, dbox.left - box.left - tip.offsetWidth / 2));
-    tip.style.left = `${left}px`;
-    tip.style.top = `${Math.max(0, dbox.top - box.top - tip.offsetHeight - 10)}px`;
+    const box = wrap.getBoundingClientRect(); const hb = hit.getBoundingClientRect();
+    tip.style.left = `${Math.min(box.width - tip.offsetWidth, Math.max(0, hb.left - box.left + hb.width / 2 - tip.offsetWidth / 2))}px`;
+    tip.style.top = '0px';
   });
-  wrap.addEventListener('mouseleave', () => { tip.hidden = true; cross.hidden = true; });
+  wrap.addEventListener('mouseleave', () => { tip.hidden = true; });
 }
 
-const incidentRow = (i) => `<li${i.account_id ? ` class="click" data-account="${esc(i.account_id)}"` : i.href ? ` class="click" data-href="${esc(i.href)}"` : ''}>
-  <span class="al-ic ${SEVERITY[i.severity][0]}">${kpiIcon('alert')}</span>
-  <div class="al-t"><b>${esc(i.issue)}</b>${i.detail ? `<p class="al-d" title="${esc(i.detail)}">${esc(i.detail)}</p>` : ''}<span>${esc([i.account, i.service].filter(Boolean).join(' · '))}</span></div>
-  <div class="al-r">${tag(...SEVERITY[i.severity])}<span>${esc(since(i.since))}</span></div></li>`;
+const ATTENTION = [
+  ['service', 'Service Failures', 'server'], ['integration', 'Integration Failures', 'link'],
+  ['payment', 'Failed Payments', 'card'], ['suspended', 'Suspended Accounts', 'alert'],
+  ['trial', 'Expiring Trials', 'clock'], ['onboarding', 'Failed Onboarding', 'device'],
+  ['unverified', 'Unverified Accounts', 'mail'],
+];
+const ACT_ICON = { registered: ['acc', 'users'], signup: ['mute', 'mail'], verified: ['ok', 'check'], service: ['acc', 'card'],
+  package: ['acc', 'trophy'], trial: ['warn', 'clock'], integration: ['ok', 'link'], suspended: ['bad', 'alert'],
+  reactivated: ['ok', 'check'], closed: ['bad', 'alert'], cancel: ['warn', 'card'], paying: ['ok', 'money'],
+  payment: ['ok', 'money'], payment_failed: ['bad', 'money'] };
+const SVC_STATUS_CORE = { ...SVC_STATUS };
+const ms = (v) => (v == null ? '—' : v < 1 ? '<1 ms' : `${Math.round(v)} ms`);
+
+const TIP = {
+  availability: "Share of the checks Core ran that got an answer, over the last 30 days. When Core itself is down no checks are recorded, so those gaps are not counted; a network fault on Core's side counts against the service.",
+  response: 'The 95th percentile of answered checks in the last 24 hours (the slowest 1 in 20), with the average below. Checks that got no answer are left out of both and counted separately.',
+  failed: '5xx answers out of the requests this process handled in the last 24 hours. Health and metrics polls are not counted. The count is per process, not combined across workers, and starts again when the process restarts. 401 and 403 answers are not failures but are shown apart.',
+  jobs: 'Pending and running are right now. The age shows how long the oldest punch has been waiting to be written to Odoo, which tells you whether writes are blocked. Failed counts the last 24 hours.',
+};
+const DELAYED_MS = 30 * 60 * 1000;
+const clock = (v) => new Date(v).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+
+function dataSpan(days) {
+  if (days == null || days >= 29.5) return '';
+  if (days < 1) { const h = Math.max(1, Math.round(days * 24)); return `${h} hour${h === 1 ? '' : 's'} of data`; }
+  const d = Math.round(days);
+  return `${d} day${d === 1 ? '' : 's'} of data`;
+}
+
+function serviceHealthRows(services) {
+  return services.map((sv) => {
+    const [tone, label] = SVC_STATUS_CORE[sv.status] || ['mute', sv.status];
+    const live = !['not_deployed', 'disabled'].includes(sv.status);
+    const req = sv.requests;
+    const failedReq = !req ? '—' : `<span class="${req.failed ? 'bad-t' : ''}"><b>${req.failed.toLocaleString()}</b></span> <span class="muted">of ${req.total.toLocaleString()}</span>${
+      req.auth_failed ? `<small>${req.auth_failed.toLocaleString()} sign-in error${req.auth_failed === 1 ? '' : 's'}</small>` : ''}${
+      req.started_at && req.since_minutes != null && req.since_minutes < 24 * 60 ? `<small>Since restart at ${esc(clock(req.started_at))}</small>` : ''}`;
+    const j = sv.jobs;
+    const oldest = j && j.pending && j.oldest_pending_at ? new Date(j.oldest_pending_at) : null;
+    const stuck = oldest && Date.now() - oldest.getTime() > DELAYED_MS;
+    const jobs = !j ? '—' : `${j.pending ?? 0} pending · ${j.running ?? 0} running${
+      oldest ? `<small class="${stuck ? 'bad-t' : ''}">Oldest waiting ${esc(fmtAgo(j.oldest_pending_at).replace(' ago', ''))}</small>` : ''}
+      <small class="${j.failed_24h ? 'bad-t' : ''}">${j.failed_24h ?? 0} failed (24 h)</small>`;
+    const sch = sv.scheduler;
+    const schedule = sch && sch.enabled === false ? tag('mute', 'Off') : sch ? `${tag(sch.ok ? 'ok' : 'bad', sch.ok ? 'Running' : 'Stopped')}<small>${sch.last_run_at ? `Last ${esc(fmtAgo(sch.last_run_at))}` : 'Never ran'}${
+      sch.next_run_at ? ` · next ${esc(clock(sch.next_run_at))}` : ''}</small>` : '—';
+    const db = sv.database ? `${tag(sv.database.ok ? 'ok' : 'bad', sv.database.ok ? 'OK' : 'Failed')}<small>${sv.database.ok ? esc(ms(sv.database.latency_ms)) : ''}</small>` : '—';
+    const span = dataSpan(sv.availability_days);
+    const avail = sv.availability_pct == null ? '—' : `<b class="${sv.availability_pct < 99 ? 'bad-t' : ''}">${pct(sv.availability_pct)}</b>${span ? `<small>${esc(span)}</small>` : ''}`;
+    const p95 = sv.p95_latency_ms ?? sv.latency_ms;
+    const latency = `<b>${ms(p95)}</b>${
+      sv.avg_latency_ms != null ? `<small>avg ${esc(ms(sv.avg_latency_ms))}</small>` : ''}${
+      sv.failed_checks_24h ? `<small class="bad-t">${sv.failed_checks_24h} of ${sv.checks_24h} failed</small>` : ''}`;
+    const reason = sv.status_reason && sv.status !== 'operational' ? `<small class="why-line${tone === 'bad' ? ' bad-t' : ''}" title="${esc(sv.status_reason)}">${esc(sv.status_reason)}</small>` : '';
+    return `<tr class="click" data-health="${esc(sv.slug)}" tabindex="0" title="Open ${esc(sv.name)} history">
+      <td><b>${esc(sv.name)}</b>${sv.version ? `<small>v${esc(sv.version)}</small>` : ''}</td>
+      <td>${tag(tone, label)}${reason}</td>
+      <td class="num" ${live ? `title="${esc(TIP.availability)}"` : ''}>${live ? avail : '—'}</td>
+      <td class="num" ${live ? `title="${esc(TIP.response)}"` : ''}>${live ? latency : '—'}</td>
+      <td class="num" ${live ? `title="${esc(TIP.failed)}"` : ''}>${live ? failedReq : '—'}</td>
+      <td ${live ? `title="${esc(TIP.jobs)}"` : ''}>${live ? jobs : '—'}</td><td>${live ? schedule : '—'}</td><td>${live ? db : '—'}</td></tr>`;
+  }).join('');
+}
+
+/** The Service Health dialog: this row's figures, and for a service its last 24 hours of checks. */
+async function serviceHealthDialog(sv) {
+  const hist = await api.get(`/staff/services/${encodeURIComponent(sv.slug)}/health-history`).catch(() => null);
+  const bar = (h) => {
+    const none = h.availability_pct == null;
+    const cls = none ? 'none' : h.availability_pct >= 99 ? 'ok' : h.availability_pct >= 50 ? 'warn' : 'bad';
+    const tipText = none ? `${clock(h.start)}: no checks` : `${clock(h.start)}: ${h.availability_pct}% of ${h.checks} checks answered${h.avg_latency_ms != null ? `, ${h.avg_latency_ms} ms on average` : ''}`;
+    return `<i class="hb ${cls}" title="${esc(tipText)}"></i>`;
+  };
+  const dur = (o) => {
+    if (!o.until) return 'still failing';
+    const mins = Math.max(1, Math.round((new Date(o.until) - new Date(o.from)) / 60000));
+    return mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} min` : `${mins} min`;
+  };
+  const facts = [
+    ['Status', `${tag(...(SVC_STATUS_CORE[sv.status] || ['mute', sv.status]))}${sv.status_reason && sv.status !== 'operational' ? ` <span class="muted">${esc(sv.status_reason)}</span>` : ''}`],
+    ['Availability (30 days)', sv.availability_pct == null ? '—' : `${pct(sv.availability_pct)}${dataSpan(sv.availability_days) ? ` · ${esc(dataSpan(sv.availability_days))}` : ''}`],
+    ['Response (24 h)', sv.p95_latency_ms == null ? '—' : `p95 ${esc(ms(sv.p95_latency_ms))} · avg ${esc(ms(sv.avg_latency_ms))}`],
+    ['Failed requests (24 h)', sv.requests ? `${sv.requests.failed.toLocaleString()} of ${sv.requests.total.toLocaleString()}${sv.requests.auth_failed ? ` · ${sv.requests.auth_failed.toLocaleString()} sign-in errors` : ''}` : '—'],
+    ['Database', sv.database ? `${sv.database.ok ? 'OK' : 'Failed'}${sv.database.ok ? ` · ${esc(ms(sv.database.latency_ms))}` : ''}` : '—'],
+  ];
+  const body = `<dl class="hd-facts">${facts.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl>
+    ${!hist || !hist.checks ? '<p class="muted hd-note">No checks in the last 24 hours.</p>'
+      : `<h3 class="hd-h">Last 24 Hours</h3><div class="hd-strip">${hist.hours.map(bar).join('')}</div>
+        <div class="hd-axis"><span>24 h ago</span><span>Now</span></div>
+        <h3 class="hd-h">Outages</h3>${hist.outages.length ? `<ul class="hd-outages">${hist.outages.map((o) => `<li><b>${esc(fmtAgo(o.from))}</b><span>${esc(dur(o))} · ${o.checks} failed check${o.checks === 1 ? '' : 's'}</span></li>`).join('')}</ul>`
+          : '<p class="muted hd-note">No failed checks in the last 24 hours.</p>'}`}`;
+  dialog({ title: `${sv.name} Health`, wide: true, submitLabel: 'Done', body });
+}
+
+/** Core reports on itself: it can't be checked from outside, and if it is down this page doesn't load. */
+function coreHealthCard(core) {
+  const [tone, label] = SVC_STATUS_CORE[core.status] || ['mute', core.status];
+  const req = core.requests;
+  const sch = core.scheduler;
+  const cell = (k, v, note = '') => `<div class="ch-cell"><span>${esc(k)}</span><b>${v}</b>${note ? `<small>${note}</small>` : ''}</div>`;
+  const sweep = sch && sch.enabled === false ? tag('mute', 'Off') : sch ? tag(sch.ok ? 'ok' : 'bad', sch.ok ? 'Running' : 'Stopped') : '—';
+  const sweepNote = !sch || sch.enabled === false ? '' : `${sch.last_run_at ? `Last ran ${esc(fmtAgo(sch.last_run_at))}` : 'Has not run yet'}${sch.next_run_at ? ` · next ${esc(clock(sch.next_run_at))}` : ''}`;
+  const since = req && req.started_at && req.since_minutes < 24 * 60 ? `Since restart at ${esc(clock(req.started_at))}` : 'Last 24 hours';
+  return `<div class="card a-core"><div class="card-head"><h2>Core Health</h2></div>
+    <div class="ch-row">
+      ${cell('Status', `${tag(tone, label)}`, core.status_reason && core.status !== 'operational' ? esc(core.status_reason) : '')}
+      ${cell('Database', core.database ? `${tag(core.database.ok ? 'ok' : 'bad', core.database.ok ? 'OK' : 'Failed')} <span class="muted">${core.database.ok ? esc(ms(core.database.latency_ms)) : ''}</span>` : '—')}
+      ${cell('Background Sweep', sweep, sweepNote)}
+      ${cell('Failed Requests', req ? `<span class="${req.failed ? 'bad-t' : ''}">${req.failed.toLocaleString()}</span> <span class="muted">of ${req.total.toLocaleString()}</span>` : '—', req ? since : '')}
+      ${cell('Sign-In Errors', req ? `<span>${(req.auth_failed || 0).toLocaleString()}</span>` : '—', req ? '401 and 403 answers' : '')}
+    </div></div>`;
+}
 
 async function renderOverview(mount) {
-  const o = await api.get('/staff/overview');
+  const o = await api.get(`/staff/overview?period=${overviewRange}`);
   const k = o.kpis;
-  // Platform-level notices sit with the rest, not in a banner across the page.
-  const incidents = [...(!o.stripe.enabled ? [{ key: 'stripe', severity: 'medium', issue: 'Online payments are off',
+  const r = o.range;
+  const incidents = [...(!o.stripe.enabled ? [{ key: 'stripe', severity: 'medium', category: 'payment', issue: 'Online payments are off',
     detail: 'Add Stripe keys so customers can pay.', service: 'Payments', href: '#/payments' }] : []), ...o.incidents];
+  const byCat = Object.fromEntries(ATTENTION.map(([key]) => [key, incidents.filter((i) => i.category === key)]));
+  const urgent = incidents.filter((i) => ['critical', 'high'].includes(i.severity)).length;
+  const rev = o.revenue.summary;
+  const unit = o.acquisition.unit;
   const mixTotal = MIX.reduce((n, [key]) => n + (o.mix[key] || 0), 0);
   const mixShown = MIX.filter(([key]) => o.mix[key] || key !== 'no_service');
-  const svcShort = o.services.map((sv) => {
-    const [tone, label] = SVC_STATUS[sv.status] || ['mute', sv.status];
-    const sub = sv.integrations
-      ? `${sv.integrations.active} integrations · ${sv.jobs?.pending ?? 0} queued`
-      : sv.status === 'unavailable' ? (sv.error || 'not answering')
-        : sv.status === 'not_deployed' || sv.status === 'disabled' ? `${sv.customers} customers` : `${sv.customers} customers · no metrics yet`;
-    const failed = sv.integrations ? `${sv.integrations.failed} failed` : '—';
-    return `<li><div><b>${esc(sv.name)}</b><small>${esc(sub)}</small></div>${tag(tone, label)}<span class="num">${esc(failed)}</span></li>`;
-  }).join('');
-  mount.innerHTML = `
-    <div class="kpis">
-      ${kpi({ icon: 'users', tone: 'acc', label: 'Customers', value: k.customers.value, href: '#/accounts' })}
-      ${kpi({ icon: 'card', tone: 'acc', label: 'Subscriptions', value: k.subscriptions.value, href: '#/accounts' })}
-      ${kpi({ icon: 'money', tone: 'ok', label: 'Monthly Revenue', value: money(k.mrr.value_cents), href: '#/payments' })}
-      ${kpi({ icon: 'link', tone: k.integrations.failed ? 'bad' : 'acc', label: 'Integrations', value: k.integrations.value })}
-      ${kpi({ icon: 'server', tone: k.services.not_operational.length ? 'warn' : 'ok', label: 'Services',
-        value: `${k.services.operational} / ${k.services.deployed}` })}
-      ${kpi({ icon: 'alert', tone: incidents.length ? 'bad' : 'ok', label: 'Needs Attention', value: incidents.length })}
+  const funnelTop = Math.max(1, ...o.funnel.map((f) => f.value));
+  // No comparison yet means no line at all: five cards saying so is noise.
+  const kpiNote = (m, up = true, extra = '', fmt) => [extra, compare(m, up, fmt)].filter(Boolean).join(' · ');
+  const trialsRunning = k.trial_conversion.running;
+  const revStat = (label, value, tone = '') => `<div class="rv-stat"><span>${esc(label)}</span><b class="${tone}">${value}</b></div>`;
+
+  const actRow = (a) => {
+    const [tone, icon] = ACT_ICON[a.kind] || ['mute', 'check'];
+    const extra = a.amount_cents != null ? money(a.amount_cents, a.currency || undefined) : a.mrr_cents != null ? `${money(a.mrr_cents)}/mo` : a.detail || '';
+    return `<li${a.account_id ? ` class="click" data-account="${esc(a.account_id)}"` : ''}><span class="al-ic ${tone}">${kpiIcon(icon)}</span>
+      <div><b>${esc(a.title)}</b>${extra ? ` <span class="muted">${esc(extra)}</span>` : ''}<small>${esc(a.account || '')}</small></div>
+      <time>${esc(fmtAgo(a.at))}</time></li>`;
+  };
+  const SHOW_ACT = 8;
+  // The service under each name only helps when customers use different ones.
+  const variedServices = new Set(o.recent_customers.filter((c) => c.services.length).map((c) => c.services.join(','))).size > 1;
+
+  mount.innerHTML = `<div class="ov">
+    <div class="ov-bar">
+      <div class="seg" role="group" aria-label="Date range">${RANGES.map(([key, label]) =>
+        `<button type="button" data-range="${key}" class="${key === r.key ? 'on' : ''}">${esc(label)}</button>`).join('')}</div>
+      <a href="#attention" class="ov-attn ${urgent ? 'bad' : incidents.length ? 'warn' : 'ok'}">${kpiIcon('alert')}
+        ${incidents.length ? `${incidents.length} need attention` : 'Nothing needs attention'}</a>
     </div>
-    <div class="ov-row2">
-      <div class="card"><div class="card-head"><h2>Customers</h2><span class="hint">total · last 12 months</span></div>
-        <div class="cust-split"><div class="cust-chart">${growthChart(o.growth)}</div>
-          <div class="cust-mix">
-        ${mixTotal ? `<div class="mix" role="img" aria-label="Customer mix">${mixShown.filter(([key]) => o.mix[key]).map(([key, label, color]) =>
-          `<span style="flex:${o.mix[key]};background:${color}" title="${esc(label)}: ${o.mix[key]}"></span>`).join('')}</div>
-        <ul class="mix-leg">${mixShown.map(([key, label, color]) => `<li><span class="sw" style="background:${color}"></span>${esc(label)}
-          <b>${o.mix[key] || 0}</b><em>${Math.round(((o.mix[key] || 0) * 100) / mixTotal)}%</em></li>`).join('')}</ul>` : empty('No Customers Yet', '')}
-        <div class="facts2">
-          <div>Email not verified<b>${o.customer_facts.unverified}</b></div>
-          <div>Trials ending 7 d<b>${o.customer_facts.trials_ending_7d}</b></div>
-          <div>With failures<b>${o.customer_facts.with_failures}</b></div>
-          <div><a href="#/leads">Open leads</a><b>${o.customer_facts.open_leads}</b></div></div></div></div></div>
-      <div class="card"><div class="card-head"><h2>Needs Attention</h2>${incidents.length > 5 ? '<a href="#" id="allIncidents">View All →</a>' : ''}</div>
-        ${incidents.length ? `<ul class="alerts">${incidents.slice(0, 5).map(incidentRow).join('')}</ul>`
-          : empty('Nothing Needs Attention', '')}</div>
+
+    <div class="kpis ov-kpis">
+      ${kpi({ icon: 'users', tone: 'acc', label: 'New Customers', value: k.new_customers.value,
+        note: kpiNote(k.new_customers, true, k.new_customers.closed ? `${k.new_customers.closed} since closed` : ''), href: '#/accounts' })}
+      ${kpi({ icon: 'check', tone: 'ok', label: 'Active Customers', value: k.active_customers.value, note: kpiNote(k.active_customers), href: '#/accounts' })}
+      ${kpi({ icon: 'percent', tone: 'acc', label: 'Trial Conversion', value: pct(k.trial_conversion.value),
+        title: 'Of the free trials that ended in this period, the share that became paying customers. Trials still running are not counted yet.',
+        note: kpiNote(k.trial_conversion, true, [k.trial_conversion.value == null ? 'No trials ended yet'
+          : `${k.trial_conversion.converted} of ${k.trial_conversion.converted + k.trial_conversion.ended_unpaid} ended`,
+        trialsRunning ? `${trialsRunning} still running` : ''].filter(Boolean).join(' · ')) })}
+      ${kpi({ icon: 'money', tone: 'ok', label: 'MRR', value: money(k.mrr.value), note: kpiNote(k.mrr, true, '', (c) => money(c)), href: '#/payments' })}
+      ${kpi({ icon: 'users', tone: k.churn.value ? 'warn' : 'acc', label: 'Churn Rate', value: k.churn.value == null ? 'N/A' : pct(k.churn.value),
+        title: k.churn.value == null ? (k.churn.why || 'Not enough history yet') : 'Customers who stopped paying in this period, as a share of those paying at its start.',
+        note: kpiNote(k.churn, false, k.churn.base ? `${k.churn.churned} of ${k.churn.base}` : k.churn.churned ? `${k.churn.churned} stopped paying` : '') })}
+      ${kpi({ icon: 'card', tone: k.outstanding.value ? 'bad' : 'ok', label: 'Outstanding Payments', value: money(k.outstanding.cents),
+        note: kpiNote(k.outstanding, false, `${k.outstanding.value} account${k.outstanding.value === 1 ? '' : 's'}`, (n) => `${n} account${n === 1 ? '' : 's'}`), href: '#/payments' })}
+      ${kpi({ icon: 'trophy', tone: 'acc', label: 'Open Leads', value: k.open_leads.value, note: kpiNote(k.open_leads), href: '#/leads' })}
+      ${kpi({ icon: 'link', tone: k.failed_integrations.value ? 'bad' : 'ok', label: 'Failed Integrations', value: k.failed_integrations.value,
+        note: kpiNote(k.failed_integrations, false) })}
     </div>
-    <div class="ov-row2">
-      <div class="card"><div class="card-head"><h2>Recent Customers</h2><a href="#/accounts">Accounts →</a></div>
-        ${o.recent_customers.length ? `<div class="table-wrap"><table>
-          <thead><tr><th>Customer</th><th>Subscription</th><th>Services</th><th>Status</th><th>Registered</th><th>Last active</th></tr></thead>
-          <tbody>${o.recent_customers.map((c) => `<tr${c.id ? ` class="click" data-account="${esc(c.id)}"` : ''}>
-            <td>${esc(c.name)}</td>
+
+    <div class="ov-main">
+      <div class="card a-acq"><div class="card-head"><h2>Customer Acquisition</h2>
+        <span class="hint">${o.acquisition.total} new${o.acquisition.previous != null ? ` · ${o.acquisition.previous} in the ${esc(r.compare)}` : ''}</span></div>
+        ${bucketBars(o.acquisition.buckets, { unit, value: (p) => p.new, label: 'acq', height: 330 })}</div>
+      <div class="card a-rev"><div class="card-head"><h2>Revenue Overview</h2>
+        <span class="hint">${rev.growth_pct != null ? `${rev.growth_pct >= 0 ? '▲' : '▼'} ${pct(Math.abs(rev.growth_pct))} since ${esc(rev.growth_basis)}` : ''}</span></div>
+        <div class="rv-stats">
+          ${revStat('MRR', esc(money(rev.mrr_cents)))}${revStat('Net New', `${rev.net_new_cents < 0 ? '−' : '+'}${esc(money(Math.abs(rev.net_new_cents)))}<small>/mo</small>`,
+            rev.net_new_cents > 0 ? 'ok-t' : rev.net_new_cents < 0 ? 'bad-t' : '')}
+          ${revStat('Growth', rev.growth_pct == null ? '—' : `${rev.growth_pct >= 0 ? '+' : '−'}${pct(Math.abs(rev.growth_pct))}`,
+            rev.growth_pct == null ? '' : rev.growth_pct >= 0 ? 'ok-t' : 'bad-t')}
+          ${revStat('New revenue', `+${esc(money(rev.new_cents + rev.expansion_cents))}<small>/mo</small>`, 'ok-t')}
+          ${revStat('Churned revenue', `−${esc(money(rev.churned_cents + rev.contraction_cents))}<small>/mo</small>`, rev.churned_cents + rev.contraction_cents ? 'bad-t' : '')}
+          ${revStat('Failed payments', `${rev.failed_payments}${rev.failed_cents ? ` <small>${esc(money(rev.failed_cents))}</small>` : ''}`, rev.failed_payments ? 'bad-t' : '')}
+        </div>
+        ${o.revenue.buckets.length >= (unit === 'day' ? 3 : 2)
+    ? bucketBars(o.revenue.buckets, { unit, value: (p) => p.mrr_cents, label: 'mrr', cents: true })
+    : `<p class="rv-empty">Revenue history builds up day by day${rev.history_from ? ` (tracking since ${esc(fmtDate(rev.history_from))})` : ''}. The chart appears once there are a few days to show.</p>`}
+      </div>
+      <div class="card a-reg"><div class="card-head"><h2>Recent Registrations</h2><a href="#/accounts">Accounts →</a></div>
+        ${o.recent_customers.length ? `<div class="table-wrap"><table class="compact reg-table">
+          <thead><tr><th>Customer</th><th>Subscription</th><th>Status</th><th>Registered</th></tr></thead>
+          <tbody>${o.recent_customers.slice(0, SHOW_ACT).map((c) => `<tr${c.id ? ` class="click" data-account="${esc(c.id)}"` : ''}>
+            <td class="cust-n" title="${esc(c.name)}">${esc(c.name)}${variedServices && c.services.length ? `<small class="muted" style="display:block">${esc(c.services.join(', '))}</small>` : ''}</td>
             <td>${c.subscription ? tag(...SUB_LABEL[c.subscription]) : '—'}</td>
-            <td>${esc(c.services.join(', ') || '—')}</td>
             <td>${c.status === 'unverified' ? tag('mute', 'Email Not Verified') : statusPill(c.status)}</td>
-            <td class="nowrap">${esc(fmtDate(c.created_at))}</td>
-            <td class="nowrap">${c.last_active_at ? esc(fmtAgo(c.last_active_at)) : '—'}</td></tr>`).join('')}</tbody></table></div>`
+            <td class="nowrap">${esc(fmtDate(c.created_at))}</td></tr>`).join('')}</tbody></table></div>`
           : empty('No Customers Yet', '')}</div>
-      <div class="card"><div class="card-head"><h2>Service Health</h2><a href="#/catalog">Services →</a></div>
-        ${o.services.length ? `<ul class="svc-list">${svcShort}</ul>` : empty('No Services Yet', '')}
-        <div class="hint" style="margin-top:8px">Checked ${esc(fmtAgo(o.services[0]?.checked_at || o.checked_at))}</div></div>
-    </div>`;
-  wireGrowth(mount, o.growth);
+      <div class="card a-mix"><div class="card-head"><h2>Subscription Overview</h2><span class="hint">${mixTotal} customer${mixTotal === 1 ? '' : 's'}</span></div>
+        ${mixTotal ? `<div class="mix" role="img" aria-label="Subscriptions">${mixShown.filter(([key]) => o.mix[key]).map(([key, label, color]) =>
+          `<span style="flex:${o.mix[key]};background:${color}" title="${esc(label)}: ${o.mix[key]}"></span>`).join('')}</div>
+          <ul class="mix-leg">${mixShown.map(([key, label, color]) => `<li><span class="sw" style="background:${color}"></span>${esc(label)}
+            <b>${o.mix[key] || 0}</b><em>${Math.round(((o.mix[key] || 0) * 100) / mixTotal)}%</em></li>`).join('')}</ul>` : empty('No Customers Yet', '')}
+        ${o.mix_closed ? `<div class="hint" style="margin-top:8px">${o.mix_closed} closed account${o.mix_closed === 1 ? '' : 's'} not included.</div>` : ''}</div>
+      <div class="card a-sal"><div class="card-head"><h2>Sales Overview</h2><a href="#/leads">Leads →</a></div>
+        <ol class="funnel">${o.funnel.map((f) => `<li title="${f.pct_top != null ? `${pct(f.pct_top)} of those who registered` : ''}"><span class="fn-l">${esc(f.label)}</span>
+          <span class="fn-bar"><span style="width:${Math.max(f.value ? 2 : 0, (f.value * 100) / funnelTop)}%"></span></span>
+          <b>${f.value}</b><em>${f.pct_prev == null ? '' : pct(f.pct_prev)}</em></li>`).join('')}</ol>
+        <div class="fn-note">Each percentage is of the stage before. Subscribed means a free trial or a paid plan.${
+          o.funnel_closed ? ` ${o.funnel_closed} of those who registered have since closed their account.` : ''}</div>
+        <div class="fn-foot"><span>Open leads <b>${o.leads.open}</b> <span class="muted">(tracked separately)</span></span>
+          <span>New ${o.leads.by_stage.new} · Contacted ${o.leads.by_stage.contacted} · Qualified ${o.leads.by_stage.qualified}</span>
+          <span>Pipeline <b>${o.leads.pipeline_cents ? `${esc(money(o.leads.pipeline_cents))}/mo` : '—'}</b></span></div></div>
+      <div class="card a-att" id="attention"><div class="card-head"><h2>Needs Attention</h2><span class="hint">${incidents.length} open</span></div>
+        <ul class="attn-list">${ATTENTION.map(([key, label, icon]) => {
+          const items = byCat[key];
+          const worst = items.some((i) => ['critical', 'high'].includes(i.severity)) ? 'bad' : items.some((i) => i.severity === 'medium') ? 'warn' : items.length ? 'acc' : 'ok';
+          const names = [...new Set(items.map((i) => i.account || i.service || i.issue))];
+          return `<li${items.length ? ` class="click" data-cat="${key}"` : ''}><span class="al-ic ${worst}">${kpiIcon(icon)}</span>
+            <div><b>${esc(label)}</b><small>${items.length ? esc(names.slice(0, 2).join(', ') + (names.length > 2 ? ` +${names.length - 2}` : '')) : 'All clear'}</small></div>
+            <span class="attn-n ${items.length ? worst : ''}">${items.length}</span></li>`;
+        }).join('')}</ul></div>
+      <div class="card a-act"><div class="card-head"><h2>Recent Activity</h2>${o.activity.length > SHOW_ACT ? '<a href="#" id="allActivity">View All →</a>' : ''}</div>
+        ${o.activity.length ? `<ul class="act-feed">${o.activity.slice(0, SHOW_ACT).map(actRow).join('')}</ul>` : empty('Nothing Yet', '')}</div>
+      ${coreHealthCard(o.core)}
+      <div class="card a-hlt"><div class="card-head"><h2>Service Health</h2><span class="hint">Checked ${esc(fmtAgo(o.checked_at))}</span></div>
+      <div class="table-wrap"><table class="health compact">
+      <colgroup><col class="c-svc"><col class="c-stat"><col class="c-av"><col class="c-rsp"><col class="c-req"><col class="c-job"><col class="c-sch"><col class="c-db"></colgroup>
+      <thead><tr><th>Service</th><th>Status</th><th class="num">Availability<small>30 days</small></th><th class="num">Response<small>p95 · 24 h</small></th>
+        <th class="num">Failed Requests<small>5xx · 24 h</small></th><th>Background Jobs<small>now · failed 24 h</small></th><th>Scheduler</th><th>Database</th></tr></thead>
+      <tbody>${serviceHealthRows(o.services)}</tbody></table></div>
+      <div class="hint" style="margin-top:8px">Aggregate across all customers; no per-customer data. Select a row for its last 24 hours.
+        Availability is the share of Core's own checks that got an answer, so it can't see a time when Core was down. Request counts are per process and restart with it. Hover a figure for its definition.</div></div>
+    </div>
+  </div>`;
+
+  wireChart(mount, 'acq', o.acquisition.buckets, (p) => `<b>${esc(bucketLabel(p.key, unit, true))}</b><span>${p.new} new customer${p.new === 1 ? '' : 's'}</span>`);
+  wireChart(mount, 'mrr', o.revenue.buckets, (p) => `<b>${esc(bucketLabel(p.key, unit, true))}</b><span>MRR ${p.mrr_cents == null ? '—' : esc(money(p.mrr_cents))}</span>
+    ${p.new_cents ? `<span>New +${esc(money(p.new_cents))}</span>` : ''}${p.churned_cents ? `<span>Churned −${esc(money(p.churned_cents))}</span>` : ''}`);
+  mount.onkeydown = (e) => {
+    const health = e.key === 'Enter' && e.target.closest?.('[data-health]');
+    if (health) health.click();
+  };
   mount.onclick = (e) => {
-    if (e.target.closest('#allIncidents')) {
+    const range = e.target.closest('[data-range]');
+    if (range) { overviewRange = range.dataset.range; guard(() => renderOverview(mount)); return; }
+    if (e.target.closest('.ov-attn')) { e.preventDefault(); $('#attention', mount).scrollIntoView({ behavior: 'smooth', block: 'center' }); return; }
+    if (e.target.closest('#allActivity')) {
       e.preventDefault();
-      dialog({ title: 'Needs Attention', wide: true, submitLabel: 'Done',
-        body: `<ul class="alerts">${incidents.map(incidentRow).join('')}</ul>` });
+      dialog({ title: 'Recent Activity', wide: true, submitLabel: 'Done', body: `<ul class="act-feed">${o.activity.map(actRow).join('')}</ul>` });
       return;
     }
+    const cat = e.target.closest('[data-cat]');
+    if (cat) {
+      const [, label] = ATTENTION.find(([key]) => key === cat.dataset.cat);
+      dialog({ title: label, wide: true, submitLabel: 'Done',
+        body: `<ul class="alerts">${byCat[cat.dataset.cat].map(incidentRow).join('')}</ul>` });
+      return;
+    }
+    const health = e.target.closest('[data-health]');
+    if (health) { const sv = o.services.find((x) => x.slug === health.dataset.health); if (sv) guard(() => serviceHealthDialog(sv)); return; }
     const go = e.target.closest('[data-href]');
     if (go) { document.querySelector('.wiz-backdrop')?.click(); window.location.hash = go.dataset.href; return; }
     const row = e.target.closest('[data-account]');
@@ -316,13 +521,56 @@ async function renderServiceDashboard(mount, route, { slug }) {
 /* =========================================================================
  * Accounts
  * ====================================================================== */
-const filters = { q: '', status: '', service: '' };
+const filters = { q: '', status: '', service: '', billing: '' };
+
+const BILLING_FILTER = [['paying', 'Paying'], ['trial', 'Trial'], ['trial_ending', 'Trial Ending'], ['past_due', 'Payment Due'], ['none', 'No Service']];
+const SHOWN_SERVICES = 2;
+
+/** One service in the list: a state dot and its name. Billing says what happens next. */
+function serviceLine(r) {
+  const tone = r.status === 'trialing' ? 'trialing' : r.status === 'active' ? 'ok' : r.status === 'past_due' || r.status === 'suspended' ? 'bad' : 'mute';
+  const word = r.status === 'active' && !r.billed ? 'Active' : r.status === 'active' ? 'Paying' : STATUS_LABEL[r.status] || r.status;
+  return `<div class="svc-line" title="${esc(`${r.service.name}: ${word}`)}"><i class="dot ${tone}" aria-label="${esc(word)}"></i><span>${esc(r.service.name)}</span></div>`;
+}
+
+// What needs a look comes first, so the two shown are the two that matter.
+function serviceRank(r) {
+  const left = r.trial_ends_at ? new Date(r.trial_ends_at).getTime() : Infinity;
+  return r.status === 'past_due' ? [0, 0] : r.status === 'trialing' ? [1, left] : [2, 0];
+}
+
+function perMonth(a) {
+  const paying = a.paying_cents, trial = a.after_trial_cents;
+  if (!paying && !trial) return '<span class="muted">—</span>';
+  return `${paying ? money(paying) : '<span class="muted">—</span>'}${trial ? `<small class="muted">${paying ? '+ ' : ''}${esc(money(trial))} after trial</small>` : ''}`;
+}
+
+const dayMonth = (v) => new Date(v).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+
+/** The Billing pill with its next event, and under it how a paying account pays. */
+function billingCell(a) {
+  const b = a.billing;
+  const label = b.key === 'paying' && b.renews_at ? `Paying · renews ${dayMonth(b.renews_at)}` : b.label;
+  const under = b.note || (b.key === 'paying' ? (a.pays_online ? 'Paid via Stripe' : 'Not billed online') : '');
+  return `${tag(b.tone, label)}${under ? `<small class="muted">${esc(under)}</small>` : ''}`;
+}
+
+const SORTS = {
+  name: (x, y) => x.name.localeCompare(y.name),
+  billing: (x, y) => x.billing.rank - y.billing.rank || (x.billing.trial_days ?? 999) - (y.billing.trial_days ?? 999),
+  permonth: (x, y) => x.paying_cents - y.paying_cents,
+  since: (x, y) => new Date(x.created_at) - new Date(y.created_at),
+};
+// Default: what needs a look first (payment due, suspended, trials ending soonest), newest first within a tie.
+const sorting = { key: 'billing', dir: 1 };
+const sortHead = (key, label, cls = '') => `<th class="sort ${cls}" data-sort="${key}" tabindex="0" aria-sort="${sorting.key === key ? (sorting.dir > 0 ? 'ascending' : 'descending') : 'none'}">${label}<i>${sorting.key === key ? (sorting.dir > 0 ? '▲' : '▼') : ''}</i></th>`;
 
 async function renderAccounts(mount) {
   const svcs = await services();
-  const qs = new URLSearchParams(Object.entries({ q: filters.q, status_filter: filters.status, service: filters.service })
+  const qs = new URLSearchParams(Object.entries({ q: filters.q, status_filter: filters.status, service: filters.service, billing_filter: filters.billing })
     .filter(([, v]) => v)).toString();
   const rows = await api.get(`/staff/accounts${qs ? `?${qs}` : ''}`);
+  rows.sort((x, y) => sorting.dir * SORTS[sorting.key](x, y) || new Date(y.created_at) - new Date(x.created_at));
   mount.innerHTML = `
     <div class="filterbar">
       <label class="fb-search"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -331,16 +579,24 @@ async function renderAccounts(mount) {
         `<option value="${s}" ${filters.status === s ? 'selected' : ''}>${STATUS_LABEL[s]}</option>`).join('')}</select>
       <select id="service" aria-label="Service"><option value="">All services</option>${svcs.map((s) =>
         `<option value="${esc(s.slug)}" ${filters.service === s.slug ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
+      <select id="billing" aria-label="Billing"><option value="">All billing</option>${BILLING_FILTER.map(([v, l]) =>
+        `<option value="${v}" ${filters.billing === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <span class="fb-spacer"></span>
       <button class="primary" id="new">New Account</button>
     </div>
-    <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Account</th><th>Owner</th><th>Services</th><th>Status</th><th class="num">Per Month</th><th>Since</th></tr></thead>
-      <tbody>${rows.map((a) => `<tr class="click" data-id="${esc(a.id)}">
-        <td><strong>${esc(a.name)}</strong></td><td>${esc(a.owner_email || '—')}</td>
-        <td>${a.services.filter((s) => s.status !== 'cancelled').map((s) => `${esc(s.service.name)} ${statusPill(s.status)}`).join('<br>') || '<span class="muted">—</span>'}</td>
-        <td>${statusPill(a.status)}${a.pays_online ? ' <span class="pill">Stripe</span>' : ''}</td>
-        <td class="num">${money(a.monthly_total_cents)}</td><td class="nowrap">${esc(fmtDate(a.created_at))}</td></tr>`).join('')
+    <div class="card"><div class="table-wrap"><table class="accounts">
+      <thead><tr>${sortHead('name', 'Account')}<th>Services</th><th>Status</th>${sortHead('billing', 'Billing')}${sortHead('permonth', 'Per Month', 'num')}${sortHead('since', 'Since')}</tr></thead>
+      <tbody>${rows.map((a) => {
+        const live = a.services.filter((r) => r.status !== 'cancelled')
+          .sort((x, y) => { const [a1, a2] = serviceRank(x); const [b1, b2] = serviceRank(y); return a1 - b1 || a2 - b2; });
+        return `<tr class="click" data-id="${esc(a.id)}">
+        <td><strong>${esc(a.name)}</strong>${a.owner_email ? `<small class="muted">${esc(a.owner_email)}</small>` : ''}</td>
+        <td>${live.slice(0, SHOWN_SERVICES).map(serviceLine).join('') || '<span class="muted">—</span>'}${
+          live.length > SHOWN_SERVICES ? `<small class="muted" title="${esc(live.slice(SHOWN_SERVICES).map((r) => r.service.name).join(', '))}">+${live.length - SHOWN_SERVICES} more</small>` : ''}</td>
+        <td>${a.status === 'active' ? '<i class="dot ok" title="Active" aria-label="Active"></i>' : statusPill(a.status)}</td>
+        <td>${billingCell(a)}</td>
+        <td class="num">${perMonth(a)}</td><td class="nowrap">${esc(fmtDate(a.created_at))}</td></tr>`;
+      }).join('')
         || `<tr><td colspan="6">${empty('No Accounts Match', '')}</td></tr>`}</tbody>
     </table></div></div>`;
   let timer;
@@ -350,6 +606,17 @@ async function renderAccounts(mount) {
   });
   $('#status', mount).addEventListener('change', (e) => { filters.status = e.target.value; renderAccounts(mount); });
   $('#service', mount).addEventListener('change', (e) => { filters.service = e.target.value; renderAccounts(mount); });
+  $$('th[data-sort]', mount).forEach((th) => {
+    const go = () => {
+      const key = th.dataset.sort;
+      sorting.dir = sorting.key === key ? -sorting.dir : 1;
+      sorting.key = key;
+      renderAccounts(mount);
+    };
+    th.addEventListener('click', go);
+    th.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  });
+  $('#billing', mount).addEventListener('change', (e) => { filters.billing = e.target.value; renderAccounts(mount); });
   $$('tr[data-id]', mount).forEach((tr) => tr.addEventListener('click', () => { window.location.hash = `#/accounts/${tr.dataset.id}`; }));
   $('#new', mount).addEventListener('click', () => newAccountDialog());
 }
@@ -467,7 +734,7 @@ async function renderAccount(mount, route, { id }) {
         </tr>`).join('')}</tbody></table>` : empty('No Odoo Connected', '')}
     </div>
     <div class="card" style="margin-top:14px"><div class="card-head"><h2>History</h2></div>
-      <ul class="timeline">${a.audit.map((e) => `<li><div><strong>${esc(e.action)}</strong>${e.detail ? ` · ${esc(e.detail)}` : ''}</div>
+      <ul class="audit-feed">${a.audit.map((e) => `<li><div><strong>${esc(e.action)}</strong>${e.detail ? ` <span class="muted">· ${esc(e.detail)}</span>` : ''}</div>
         <div class="hint">${esc(e.actor)} · ${esc(fmtAgo(e.at))}</div></li>`).join('') || '<li class="muted">Nothing yet.</li>'}</ul>
     </div>
     <div class="card danger-zone" style="margin-top:14px">
@@ -996,7 +1263,7 @@ async function route() {
     }
     mountShell({
       nav: [{ label: 'Console', items: PAGES }],
-      user: state.me.email,
+      user: '',  // the top-bar chip already names the signed-in staff member
       pill: staffChip(state.me),
       onSignOut: async () => { await signOut(); state.me = null; unmountShell(); route(); },
     });
