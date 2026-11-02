@@ -58,6 +58,11 @@ SUBSCRIPTION_SWEEP_EVERY_SECONDS = 3600
 #: minutes — but not every tick.
 ALERT_EMAIL_EVERY_SECONDS = 300
 
+#: Accounts with a connection in trouble are re-checked this often, so one that
+#: has been fixed turns Connected (and leaves the slow lane) without waiting for
+#: the next slowed-down sync or for the customer to sign in.
+RECOVERY_PROBE_EVERY_SECONDS = 300
+
 
 class Scheduler:
     """Owns one asyncio task. Start it in ``lifespan``, stop it on shutdown."""
@@ -71,6 +76,7 @@ class Scheduler:
         self._last_stale_close: datetime | None = None
         self._last_subscription_sweep: datetime | None = None
         self._last_alert_sweep: datetime | None = None
+        self._last_recovery_probe: datetime | None = None
         self.ticks = 0
         self.dispatched = 0
 
@@ -167,6 +173,9 @@ class Scheduler:
 
         if self._alert_sweep_due():
             asyncio.create_task(self._run_alert_sweep())
+
+        if self._recovery_probe_due():
+            asyncio.create_task(self._run_recovery_probe())
 
     def _claim_and_select(self) -> tuple[bool, list[str]]:
         """Claim the lease and read the due list — one short database visit.
@@ -287,6 +296,37 @@ class Scheduler:
                 log.info("Alert emails: %d sent to %d account(s)", result["emails_sent"], result["tenants_emailed"])
         except Exception:  # noqa: BLE001
             log.exception("Alert email sweep failed")
+
+    def _recovery_probe_due(self) -> bool:
+        now = datetime.now(timezone.utc)
+        if self._last_recovery_probe is None:
+            self._last_recovery_probe = now      # not on the first tick either
+            return False
+        if (now - self._last_recovery_probe).total_seconds() < RECOVERY_PROBE_EVERY_SECONDS:
+            return False
+        self._last_recovery_probe = now
+        return True
+
+    async def _run_recovery_probe(self) -> None:
+        try:
+            fixed = await asyncio.to_thread(self._recovery_probe_blocking)
+            if fixed:
+                log.info("Connection recheck: %d account(s) back to healthy", fixed)
+        except Exception:  # noqa: BLE001
+            log.exception("Connection recheck failed")
+
+    @staticmethod
+    def _recovery_probe_blocking() -> int:
+        from app.services import health_probe
+
+        with session_scope() as db:
+            ids = health_probe.tenants_in_trouble(db)
+        fixed = 0
+        for tenant_id in ids:
+            result = health_probe.recheck_tenant(tenant_id)
+            if result and result.get("streak_cleared"):
+                fixed += 1
+        return fixed
 
     @staticmethod
     def _alert_sweep_blocking() -> dict[str, int]:

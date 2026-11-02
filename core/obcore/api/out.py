@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from obcore.config import settings
 from obcore.models import (
     Account, AccountService, Lead, LeadEvent, OdooConnection, Service, ServicePackage, StaffUser, User,
 )
 from obcore.security import aware
+from obcore.urlcheck import is_local
 
 
 def iso(value) -> str | None:
@@ -25,7 +27,10 @@ def package_out(p: ServicePackage, *, staff: bool = False) -> dict[str, Any]:
         "sort_order": p.sort_order,
     }
     if staff:
-        out.update(stripe_price_id=p.stripe_price_id, stripe_yearly_price_id=p.stripe_yearly_price_id)
+        out.update(stripe_price_id=p.stripe_price_id, stripe_yearly_price_id=p.stripe_yearly_price_id,
+                   # What a new trial on this package really gets: its own length, else the platform's.
+                   trial_days_effective=p.trial_days if p.trial_days is not None else settings.default_trial_days,
+                   trial_is_default=p.trial_days is None)
     return out
 
 
@@ -38,7 +43,20 @@ def service_out(s: Service, *, staff: bool = False) -> dict[str, Any]:
     }
     if staff:
         out.update(internal_url=s.internal_url, sso_callback_path=s.sso_callback_path,
-                   has_client_secret=bool(s.client_secret_hash), sort_order=s.sort_order)
+                   has_client_secret=bool(s.client_secret_hash), sort_order=s.sort_order,
+                   trial_default_days=settings.default_trial_days, url_warnings=url_warnings(s))
+    return out
+
+
+def url_warnings(s: Service) -> list[dict[str, str]]:
+    """Addresses that can't be right in production: a service left pointing at the developer's own machine."""
+    if not settings.is_production:
+        return []
+    out = []
+    if is_local(s.base_url):
+        out.append({"field": "base_url", "message": "Points at this machine (localhost). Customers can't open it. Set the real public address."})
+    if is_local(s.internal_url):
+        out.append({"field": "internal_url", "message": "Points at this machine (localhost). The core can't reach the service there. Use its container or private address."})
     return out
 
 
@@ -109,6 +127,7 @@ def lead_out(lead: Lead) -> dict[str, Any]:
         "stage": lead.stage, "stage_changed_at": iso(lead.stage_changed_at), "demo_status": lead.demo_status,
         "demo_at": iso(lead.demo_at), "lost_reason": lead.lost_reason, "owner_staff_id": lead.owner_staff_id,
         "value_cents": lead.value_cents, "account_id": lead.account_id, "created_at": iso(lead.created_at),
+        "follow_up_on": lead.follow_up_on.isoformat() if lead.follow_up_on else None,
     }
 
 

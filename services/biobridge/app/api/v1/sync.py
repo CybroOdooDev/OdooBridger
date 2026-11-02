@@ -546,6 +546,10 @@ def _fill_missing_companies(db: Session, tenant) -> None:
         db.rollback()
 
 
+#: Written on a punch when its badge is deleted; how restoring finds them again.
+DELETED_BADGE_NOTE = "Badge deleted from the unmatched list"
+
+
 @router.get("/mappings", response_model=list[MappingOut])
 def list_mappings(
     status_filter: str | None = Query(default=None, alias="status"),
@@ -680,10 +684,41 @@ def delete_mapping(
         PunchRecord.emp_code == mapping.emp_code,
         PunchRecord.process_state == PunchState.unmapped.value,
     ).update({"process_state": PunchState.skipped.value,
-              "error_message": "Badge deleted from the unmatched list"})
+              "error_message": DELETED_BADGE_NOTE})
     audit(db, principal, "mapping.delete", mapping.emp_code, "", request)
     db.commit()
     return MessageOut(message="Badge deleted")
+
+
+@router.post("/mappings/{mapping_id}/restore", response_model=MessageOut)
+def restore_mapping(
+    mapping_id: str,
+    request: Request,
+    principal: Principal = Depends(require_writer),
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Bring a deleted badge back to the unmatched list.
+
+    The badge goes back to ``unmapped`` and the next sync tries to match it
+    again. The punches that were skipped *because it was deleted* wait for a
+    match again (punches skipped for any other reason are left alone).
+    """
+    mapping = db.get(EmployeeMapping, mapping_id)
+    if mapping is None or mapping.tenant_id != principal.tenant.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Mapping not found")
+    if mapping.status != MappingStatus.removed.value:
+        raise HTTPException(status.HTTP_409_CONFLICT, "That badge isn't deleted.")
+    mapping.status = MappingStatus.unmapped.value
+    mapping.match_note = "Waiting to be matched to an Odoo employee."
+    back = db.query(PunchRecord).filter(
+        PunchRecord.tenant_id == principal.tenant.id,
+        PunchRecord.emp_code == mapping.emp_code,
+        PunchRecord.process_state == PunchState.skipped.value,
+        PunchRecord.error_message == DELETED_BADGE_NOTE,
+    ).update({"process_state": PunchState.unmapped.value, "error_message": None})
+    audit(db, principal, "mapping.restore", mapping.emp_code, f"{back} punch(es) back", request)
+    db.commit()
+    return MessageOut(message=f"Badge restored — {back} punch{'es' if back != 1 else ''} waiting to be matched")
 
 
 @router.get("/attendance", response_model=list[AttendanceOut])

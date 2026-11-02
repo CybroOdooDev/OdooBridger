@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
@@ -20,9 +21,10 @@ from obcore.models import (
     DEMO_STATUSES, LEAD_STAGES, OPEN_STAGES, Account, AccountClosure, AccountService, AccountStatus,
     AuditLog, Lead, LeadEvent, Service, ServicePackage, ServiceStatus, StaffUser, User,
 )
+from obcore.urlcheck import is_local
 from obcore.security import aware, hash_password, utcnow, validate_password, verify_password
 from obcore.services import accounts as acc
-from obcore.services import billing, closing, leads, provisioning, sso
+from obcore.services import billing, closing, leads, ops, provisioning, sso
 from obcore.services import stripe_api as stripe
 
 router = APIRouter(prefix="/staff", tags=["staff"], dependencies=[Depends(stripe_config)])
@@ -85,6 +87,12 @@ def service_health_history(slug: str, _: StaffUser = Depends(get_staff), db: Ses
 # =============================================================================
 # Accounts
 # =============================================================================
+@router.get("/accounts/count")
+def count_accounts(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    """How many accounts there are in all, for "5 of 6 accounts" over a filtered list."""
+    return {"total": db.scalar(select(func.count(Account.id))) or 0}
+
+
 @router.get("/accounts")
 def list_accounts(q: str | None = None, status_filter: str | None = None, service: str | None = None,
                   billing_filter: str | None = None, _: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> list[dict]:
@@ -108,6 +116,7 @@ def list_accounts(q: str | None = None, status_filter: str | None = None, servic
         row = account_out(account)
         row["billing"] = state
         row["paying_cents"], row["after_trial_cents"] = billing.split_monthly_cents(account)
+        row["billed_period_cents"] = billing.billed_period_cents(account)
         owner = acc.owner_of(account)
         row["owner_email"] = owner.email if owner else None
         row["users_count"] = len(account.users)
@@ -394,14 +403,22 @@ def payments(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -
                          for r in account.services if r.stripe_item_id],
             "stripe_customer_id": account.stripe_customer_id,
         })
-    out = {"stripe": stripe.config_summary(db), "subscribers": subscribers, "invoices": [], "error": None}
-    if stripe.enabled():
-        try:
-            data = stripe.request("GET", "invoices", {"limit": 25})
-            out["invoices"] = [billing.invoice_out(i) for i in data.get("data") or [] if i.get("status") != "draft"]
-        except stripe.BillingError as exc:
-            out["error"] = str(exc)
-    return out
+    # Nothing here waits on Stripe, so the page opens at once; the console then runs the Stripe check
+    # and loads the invoices with the two calls below.
+    return {"stripe": stripe.config_summary(db), "subscribers": subscribers}
+
+
+#: How long the Payments page waits for Stripe before it says Stripe didn't answer.
+PAGE_STRIPE_TIMEOUT = 8
+
+
+@router.get("/payments/invoices")
+def payment_invoices(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    try:
+        data = stripe.request("GET", "invoices", {"limit": 25}, timeout=PAGE_STRIPE_TIMEOUT)
+    except stripe.BillingError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return {"invoices": [billing.invoice_out(i) for i in data.get("data") or [] if i.get("status") != "draft"]}
 
 
 class StripeKeysIn(BaseModel):
@@ -424,7 +441,7 @@ def set_stripe(payload: StripeKeysIn, staff: StaffUser = Depends(get_staff), db:
 @router.post("/payments/stripe/test")
 def test_stripe(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
     try:
-        data = stripe.request("GET", "balance")
+        data = stripe.request("GET", "balance", timeout=PAGE_STRIPE_TIMEOUT)
     except stripe.BillingError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     return {"message": "Stripe answered.", "livemode": data.get("livemode")}
@@ -466,6 +483,7 @@ class ServiceIn(BaseModel):
 def create_service(payload: ServiceIn, staff: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
     if not payload.slug or not payload.name or not payload.base_url:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Slug, name and URL are required.")
+    _check_urls(payload)
     if db.scalar(select(Service.id).where(Service.slug == payload.slug)):
         raise HTTPException(status.HTTP_409_CONFLICT, "A service with that slug exists.")
     service = Service(**{k: v for k, v in payload.model_dump().items() if v is not None})
@@ -474,6 +492,19 @@ def create_service(payload: ServiceIn, staff: StaffUser = Depends(get_staff), db
     acc.audit(db, actor(staff), "catalog.service_create", detail=payload.slug)
     db.commit()
     return {**service_out(service, staff=True), "client_secret": secret}
+
+
+def _check_urls(payload: ServiceIn, service: Service | None = None) -> None:
+    """In production a service can't live at localhost: customers and the core would never reach it."""
+    if not settings.is_production:
+        return
+    given = payload.model_dump(exclude_unset=True)
+    for field, label in (("base_url", "Public URL"), ("internal_url", "Internal URL")):
+        value = given.get(field)
+        if value and is_local(value):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"{label} points at localhost, which only works on a developer machine. "
+                                "Use the address customers and the core can really reach.")
 
 
 def _catalog_service(db: Session, service_id: str) -> Service:
@@ -503,6 +534,7 @@ def _rebind_odoo(db: Session, service: Service, uses_odoo: bool) -> None:
 def update_service(service_id: str, payload: ServiceIn, staff: StaffUser = Depends(get_staff),
                    db: Session = Depends(get_db)) -> dict:
     service = _catalog_service(db, service_id)
+    _check_urls(payload, service)
     for key, value in payload.model_dump(exclude_unset=True).items():
         if key == "slug" and value != service.slug:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "A service's slug can't change.")
@@ -512,6 +544,81 @@ def update_service(service_id: str, payload: ServiceIn, staff: StaffUser = Depen
     acc.audit(db, actor(staff), "catalog.service_update", detail=service.slug)
     db.commit()
     return service_out(service, staff=True)
+
+
+@router.get("/services/health")
+def services_health(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    """Each service's status for the catalog page. Loaded after the page opens: it waits on the services."""
+    return {row["id"]: {"status": row["status"], "latency_ms": row["latency_ms"], "reason": row["status_reason"]}
+            for row in ops.collect(db)}
+
+
+@router.post("/services/{service_id}/test")
+def test_service(service_id: str, staff: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    """Ask the service's /health right now, from the core's side: the address the core really uses."""
+    service = _catalog_service(db, service_id)
+    check = ops._check({"api_url": service.api_url}, ops._metrics_headers(service, db)) if service.client_secret_hash \
+        else ops._check({"api_url": service.api_url}, {})
+    return {"reachable": check["reachable"], "latency_ms": check["latency_ms"], "error": check["error"],
+            "url": service.api_url, "signed_in": bool(check["metrics"]) if check["reachable"] else None}
+
+
+def _price_state(price_id: str | None, want_cents: int | None, currency: str, interval: str,
+                 lookup: dict[str, dict | str]) -> dict:
+    """One Stripe price against what the catalog says it should be."""
+    if not price_id:
+        return {"state": "missing", "detail": "No Stripe price. This can't be bought online."}
+    found = lookup.get(price_id)
+    if isinstance(found, str):
+        return {"state": "error", "detail": found}
+    if found is None:
+        return {"state": "error", "detail": "Stripe didn't answer."}
+    if found.get("not_found"):
+        return {"state": "notfound", "detail": f"Stripe has no price {price_id}. Check the id."}
+    problems = []
+    if not found.get("active", True):
+        problems.append("the price is archived in Stripe")
+    got_interval = (found.get("recurring") or {}).get("interval")
+    if got_interval != interval:
+        problems.append(f"it bills {'per ' + got_interval if got_interval else 'once'}, not per {interval}")
+    if found.get("currency") and found["currency"].lower() != (currency or "usd").lower():
+        problems.append(f"it is in {found['currency'].upper()}, not {(currency or 'usd').upper()}")
+    if want_cents is not None and found.get("unit_amount") is not None and found["unit_amount"] != want_cents:
+        cur = (found.get("currency") or currency or "usd").upper()
+        problems.append(f"Stripe charges {found['unit_amount'] / 100:,.2f} {cur}, the catalog says {want_cents / 100:,.2f} {cur}")
+    if problems:
+        return {"state": "mismatch", "detail": "Out of sync: " + "; ".join(problems) + "."}
+    return {"state": "ok", "detail": "Matches the Stripe price."}
+
+
+@router.get("/services/stripe-check")
+def stripe_check(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    """Compare every package's Stripe prices with the catalog. Loaded after the page opens."""
+    if not stripe.enabled():
+        return {"enabled": False, "packages": {}}
+    packages = db.scalars(select(ServicePackage)).all()
+    ids = sorted({i for p in packages for i in (p.stripe_price_id, p.stripe_yearly_price_id) if i})
+
+    def fetch(price_id: str):
+        try:
+            return stripe.request("GET", f"prices/{price_id}", timeout=PAGE_STRIPE_TIMEOUT)
+        except stripe.BillingError as exc:
+            text = str(exc)
+            if "No such price" in text:
+                return {"not_found": True}
+            return text
+
+    lookup: dict[str, dict | str] = {}
+    if ids:
+        with ThreadPoolExecutor(max_workers=min(6, len(ids))) as pool:
+            lookup = dict(zip(ids, pool.map(fetch, ids)))
+    out = {}
+    for p in packages:
+        out[p.id] = {
+            "month": _price_state(p.stripe_price_id, p.monthly_price_cents, p.currency, "month", lookup),
+            "year": _price_state(p.stripe_yearly_price_id, p.yearly_price_cents, p.currency, "year", lookup),
+        }
+    return {"enabled": True, "packages": out}
 
 
 @router.post("/services/{service_id}/secret")
@@ -540,12 +647,37 @@ class PackageIn(BaseModel):
     sort_order: int | None = None
 
 
+LIMIT_KEYS = {"max_devices": 0, "max_employees": 0, "max_seats": 0, "min_sync_interval_minutes": 1}
+
+
+def _clean_entitlements(raw: dict) -> dict:
+    """Limits are numbers (empty = unlimited). A typo such as "ten" must fail here, not at a customer's sync."""
+    out = {}
+    for key, value in raw.items():
+        if value is None or value == "":
+            out[key] = None
+            continue
+        if key not in LIMIT_KEYS:
+            out[key] = value          # a limit only some other service knows about
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < LIMIT_KEYS[key]:
+            minimum = LIMIT_KEYS[key]
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"{key} must be a whole number of {minimum} or more, or empty for no limit.")
+        out[key] = value
+    return out
+
+
 def _apply_package(db: Session, package: ServicePackage, data: dict) -> None:
+    if data.get("entitlements") is not None:
+        data["entitlements"] = _clean_entitlements(data["entitlements"])
     for key in ("stripe_price_id", "stripe_yearly_price_id"):
         if key in data and data[key] is not None:
             data[key] = data[key].strip() or None
             if data[key] and not data[key].startswith("price_"):
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Stripe price ids start with price_.")
+    if data.get("is_active") is False:
+        data["is_default"] = False      # a package off sale can't be the one signups start on
     for key, value in data.items():
         setattr(package, key, value)
     if data.get("is_default"):
@@ -592,6 +724,20 @@ def update_package(package_id: str, payload: PackageIn, staff: StaffUser = Depen
 # =============================================================================
 # Leads
 # =============================================================================
+def _with_activity(db: Session, rows: list[dict]) -> list[dict]:
+    """Add ``last_activity_at`` to lead rows: the newest history entry (a move, note, demo change or
+    assignment), or when the lead came in. One query for all of them."""
+    if not rows:
+        return rows
+    # Planning a follow-up isn't contact, so it doesn't reset the "last activity" clock.
+    newest = dict(db.execute(select(LeadEvent.lead_id, func.max(LeadEvent.created_at))
+                             .where(LeadEvent.kind != "followup").group_by(LeadEvent.lead_id)).all())
+    for row in rows:
+        at = newest.get(row["id"])
+        row["last_activity_at"] = iso(at) if at else row["created_at"]
+    return rows
+
+
 @router.get("/leads")
 def list_leads(stage: str | None = None, q: str | None = None, service: str | None = None,
                demo: str | None = None, _: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> list[dict]:
@@ -609,16 +755,22 @@ def list_leads(stage: str | None = None, q: str | None = None, service: str | No
     rows = [lead_out(lead) for lead in db.scalars(stmt.limit(500)).all()]
     if service:
         rows = [r for r in rows if service in r["services"]]
-    return rows
+    return _with_activity(db, rows)
 
 
 @router.get("/leads/pipeline")
 def pipeline(_: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
     stages = {s: [] for s in LEAD_STAGES}
-    for lead in db.scalars(select(Lead).order_by(Lead.stage_changed_at.desc())).all():
-        stages.setdefault(lead.stage, []).append(lead_out(lead))
+    for row in _with_activity(db, [lead_out(lead) for lead in db.scalars(select(Lead).order_by(Lead.stage_changed_at.desc())).all()]):
+        stages.setdefault(row["stage"], []).append(row)
     return {"stages": stages, "demo_statuses": list(DEMO_STATUSES),
             "staff": [staff_out(s) for s in db.scalars(select(StaffUser).where(StaffUser.is_active.is_(True)))]}
+
+
+@router.get("/leads/trends")
+def lead_trends(days: int = 30, _: StaffUser = Depends(get_staff), db: Session = Depends(get_db)) -> dict:
+    """The Leads page's four figures and how they moved (see ``leads.trends``)."""
+    return leads.trends(db, days=max(1, min(days, 365)))
 
 
 def _lead(db: Session, lead_id: str) -> Lead:
@@ -663,6 +815,7 @@ class LeadPatch(BaseModel):
     demo_status: str | None = None
     demo_at: datetime | None = None
     owner_staff_id: str | None = None
+    follow_up_on: date | None = None
     value_cents: int | None = Field(default=None, ge=0)
     name: str | None = None
     company: str | None = None
@@ -687,7 +840,21 @@ def update_lead(lead_id: str, payload: LeadPatch, staff: StaffUser = Depends(get
                            demo_at=payload.demo_at)
     except leads.LeadError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    for key in ("owner_staff_id", "value_cents", "name", "company", "phone", "country", "services"):
+    if "owner_staff_id" in data and data["owner_staff_id"] != lead.owner_staff_id:
+        owner = None
+        if data["owner_staff_id"]:
+            owner = db.get(StaffUser, data["owner_staff_id"])
+            if owner is None or not owner.is_active:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "That staff member can't own leads.")
+        leads.record(db, lead, "owner", staff.email,
+                     note=f"Assigned to {owner.full_name or owner.email}" if owner else "Unassigned")
+    if "follow_up_on" in data and data["follow_up_on"] != lead.follow_up_on:
+        if lead.stage == "lost":
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "A lost lead has nothing to follow up on. Reopen it first.")
+        day = data["follow_up_on"]
+        leads.record(db, lead, "followup", staff.email,
+                     note=f"Follow-up set for {day.strftime('%a')} {day.day} {day.strftime('%b %Y')}" if day else "Follow-up cleared")
+    for key in ("owner_staff_id", "follow_up_on", "value_cents", "name", "company", "phone", "country", "services"):
         if key in data:
             setattr(lead, key, data[key])
     db.commit()
@@ -717,13 +884,15 @@ def convert_lead(lead_id: str, payload: ConvertIn, request: Request, staff: Staf
     lead = _lead(db, lead_id)
     if lead.account_id and db.get(Account, lead.account_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "This lead already has an account.")
+    if lead.stage != "qualified":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only a Qualified lead can be converted to an account.")
     choices = payload.services if payload.services is not None else [ChoiceIn(service=s) for s in lead.services or []]
     account = _create_account(db, CreateAccountIn(
         company=lead.company, owner_email=lead.email, owner_name=lead.name, country=lead.country,
         timezone=lead.timezone, services=choices, send_invite=payload.send_invite, lead_id=lead.id),
         staff, request)
     lead.account_id = account.id
-    leads.move(db, lead, "won", staff.email)
+    leads.move(db, lead, "won", staff.email, converting=True)
     leads.record(db, lead, "convert", staff.email, note=f"Account {account.name} created")
     _sync(db, account)
     return {"account": account_out(account, staff=True), "lead": lead_out(lead)}

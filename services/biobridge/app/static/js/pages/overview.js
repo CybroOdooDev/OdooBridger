@@ -124,8 +124,27 @@ function sourceDetail(sources) {
   return `<tr><td colspan="2" class="hint">${failed.length} of ${sources.length} biometric connections failed. Needs attention: ${names}.</td></tr>`;
 }
 
-export async function render(mount) {
-  mount.innerHTML = loading();
+/* A connection that is down is re-checked by the server right after sign-in (and
+ * every few minutes), so the page quietly re-reads itself a few times while any
+ * connection is in trouble: the status turns Connected when it recovers, with no
+ * button and no toast. Stops when everything is fine, the page is left, or the
+ * tab is hidden. */
+const SETTLE_AFTER = [7000, 20000, 60000];
+const UNHEALTHY = ['failed', 'degraded', 'unverified'];
+let settleTimer = null;
+
+function settle(mount, route, attempt, unhealthy) {
+  clearTimeout(settleTimer);
+  if (!unhealthy || attempt >= SETTLE_AFTER.length) return;
+  settleTimer = setTimeout(async () => {
+    // #content is reused by every page, so only repaint while this one is showing.
+    if (!mount.isConnected || document.hidden || !['', '#', '#/'].includes(window.location.hash)) return;
+    try { await render(mount, route, { silent: true, attempt: attempt + 1 }); } catch { /* the next visit retries */ }
+  }, SETTLE_AFTER[attempt] - (attempt ? SETTLE_AFTER[attempt - 1] : 0));
+}
+
+export async function render(mount, route, opts = {}) {
+  if (!opts.silent) mount.innerHTML = loading();
   const [data, runs, devices, sources] = await Promise.all([
     api.get('/dashboard'),
     api.get('/sync/runs?limit=5').catch(() => []),
@@ -225,6 +244,10 @@ export async function render(mount) {
     </div>
     </div>
   `;
+
+  settle(mount, route, opts.attempt || 0, [
+    health.odoo, worstOf(sources, health.source),
+  ].some((state) => UNHEALTHY.includes(state)));
 
   // The checklist's "Sync now" is the top bar's, pressed from here.
 

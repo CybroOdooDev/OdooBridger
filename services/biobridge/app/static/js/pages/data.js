@@ -3,7 +3,7 @@
 import { api, auth } from '../api.js';
 import {
   $, busy, empty, esc, field, fmtAgo, fmtHours, fmtLocal, fmtUtc, guard, loading, pill,
-  readForm, stat, todayISO, triggerLabel } from '../ui.js';
+  readForm, stat, toast, todayISO, triggerLabel } from '../ui.js';
 
 const TRASH_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
   + 'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -185,12 +185,46 @@ export function unmappedCard(attention) {
     </div>`;
 }
 
+/* Badges deleted from the list above. They are kept (so a sync does not bring
+ * them back); Restore puts one back in the unmatched list. */
+export function deletedBadgesCard(removed) {
+  if (!removed.length) return '';
+  return `
+    <details class="card" id="deletedBadges" style="margin-top:18px">
+      <summary><h2 style="display:inline">Deleted Badges <span class="hint">${removed.length}</span></h2></summary>
+      <p style="color:var(--muted);margin:10px 0 12px;font-size:13px">
+        These badges were deleted from the unmatched list, so their punches are skipped.
+        Restore one to match it again.
+      </p>
+      <div class="scroll" style="overflow:visible"><table>
+        <thead><tr><th>Badge</th><th>Name On The Device</th><th></th></tr></thead>
+        <tbody>${removed.map((m) => `<tr>
+          <td class="mono">${esc(m.emp_code)}</td>
+          <td>${esc(m.source_name || '—')}</td>
+          <td class="actions-cell">${auth.canWrite ? `<button class="sm" data-restore="${esc(m.id)}">Restore</button>` : ''}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </details>`;
+}
+
 const SUGGESTION_KIND = {
   badge_only: 'Same badge, different name',
   name_only: 'Same name, different badge',
 };
 
 export function wireUnmapped(mount, rerender) {
+  mount.querySelectorAll('[data-restore]').forEach((button) => {
+    button.addEventListener('click', () =>
+      busy(button, async () => {
+        const done = await guard(async () => {
+          const result = await api.post(`/mappings/${button.dataset.restore}/restore`, {});
+          await rerender();
+          return result;
+        });
+        if (done) toast(done.message, 'ok');
+      })
+    );
+  });
   mount.querySelectorAll('[data-picker]').forEach((box) => wirePicker(box, mount, rerender));
   mount.querySelectorAll('[data-confirm]').forEach((button) => {
     button.addEventListener('click', () =>

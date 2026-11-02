@@ -482,6 +482,13 @@ def split_monthly_cents(account: Account) -> tuple[int, int]:
     return paying, trial
 
 
+def billed_period_cents(account: Account) -> int:
+    """What the paying services are charged per billing period: the monthly
+    prices on a monthly account, the yearly prices on a yearly one."""
+    return sum((r.package.price_cents_for(account.billing_interval) or 0) for r in account.services
+               if r.package and r.status in (ServiceStatus.active.value, ServiceStatus.past_due.value))
+
+
 # =============================================================================
 # Webhooks
 # =============================================================================

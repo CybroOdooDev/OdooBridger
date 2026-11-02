@@ -6,7 +6,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -55,7 +55,7 @@ from app.services.onboarding import (
     issue_signin_code,
     send_account_ready,
 )
-from app.services import password_reset
+from app.services import health_probe, password_reset
 from app.services.timeutils import ensure_aware, is_past
 
 log = logging.getLogger(__name__)
@@ -291,7 +291,8 @@ def _record_login(user: User) -> None:
 
 
 @router.post("/login", response_model=TokenPair, dependencies=[Depends(standalone_only)])
-def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+def login(payload: LoginRequest, request: Request, background: BackgroundTasks,
+          db: Session = Depends(get_db)) -> TokenPair:
     """The customer door. Issues a tenant-scoped session — to customers only.
 
     Platform staff is a backend role, not a customer role: a staff account is
@@ -313,6 +314,7 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
     _record_login(user)
     tokens = _issue(db, user, request, SCOPE_TENANT)
     db.commit()
+    background.add_task(health_probe.recheck_tenant, user.tenant_id)
     return tokens
 
 
@@ -458,7 +460,8 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)) -> 
 
 
 @router.post("/signin-code", response_model=TokenPair, dependencies=[Depends(standalone_only)])
-def signin_with_code(payload: SignInCodeIn, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+def signin_with_code(payload: SignInCodeIn, request: Request, background: BackgroundTasks,
+                     db: Session = Depends(get_db)) -> TokenPair:
     """Exchange the one-time code from the confirmation page for a customer
     session. Single use, short-lived, and refused for staff or workspace-less
     accounts exactly as the password door is."""
@@ -469,6 +472,7 @@ def signin_with_code(payload: SignInCodeIn, request: Request, db: Session = Depe
     _record_login(user)
     tokens = _issue(db, user, request, SCOPE_TENANT)
     db.commit()
+    background.add_task(health_probe.recheck_tenant, user.tenant_id)
     return tokens
 
 
@@ -592,7 +596,8 @@ class PlatformSsoIn(BaseModel):
 
 
 @router.post("/platform/sso", response_model=TokenPair)
-def platform_sso(payload: PlatformSsoIn, request: Request, db: Session = Depends(get_db)) -> TokenPair:
+def platform_sso(payload: PlatformSsoIn, request: Request, background: BackgroundTasks,
+                 db: Session = Depends(get_db)) -> TokenPair:
     """Finish an OdooBridger sign-in: trade the one-time code for the user's
     identity, bring their account and user up to date, open a session."""
     from app.services import platform_link
@@ -608,4 +613,6 @@ def platform_sso(payload: PlatformSsoIn, request: Request, db: Session = Depends
     _record_login(user)
     tokens = _issue(db, user, request, SCOPE_TENANT)
     db.commit()
+    if user.tenant_id:
+        background.add_task(health_probe.recheck_tenant, user.tenant_id)
     return tokens

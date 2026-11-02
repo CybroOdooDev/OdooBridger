@@ -30,7 +30,7 @@ from obcore.mailer import OUTBOX
 from obcore.models import Service, ServicePackage, StaffUser
 from obcore.security import hash_password, hash_token
 from obcore.services import accounts as acc
-from obcore.services import ops, provisioning
+from obcore.services import notifications, ops, provisioning
 from obcore.services import stripe_api
 
 SERVICE_SECRET = "service-secret-for-tests"
@@ -92,6 +92,18 @@ class FakeService:
                 return _error(404)
             return self.metrics
 
+        #: What GET .../alerts answers for any account (None = the service has no such endpoint).
+        self.alerts: dict | None = {"count": 0, "severity": None}
+
+        @self.app.get("/platform/v1/accounts/{account_id}/alerts")
+        async def alerts(account_id: str, request: Request):
+            self._verify(request, account_id, b"")
+            if self.down:
+                return _error(503)
+            if self.alerts is None:
+                return _error(404)
+            return self.alerts
+
         @self.app.get("/platform/v1/accounts/{account_id}/usage")
         async def usage(account_id: str, request: Request):
             self._verify(request, account_id, b"")
@@ -129,11 +141,22 @@ class FakeStripe:
         self.sessions: dict[str, dict] = {}
         self.completed: dict[str, dict] = {}
         self.calls: list[tuple[str, str, dict]] = []
+        #: What Stripe holds for each Price id. Tests set these; the defaults match the catalog fixture.
+        self.prices: dict[str, dict] = {
+            "price_starter_m": {"id": "price_starter_m", "active": True, "currency": "usd", "unit_amount": 2900,
+                                "recurring": {"interval": "month"}},
+            "price_starter_y": {"id": "price_starter_y", "active": True, "currency": "usd", "unit_amount": 29000,
+                                "recurring": {"interval": "year"}},
+            "price_growth_m": {"id": "price_growth_m", "active": True, "currency": "usd", "unit_amount": 7900,
+                               "recurring": {"interval": "month"}},
+            "price_ship_m": {"id": "price_ship_m", "active": True, "currency": "usd", "unit_amount": 1900,
+                             "recurring": {"interval": "month"}},
+        }
 
     def _id(self, prefix: str) -> str:
         return f"{prefix}_{next(self.ids)}"
 
-    def request(self, method: str, path: str, data: dict | None = None, idempotency_key=None) -> dict:
+    def request(self, method: str, path: str, data: dict | None = None, idempotency_key=None, timeout=None) -> dict:
         data = data or {}
         self.calls.append((method, path, data))
         if method == "POST" and path == "customers":
@@ -185,6 +208,11 @@ class FakeStripe:
         if method == "GET" and path == "invoices":
             return {"data": [{"id": "in_1", "status": "paid", "amount_paid": 2900, "currency": "usd",
                               "created": int(time.time())}]}
+        if method == "GET" and path.startswith("prices/"):
+            price = self.prices.get(path.split("/")[1])
+            if price is None:
+                raise stripe_api.BillingError(f"Stripe: No such price: '{path.split('/')[1]}'")
+            return price
         if method == "GET" and path == "balance":
             return {"livemode": False}
         raise AssertionError(f"FakeStripe does not handle {method} {path}")
@@ -224,6 +252,7 @@ def service_app(monkeypatch):
     monkeypatch.setattr(provisioning, "client_factory", lambda: TestClient(fake.app, base_url="http://biometric.test"))
     monkeypatch.setattr(ops, "client_factory", lambda: TestClient(fake.app, base_url="http://biometric.test"))
     ops.forget()
+    notifications.forget()
     return fake
 
 

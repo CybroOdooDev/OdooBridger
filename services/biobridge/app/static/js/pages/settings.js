@@ -11,7 +11,7 @@ import { api, auth } from '../api.js';
 import { openDeleteAccountWizard, openPasswordWizard } from './account.js';
 import { platform } from '../platform.js';
 import { render as renderBilling } from './billing.js';
-import { needsMatch, unmappedCard, wireUnmapped } from './data.js';
+import { deletedBadgesCard, needsMatch, unmappedCard, wireUnmapped } from './data.js';
 import {
   $, $$, banner, busy, empty, esc, field as baseField, INFO_ICON, fmtAgo, fmtIn, guard, loading, pill, pricingCards, readForm,
   timezoneNames, toast, wirePricingCards,
@@ -720,9 +720,10 @@ let odooLastCompanies = null; // { connId, companies: [{id, name}] } | null
 
 async function renderOdoo(mount, route) {
   mount.innerHTML = loading();
-  const [odooList, mappings, sources] = await Promise.all([
+  const [odooList, mappings, removedBadges, sources] = await Promise.all([
     api.get('/odoo-connections'),
     api.get('/mappings?limit=500').catch(() => []),
+    api.get('/mappings?status=removed&limit=500').catch(() => []),
     api.get('/sources').catch(() => []),
   ]);
   // The connection actually in use: in platform mode, the one set in OdooBridger.
@@ -737,7 +738,10 @@ async function renderOdoo(mount, route) {
   // Platform mode with a connection made here before OdooBridger owned it:
   // it keeps syncing, read-only, until the same Odoo is connected there.
   const locked = managed || platform.on;
-  const portalOdoo = `${platform.info?.portal_url || '/'}#/odoo?from=biobridge`;
+  // OdooBridger shows "Continue With BioBridge Setup" when it was opened from
+  // the setup, and plain "Go To BioBridge" when opened from the settings later.
+  const inSetup = Boolean(mount.closest('#setupBody'));
+  const portalOdoo = `${platform.info?.portal_url || '/'}#/odoo?from=${inSetup || !odoo ? 'biobridge' : 'biobridge-open'}`;
   if (platform.on && !odoo) {
     mount.innerHTML = `<div class="card">${cardHead('Odoo', '')}
       ${banner('Connect Odoo In OdooBridger',
@@ -752,7 +756,6 @@ async function renderOdoo(mount, route) {
   // Test sits before Connect, left to right, and on a new connection Connect
   // only unlocks once the values in the form have been tested — see
   // wireTestFirst. Remove is kept apart from both, on the far left.
-  const inSetup = Boolean(mount.closest('#setupBody'));
   const removeControls = odoo && !readonly && !inSetup && !locked ? (
     odooConfirmDelete
       ? '<span class="hint">Remove this connection?</span>'
@@ -764,7 +767,7 @@ async function renderOdoo(mount, route) {
   // its status, Test Connection, and a way to its settings in OdooBridger.
   const openCore = `<a class="btn" href="${esc(portalOdoo)}">Open In OdooBridger</a>`;
   const actions = locked && odoo
-    ? `${pill(odoo.status)}
+    ? `<span id="odooPill">${pill(odoo.status)}</span>
       ${readonly ? '' : '<button type="button" id="testOdoo">Test Connection</button>'}
       ${openCore}
       ${readonly ? '' : `<button class="primary" id="saveOdoo" type="submit" form="odooForm">Save Changes</button>`}`
@@ -819,7 +822,8 @@ async function renderOdoo(mount, route) {
       </form>
       ${inSetup && actions ? `<div class="setup-foot actions">${actions}</div>` : ''}
     </div>
-    ${odoo && biometricUp && mappings.some(needsMatch) ? unmappedCard(mappings.filter(needsMatch)) : ''}`;
+    ${odoo && biometricUp && mappings.some(needsMatch) ? unmappedCard(mappings.filter(needsMatch)) : ''}
+    ${odoo && biometricUp ? deletedBadgesCard(removedBadges) : ''}`;
 
   if (odoo && biometricUp) wireUnmapped(mount, () => renderOdoo(mount));
   // "Show unmapped employees" on the Employees page lands here.
@@ -962,8 +966,7 @@ async function renderOdoo(mount, route) {
             const fresh = (await api.get('/odoo-connections')).find((c) => c.id === odoo.id);
             if (fresh) {
               Object.assign(odoo, fresh);
-              const box = $('#odooStatus', mount);
-              if (box) box.innerHTML = statusRow(odoo);
+              repaintOdooStatus(mount, odoo, locked);
             }
           }
         } catch { /* the pill catches up on the next load */ }
@@ -2326,6 +2329,20 @@ export async function syncSource(sourceId) {
     if (error.status !== 401) toast(error.message || 'Sync failed', 'bad');
     return null;
   }
+}
+
+/* Show the connection's current status after a check. When OdooBridger owns the
+ * connection, the pill sits in the card's header (and the card has no status
+ * row of its own, only the error banner); otherwise it is the status row. */
+function repaintOdooStatus(mount, odoo, locked) {
+  const box = $('#odooStatus', mount);
+  if (!locked) {
+    if (box) box.innerHTML = statusRow(odoo);
+    return;
+  }
+  const pillBox = $('#odooPill', mount);
+  if (pillBox) pillBox.innerHTML = pill(odoo.status);
+  if (box) box.innerHTML = odoo.status_message ? banner('Error', odoo.status_message, 'bad') : '';
 }
 
 function statusRow(connection) {

@@ -7,6 +7,7 @@ import { detectZone } from '/site/geo.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
 import { multiSelect } from '/site/multiselect.js';
 import { renderReports } from './reports.js';
+import { resetBell, watchBell } from './notifications.js';
 
 const { api, session, restore, signOut } = makeClient('customer');
 const state = { me: null, account: null, available: [], stripe: false, catalog: null };
@@ -633,7 +634,7 @@ function odooCard(conn) {
     ['Address', `<a href="${esc(conn.url)}" target="_blank" rel="noopener">${esc(conn.url)}</a>`],
     ['Database', esc(conn.db)],
     ['Login', esc(conn.login)],
-    ['Version', conn.version ? `${esc(conn.version)} · ${conn.api === 'json2' ? 'JSON-2 API' : 'XML-RPC'}` : '—'],
+    ['Version', conn.version ? esc(conn.version) : '—'],
     ['Companies', companies],
     ['Last checked', conn.last_checked_at ? esc(fmtDate(conn.last_checked_at)) : '—'],
     conn.key_expires_at ? ['Key expires', esc(fmtDate(conn.key_expires_at))] : null,
@@ -660,13 +661,18 @@ function odooCard(conn) {
 }
 
 
-/* Set only when BioBridge sent the person here; keeps the way back for the visit. */
-let cameFromBioBridge = false;
+/* Set only when BioBridge sent the person here; keeps the way back for the visit.
+ * "setup" = from BioBridge's guided setup, "open" = from its settings later. */
+let cameFromBioBridge = null;
 const backToBioBridge = () => (cameFromBioBridge
-  ? '<a href="#" class="banner-action" data-back-bio style="text-decoration:underline">Continue With BioBridge Setup &rarr;</a>' : '');
+  ? `<a href="#" class="banner-action" data-back-bio style="text-decoration:underline">${
+    cameFromBioBridge === 'setup' ? 'Continue With BioBridge Setup' : 'Go To BioBridge'} &rarr;</a>` : '');
 
 async function renderOdoo(mount, route) {
-  if (route) cameFromBioBridge = route.query?.from === 'biobridge';
+  if (route) {
+    const from = route.query?.from;
+    cameFromBioBridge = from === 'biobridge' ? 'setup' : from === 'biobridge-open' ? 'open' : null;
+  }
   mount.innerHTML = loading();
   const data = await api.get('/portal/odoo');
   const conn = data.connections[0] || null;
@@ -806,8 +812,9 @@ async function route() {
       nav: [{ items: NAV }],
       user: state.me.email,
       pill: accountChip(state.account.name),
-      onSignOut: async () => { await signOut(); unmountShell(); window.location.hash = '#/login'; },
+      onSignOut: async () => { await signOut(); resetBell(); unmountShell(); window.location.hash = '#/login'; },
     });
+    watchBell({ api, open: (slug, query) => guard(() => openService(slug, query)) });
     $('#pageTitle').textContent = page ? (page.group === 'account' ? 'Account' : page.title) : 'Not Found';
     const content = $('#content');
     const fresh = content.cloneNode(false);   // drop listeners from the last page
@@ -829,7 +836,7 @@ async function route() {
   }
 }
 
-window.addEventListener('ob:signed-out', () => { unmountShell(); window.location.hash = '#/login'; route(); });
+window.addEventListener('ob:signed-out', () => { resetBell(); unmountShell(); window.location.hash = '#/login'; route(); });
 window.addEventListener('hashchange', route);
 wireTips();
 wireSearchSelects();

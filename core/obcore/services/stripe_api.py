@@ -113,7 +113,7 @@ def _flatten(data: dict[str, Any], prefix: str = "") -> list[tuple[str, str]]:
 
 
 def request(method: str, path: str, data: dict[str, Any] | None = None,
-            idempotency_key: str | None = None) -> dict[str, Any]:
+            idempotency_key: str | None = None, timeout: float | None = None) -> dict[str, Any]:
     if not enabled():
         raise BillingError("Online payments are not set up yet.")
     headers = {"Authorization": f"Bearer {secret_key()}"}
@@ -127,7 +127,7 @@ def request(method: str, path: str, data: dict[str, Any] | None = None,
         response = httpx.request(
             method, f"{settings.stripe_api_base.rstrip('/')}/v1/{path.lstrip('/')}",
             content=body, params=_flatten(data) if data and method == "GET" else None,
-            headers=headers, timeout=settings.http_timeout_seconds)
+            headers=headers, timeout=timeout or settings.http_timeout_seconds)
     except httpx.RequestError as exc:
         raise BillingError(f"Could not reach Stripe: {exc}") from exc
     try:

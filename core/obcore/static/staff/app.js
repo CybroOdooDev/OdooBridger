@@ -2,9 +2,10 @@
 
 import '/assets/password-toggle.js';
 import { fmtDate, money } from '/assets/api.js';
-import { $, $$, banner, empty, esc, field, fmtAgo, busy, guard, kpi, kpiIcon, loading, readForm, toast, wireTips } from '/assets/ui.js';
+import { $, $$, banner, empty, esc, field, fmtAgo, busy, guard, kpi, kpiIcon, loading, readForm, toast, viewSwitchHtml, wireTips } from '/assets/ui.js';
 import { authCard, dialog, match, mountShell, parseHash, submitting, unmountShell } from '/assets/shell.js';
 import { client } from './client.js';
+import { compare, pct } from './compare.js';
 import { renderLeads } from './leads.js';
 
 const { api, session, restore, signOut } = client;
@@ -69,23 +70,9 @@ function since(iso) {
 /* ---- overview helpers ---------------------------------------------------- */
 const RANGES = [['30d', 'Last 30 Days'], ['6m', 'Last 6 Months'], ['12m', 'Last 12 Months'], ['all', 'All Time']];
 let overviewRange = '30d';
-const pct = (v) => (v == null ? '—' : `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`);
 const bucketLabel = (key, unit, long = false) => (unit === 'day'
   ? new Date(`${key}T00:00:00`).toLocaleDateString(undefined, long ? { weekday: 'short', day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short' })
   : new Date(`${key}-01T00:00:00`).toLocaleDateString(undefined, long ? { month: 'long', year: 'numeric' } : { month: 'short' }));
-
-/** "▲ 12% vs previous 30 days". ``upIsGood`` decides the colour; ``fmt`` formats the
- *  numbers shown when the earlier figure was 0 (a percentage of 0 means nothing). */
-function compare(m, upIsGood = true, fmt = (v) => String(v)) {
-  if (!m || !m.basis) return '';
-  if (m.change_pct == null) {
-    return m.previous === 0 && m.value
-      ? `<span class="cmp up ${upIsGood ? 'good' : 'bad'}">+${esc(fmt(m.value))}</span> <span class="cmp-b">vs ${esc(fmt(0))} ${esc(m.basis)}</span>` : '';
-  }
-  if (m.change_pct === 0) return `<span class="cmp flat">No change</span> <span class="cmp-b">vs ${esc(m.basis)}</span>`;
-  const up = m.change_pct > 0;
-  return `<span class="cmp ${up ? 'up' : 'down'} ${up === upIsGood ? 'good' : 'bad'}">${up ? '▲' : '▼'} ${pct(Math.abs(m.change_pct))}</span> <span class="cmp-b">vs ${esc(m.basis)}</span>`;
-}
 
 /** Bars, one per day or month, with a tooltip. ``cents`` draws the axis in dollars. */
 function bucketBars(points, { unit, value, label, cents = false, height = 220 }) {
@@ -275,7 +262,7 @@ async function renderOverview(mount) {
 
   mount.innerHTML = `<div class="ov">
     <div class="ov-bar">
-      <div class="seg" role="group" aria-label="Date range">${RANGES.map(([key, label]) =>
+      <div class="view-toggle" role="group" aria-label="Date range">${RANGES.map(([key, label]) =>
         `<button type="button" data-range="${key}" class="${key === r.key ? 'on' : ''}">${esc(label)}</button>`).join('')}</div>
       <a href="#attention" class="ov-attn ${urgent ? 'bad' : incidents.length ? 'warn' : 'ok'}">${kpiIcon('alert')}
         ${incidents.length ? `${incidents.length} need attention` : 'Nothing needs attention'}</a>
@@ -521,16 +508,17 @@ async function renderServiceDashboard(mount, route, { slug }) {
 /* =========================================================================
  * Accounts
  * ====================================================================== */
-const filters = { q: '', status: '', service: '', billing: '' };
+const filters = { q: '', tab: '', service: '' };
 
-const BILLING_FILTER = [['paying', 'Paying'], ['trial', 'Trial'], ['trial_ending', 'Trial Ending'], ['past_due', 'Payment Due'], ['none', 'No Service']];
 const SHOWN_SERVICES = 2;
 
-/** One service in the list: a state dot and its name. Billing says what happens next. */
+/** One service in the list: a state dot and its name. Billing says what happens next.
+ *  The dot is never the only carrier: the state is also in hidden text and the hover label. */
 function serviceLine(r) {
   const tone = r.status === 'trialing' ? 'trialing' : r.status === 'active' ? 'ok' : r.status === 'past_due' || r.status === 'suspended' ? 'bad' : 'mute';
   const word = r.status === 'active' && !r.billed ? 'Active' : r.status === 'active' ? 'Paying' : STATUS_LABEL[r.status] || r.status;
-  return `<div class="svc-line" title="${esc(`${r.service.name}: ${word}`)}"><i class="dot ${tone}" aria-label="${esc(word)}"></i><span>${esc(r.service.name)}</span></div>`;
+  const ends = r.status === 'trialing' && r.trial_ends_at ? `, ends ${fmtDate(r.trial_ends_at)}` : '';
+  return `<div class="svc-line" data-tip="${esc(`${r.service.name}: ${word}${ends}`)}"><i class="dot ${tone}" aria-hidden="true"></i><span class="sr-only">${esc(word)}: </span><span>${esc(r.service.name)}</span></div>`;
 }
 
 // What needs a look comes first, so the two shown are the two that matter.
@@ -539,85 +527,323 @@ function serviceRank(r) {
   return r.status === 'past_due' ? [0, 0] : r.status === 'trialing' ? [1, left] : [2, 0];
 }
 
+/** What a month costs: the price now, and what a trial turns into. A trial on its own is one
+ *  plain line ("$79/mo after trial"), not a dash over a number. */
 function perMonth(a) {
   const paying = a.paying_cents, trial = a.after_trial_cents;
   if (!paying && !trial) return '<span class="muted">—</span>';
-  return `${paying ? money(paying) : '<span class="muted">—</span>'}${trial ? `<small class="muted">${paying ? '+ ' : ''}${esc(money(trial))} after trial</small>` : ''}`;
+  if (!paying) return `<span class="muted">${esc(money(trial))}/mo after trial</span>`;
+  const yearly = a.billing_interval === 'year' && a.billed_period_cents ? `<small class="muted">${esc(money(a.billed_period_cents))} billed yearly</small>` : '';
+  return `${money(paying)}${yearly}${trial ? `<small class="muted">+ ${esc(money(trial))}/mo after trial</small>` : ''}`;
 }
 
-const dayMonth = (v) => new Date(v).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+// A date a year away needs its year, or "29 Oct" reads as the day the account signed up.
+const renewDate = (v) => new Date(v).toLocaleDateString(undefined, {
+  day: 'numeric', month: 'short', ...(new Date(v) - Date.now() > 300 * 86400000 ? { year: 'numeric' } : {}) });
 
-/** The Billing pill with its next event, and under it how a paying account pays. */
+const TRIAL_KEYS = ['trial', 'trial_ending', 'mixed'];
+
+/** The Billing pill with its next event, and under it how a paying account pays. The pill is
+ *  amber under a week and red under three days (the server sets the tone). */
 function billingCell(a) {
   const b = a.billing;
-  const label = b.key === 'paying' && b.renews_at ? `Paying · renews ${dayMonth(b.renews_at)}` : b.label;
-  const under = b.note || (b.key === 'paying' ? (a.pays_online ? 'Paid via Stripe' : 'Not billed online') : '');
-  return `${tag(b.tone, label)}${under ? `<small class="muted">${esc(under)}</small>` : ''}`;
+  const label = b.key === 'paying' && b.renews_at ? `Paying · renews ${renewDate(b.renews_at)}` : b.label;
+  const ends = a.services.filter((r) => r.status === 'trialing' && r.trial_ends_at).map((r) => new Date(r.trial_ends_at).getTime());
+  const tip = b.renews_at ? `Renews ${fmtDate(b.renews_at)}` : ends.length ? `Trial ends ${fmtDate(new Date(Math.min(...ends)).toISOString())}` : '';
+  // Suspending does not pause a trial: it keeps counting and ends unpaid, so say so.
+  const note = b.note || (b.key === 'paying' ? (a.pays_online ? 'Paid via Stripe' : 'Not billed online') : '');
+  const clock = a.status === 'suspended' && TRIAL_KEYS.includes(b.key);
+  return `<span ${tip ? `data-tip="${esc(tip)}"` : ''}>${tag(b.tone, label)}</span>${note ? `<small class="muted">${esc(note)}</small>` : ''}${
+    clock ? '<small class="warn-t" data-tip="Suspending an account does not pause its trial. If it ends while the account is suspended, the service becomes payment due.">Trial still running</small>' : ''}`;
 }
 
+/** The Status pill, with a hover label saying what it means for the account. */
+const STATUS_TIP = {
+  active: 'Active: the account and its services can run.',
+  suspended: 'Suspended: its services are stopped until it is reactivated. Trials keep counting down.',
+  closed: 'Closed: the account has been shut down.',
+};
+const statusCell = (a) => `<span class="pill ${STATUS_TONE[a.status] || 'mute'}" data-tip="${esc(STATUS_TIP[a.status] || '')}">${esc(STATUS_LABEL[a.status] || a.status)}</span>`;
+
+/** "5 d ago": the year is the same on every row, so the full date lives in the hover label. */
+function signedUp(value) {
+  const s = (Date.now() - new Date(value).getTime()) / 1000;
+  const d = Math.floor(s / 86400);
+  const when = s < 60 ? 'Just now' : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago`
+    : d < 60 ? `${d} d ago` : d < 730 ? `${Math.floor(d / 30)} mo ago` : `${Math.floor(d / 365)} y ago`;
+  return `<span class="nowrap" data-tip="Joined ${esc(fmtDate(value))}">${when}</span>`;
+}
+
+// Ties never shuffle: the order within one is by name, then id.
+const byName = (x, y) => x.name.localeCompare(y.name) || String(x.id).localeCompare(String(y.id));
 const SORTS = {
-  name: (x, y) => x.name.localeCompare(y.name),
+  name: byName,
   billing: (x, y) => x.billing.rank - y.billing.rank || (x.billing.trial_days ?? 999) - (y.billing.trial_days ?? 999),
-  permonth: (x, y) => x.paying_cents - y.paying_cents,
+  permonth: (x, y) => (x.paying_cents - y.paying_cents) || (x.after_trial_cents - y.after_trial_cents),
   since: (x, y) => new Date(x.created_at) - new Date(y.created_at),
 };
-// Default: what needs a look first (payment due, suspended, trials ending soonest), newest first within a tie.
+const SORT_CHOICES = [['billing', 'Needs Attention'], ['name', 'Name'], ['permonth', 'Per Month'], ['since', 'Joined']];
+const NEEDS_ATTENTION = 'Payment due, trials ending in under 3 days, suspended, trials ending within 7 days, then everything else. Ties go A to Z.';
+// One sort for both views: the Sort control sets it, the column headers show it (and a click on one sets it too).
 const sorting = { key: 'billing', dir: 1 };
-const sortHead = (key, label, cls = '') => `<th class="sort ${cls}" data-sort="${key}" tabindex="0" aria-sort="${sorting.key === key ? (sorting.dir > 0 ? 'ascending' : 'descending') : 'none'}">${label}<i>${sorting.key === key ? (sorting.dir > 0 ? '▲' : '▼') : ''}</i></th>`;
+const sortHead = (key, label, cls = '', tip = '') => `<th class="sort ${cls}" data-sort="${key}" tabindex="0" ${tip ? `data-tip="${esc(tip)}"` : ''} aria-sort="${sorting.key === key ? (sorting.dir > 0 ? 'ascending' : 'descending') : 'none'}">${label}<i>${sorting.key === key ? (sorting.dir > 0 ? '▲' : '▼') : ''}</i></th>`;
+
+// The State tabs: one row that is also the summary. Each counts the accounts the search and
+// Service filter leave, so "who is in trouble" is one click and the numbers always add up.
+const OVERLAP = ' Tabs can overlap (a suspended trial is in both Suspended and Trial), so the counts can add up to more than the total.';
+const TABS = [
+  ['', 'All', () => true, 'Every account.'],
+  ['past_due', 'Payment Due', (a) => a.billing.key === 'past_due', 'Accounts with an overdue payment.' + OVERLAP],
+  ['suspended', 'Suspended', (a) => a.status === 'suspended', 'Accounts staff have suspended, whatever their billing.' + OVERLAP],
+  ['trial', 'Trial', (a) => TRIAL_KEYS.includes(a.billing.key), 'Accounts with a service on free trial, including trials about to end.' + OVERLAP],
+  ['paying', 'Paying', (a) => ['paying', 'mixed'].includes(a.billing.key), 'Accounts paying for at least one service.' + OVERLAP],
+  ['none', 'No Service', (a) => a.billing.key === 'none', 'Accounts with no active service.' + OVERLAP],
+  ['closed', 'Closed', (a) => a.status === 'closed', 'Accounts that have been closed.' + OVERLAP],
+];
+// Always shown; the last two only when something is in them (or they are the open tab).
+const ALWAYS_TABS = new Set(['', 'past_due', 'suspended', 'trial', 'paying']);
+const EMPTY_TAB = {
+  past_due: ['No Payment Due', 'No account has an overdue payment right now.'],
+  suspended: ['No Suspended Accounts', 'Every account is active.'],
+  trial: ['No Accounts On Trial', 'Nobody is on a free trial right now.'],
+  paying: ['No Paying Accounts', 'No account is paying yet.'],
+  none: ['No Accounts Without A Service', 'Every account has at least one service.'],
+  closed: ['No Closed Accounts', ''],
+  '': ['No Accounts Match', 'Try a different search.'],
+};
+
+// View and sort are remembered per staff user in this browser (so two people sharing a computer keep their own).
+const prefs = {
+  loadedFor: null,
+  view: 'list',
+  key: () => `obcore.accounts.prefs.${state.me?.id || 'staff'}`,
+  load() {
+    if (this.loadedFor === this.key()) return;
+    this.loadedFor = this.key();
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.key()) || '{}');
+      this.view = saved.view === 'cards' ? 'cards' : 'list';
+      if (SORT_CHOICES.some(([k]) => k === saved.sort)) { sorting.key = saved.sort; sorting.dir = saved.dir === -1 ? -1 : 1; }
+    } catch { /* a convenience only */ }
+  },
+  save() {
+    try { localStorage.setItem(this.key(), JSON.stringify({ view: this.view, sort: sorting.key, dir: sorting.dir })); } catch { /* a convenience only */ }
+  },
+};
+
+const liveServices = (a) => a.services.filter((r) => r.status !== 'cancelled')
+  .sort((x, y) => { const [a1, a2] = serviceRank(x); const [b1, b2] = serviceRank(y); return a1 - b1 || a2 - b2; });
+
+function servicesCell(a) {
+  const live = liveServices(a);
+  return `${live.slice(0, SHOWN_SERVICES).map(serviceLine).join('') || '<span class="muted">—</span>'}${
+    live.length > SHOWN_SERVICES ? `<small class="muted" data-tip="${esc(live.slice(SHOWN_SERVICES).map((r) => r.service.name).join(', '))}">+${live.length - SHOWN_SERVICES} more</small>` : ''}`;
+}
+
+const SORT_ICON = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg>';
+const KEBAB = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>';
+const kebab = (a) => `<button type="button" class="kebab" data-menu="${esc(a.id)}" aria-haspopup="menu" aria-expanded="false" aria-label="Actions for ${esc(a.name)}">${KEBAB}</button>`;
+const off = (a) => (a.status === 'suspended' || a.status === 'closed' ? 'is-off' : '');
+
+function accountRow(a) {
+  return `<tr class="click ${off(a)}" data-id="${esc(a.id)}" tabindex="0" title="Open ${esc(a.name)}">
+    <td><strong>${esc(a.name)}</strong>${a.owner_email ? `<small class="muted">${esc(a.owner_email)}</small>` : ''}</td>
+    <td>${servicesCell(a)}</td>
+    <td class="keep">${statusCell(a)}</td>
+    <td class="keep">${billingCell(a)}</td>
+    <td class="num">${perMonth(a)}</td><td class="nowrap">${signedUp(a.created_at)}</td>
+    <td class="chev">${kebab(a)}</td></tr>`;
+}
+
+function accountCard(a) {
+  return `<article class="ac-card click ${off(a)}" data-id="${esc(a.id)}" tabindex="0" title="Open ${esc(a.name)}">
+    <header><div class="ac-id"><strong>${esc(a.name)}</strong>${a.owner_email ? `<small class="muted">${esc(a.owner_email)}</small>` : ''}</div>
+      <div class="ac-head-r">${a.status === 'active' ? '' : statusCell(a)}${kebab(a)}</div></header>
+    <div class="ac-services">${servicesCell(a)}</div>
+    <div class="ac-billing">${billingCell(a)}</div>
+    <footer><span class="ac-money">${perMonth(a)}</span><span class="muted ac-joined">Joined ${signedUp(a.created_at)}</span></footer>
+  </article>`;
+}
+
+/* ---- the row menu: the three things staff do most, without opening the account ---------- */
+let menuCleanup = null;
+function closeRowMenu() {
+  $('#rowMenu')?.remove();
+  $$('[aria-haspopup="menu"][aria-expanded="true"]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+  if (menuCleanup) { menuCleanup(); menuCleanup = null; }
+}
+
+// A trial that is running, or one that ended unpaid and can be reopened (billed services are Stripe's).
+const extendable = (r) => r.status === 'trialing' || (r.status === 'past_due' && !r.billed && r.trial_ends_at);
+
+async function extendTrialDialog(a) {
+  const rows = a.services.filter(extendable);
+  const ok = await dialog({
+    title: 'Extend Trial', submitLabel: 'Extend',
+    body: `<p>Adds days to ${rows.length > 1 ? `each of the ${rows.length} trials` : `the ${esc(rows[0].service.name)} trial`} on ${esc(a.name)}. A trial that has already ended starts again from today.</p>
+      ${field({ name: 'days', label: 'Days to add', type: 'number', value: '7', required: true })}`,
+    onSubmit: async (form) => {
+      const days = Number(readForm(form).days);
+      if (!(days >= 1 && days <= 365)) throw new Error('Enter between 1 and 365 days.');
+      let last = null;
+      for (const r of rows) {
+        const base = Math.max(Date.now(), r.trial_ends_at ? new Date(r.trial_ends_at).getTime() : 0);
+        last = await api.patch(`/staff/accounts/${a.id}/services/${r.service.slug}`, { trial_ends_at: new Date(base + days * 86400000).toISOString() });
+      }
+      return last;
+    },
+  });
+  if (ok) toast('Trial extended.', 'ok');
+  return Boolean(ok);
+}
+
+/** A small menu under a button: ``items`` are [key, label, class, note, checked]; ``run(key)`` is called on a pick.
+ *  Arrow keys move, Esc closes and returns to the button. Shared by the row menu and the sort menu. */
+function openMenu(button, items, run, { radio = false } = {}) {
+  closeRowMenu();
+  const menu = document.createElement('div');
+  menu.id = 'rowMenu';
+  menu.className = 'row-menu';
+  menu.setAttribute('role', 'menu');
+  menu.innerHTML = items.map(([key, label, cls, note, checked]) => `<button type="button" role="${radio ? 'menuitemradio' : 'menuitem'}" ${radio ? `aria-checked="${Boolean(checked)}"` : ''} data-act="${key}" class="${cls || ''}">
+    <span class="rm-main">${radio ? `<i class="rm-check" aria-hidden="true">${checked ? '✓' : ''}</i>` : ''}<span>${label}</span></span>${note ? `<small>${esc(note)}</small>` : ''}</button>`).join('');
+  document.body.append(menu);
+  const r = button.getBoundingClientRect();
+  menu.style.top = `${Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.max(8, Math.min(r.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`;
+  button.setAttribute('aria-expanded', 'true');
+  const buttons = $$('button', menu);
+  (buttons.find((b) => b.getAttribute('aria-checked') === 'true') || buttons[0]).focus();
+  const onClick = (e) => {
+    const item = e.target.closest('#rowMenu [data-act]');
+    if (item) { e.stopPropagation(); closeRowMenu(); run(item.dataset.act); } else if (!e.target.closest('[aria-haspopup="menu"]')) closeRowMenu();
+  };
+  const onKey = (e) => {
+    const at = buttons.indexOf(document.activeElement);
+    if (e.key === 'Escape') { closeRowMenu(); button.focus(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); buttons[(at + 1) % buttons.length].focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); buttons[(at - 1 + buttons.length) % buttons.length].focus(); }
+    else if (e.key === 'Tab') closeRowMenu();
+  };
+  document.addEventListener('click', onClick, true);
+  document.addEventListener('keydown', onKey);
+  window.addEventListener('scroll', closeRowMenu, true);
+  menuCleanup = () => {
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('keydown', onKey);
+    window.removeEventListener('scroll', closeRowMenu, true);
+  };
+}
+
+function openRowMenu(button, a, mount) {
+  const items = [['open', 'Open Details'],
+    canExtend(a) ? ['extend', 'Extend Trial'] : null,
+    a.status === 'suspended' ? ['reactivate', 'Reactivate'] : a.status === 'active' ? ['suspend', 'Suspend', 'danger'] : null].filter(Boolean);
+  const reload = () => renderAccounts(mount);
+  openMenu(button, items, async (act) => {
+    if (act === 'open') window.location.hash = `#/accounts/${a.id}`;
+    else if (act === 'extend') { if (await extendTrialDialog(a)) reload(); }
+    else if (act === 'reactivate') { if (await guard(() => api.post(`/staff/accounts/${a.id}/reactivate`), 'Reactivated.')) reload(); }
+    else if (act === 'suspend') {
+      const ok = await dialog({ title: 'Suspend Account', danger: true, submitLabel: 'Suspend',
+        body: `<p>Every service stops working for ${esc(a.name)} until reactivated. Data is kept. Any trial keeps counting down.</p>
+          ${field({ name: 'reason', label: 'Reason (staff only)' })}`,
+        onSubmit: (form) => api.post(`/staff/accounts/${a.id}/suspend`, readForm(form)) });
+      if (ok) reload();
+    }
+  });
+}
+
+/** The compact sort control: one icon button, a menu with the four orders and the current one ticked.
+ *  Picking the ticked column again reverses it; Needs Attention is a ranking, so it has no direction. */
+function openSortMenu(button, mount) {
+  const items = SORT_CHOICES.map(([key, label]) => [key, key === 'billing' ? label : `${label}${sorting.key === key ? (sorting.dir > 0 ? ' ▲' : ' ▼') : ''}`, '',
+    key === 'billing' ? NEEDS_ATTENTION : '', sorting.key === key]);
+  openMenu(button, items, (key) => {
+    sorting.dir = sorting.key === key && key !== 'billing' ? -sorting.dir : 1;
+    sorting.key = key;
+    prefs.save();
+    renderAccounts(mount);
+  }, { radio: true });
+}
+const canExtend = (a) => a.services.some(extendable);
 
 async function renderAccounts(mount) {
+  closeRowMenu();
+  prefs.load();
   const svcs = await services();
-  const qs = new URLSearchParams(Object.entries({ q: filters.q, status_filter: filters.status, service: filters.service, billing_filter: filters.billing })
-    .filter(([, v]) => v)).toString();
-  const rows = await api.get(`/staff/accounts${qs ? `?${qs}` : ''}`);
-  rows.sort((x, y) => sorting.dir * SORTS[sorting.key](x, y) || new Date(y.created_at) - new Date(x.created_at));
+  const qs = new URLSearchParams(Object.entries({ q: filters.q, service: filters.service }).filter(([, v]) => v)).toString();
+  const narrowed = Boolean(qs || filters.tab);
+  const [scoped, all] = await Promise.all([api.get(`/staff/accounts${qs ? `?${qs}` : ''}`), narrowed ? api.get('/staff/accounts/count') : null]);
+  const counts = Object.fromEntries(TABS.map(([key, , test]) => [key, scoped.filter(test).length]));
+  const tab = TABS.find(([key]) => key === filters.tab) || TABS[0];
+  const list = scoped.filter(tab[2]);
+  list.sort((x, y) => sorting.dir * SORTS[sorting.key](x, y) || byName(x, y));
+  const total = all ? all.total : list.length;
+  const view = prefs.view;
+  const [emptyTitle, emptyBody] = EMPTY_TAB[tab[0]] || EMPTY_TAB[''];
+  const emptyHtml = `<div class="empty"><strong>${esc(qs && tab[0] ? `${emptyTitle} For This Search` : emptyTitle)}</strong>${esc(emptyBody)}${
+    narrowed ? '<div><button class="link" data-showall>Show All Accounts</button></div>' : ''}</div>`;
+
   mount.innerHTML = `
     <div class="filterbar">
       <label class="fb-search"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="q" type="search" placeholder="Search company or email" value="${esc(filters.q)}" aria-label="Search accounts"></label>
-      <select id="status" aria-label="Status"><option value="">All statuses</option>${['active', 'suspended', 'closed'].map((s) =>
-        `<option value="${s}" ${filters.status === s ? 'selected' : ''}>${STATUS_LABEL[s]}</option>`).join('')}</select>
       <select id="service" aria-label="Service"><option value="">All services</option>${svcs.map((s) =>
         `<option value="${esc(s.slug)}" ${filters.service === s.slug ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>
-      <select id="billing" aria-label="Billing"><option value="">All billing</option>${BILLING_FILTER.map(([v, l]) =>
-        `<option value="${v}" ${filters.billing === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      ${narrowed ? '<button class="link" id="clear">Clear Filters</button>' : ''}
+      <span class="fb-count muted" id="count">${narrowed ? `${list.length} of ${total}` : total} account${total === 1 ? '' : 's'}</span>
       <span class="fb-spacer"></span>
+      <button type="button" class="sort-btn" id="sortBtn" aria-haspopup="menu" aria-expanded="false" aria-label="Sort accounts, now by ${esc(SORT_CHOICES.find(([k]) => k === sorting.key)[1])}" data-tip="Sort accounts · now by ${esc(SORT_CHOICES.find(([k]) => k === sorting.key)[1])}">${SORT_ICON}</button>
+      ${viewSwitchHtml([['list', 'Table'], ['cards', 'Cards']], view)}
       <button class="primary" id="new">New Account</button>
     </div>
-    <div class="card"><div class="table-wrap"><table class="accounts">
-      <thead><tr>${sortHead('name', 'Account')}<th>Services</th><th>Status</th>${sortHead('billing', 'Billing')}${sortHead('permonth', 'Per Month', 'num')}${sortHead('since', 'Since')}</tr></thead>
-      <tbody>${rows.map((a) => {
-        const live = a.services.filter((r) => r.status !== 'cancelled')
-          .sort((x, y) => { const [a1, a2] = serviceRank(x); const [b1, b2] = serviceRank(y); return a1 - b1 || a2 - b2; });
-        return `<tr class="click" data-id="${esc(a.id)}">
-        <td><strong>${esc(a.name)}</strong>${a.owner_email ? `<small class="muted">${esc(a.owner_email)}</small>` : ''}</td>
-        <td>${live.slice(0, SHOWN_SERVICES).map(serviceLine).join('') || '<span class="muted">—</span>'}${
-          live.length > SHOWN_SERVICES ? `<small class="muted" title="${esc(live.slice(SHOWN_SERVICES).map((r) => r.service.name).join(', '))}">+${live.length - SHOWN_SERVICES} more</small>` : ''}</td>
-        <td>${a.status === 'active' ? '<i class="dot ok" title="Active" aria-label="Active"></i>' : statusPill(a.status)}</td>
-        <td>${billingCell(a)}</td>
-        <td class="num">${perMonth(a)}</td><td class="nowrap">${esc(fmtDate(a.created_at))}</td></tr>`;
-      }).join('')
-        || `<tr><td colspan="6">${empty('No Accounts Match', '')}</td></tr>`}</tbody>
-    </table></div></div>`;
+    <div class="qtabs" role="group" aria-label="Filter by account state">${TABS
+      .filter(([key]) => ALWAYS_TABS.has(key) || counts[key] > 0 || filters.tab === key)
+      .map(([key, label,, tip]) => `<button type="button" class="qtab ${filters.tab === key ? 'on' : ''}" data-tab="${key}" aria-pressed="${filters.tab === key}" data-tip="${esc(tip)}">${label}<b aria-label="${counts[key]} accounts">${counts[key]}</b></button>`).join('')}</div>
+    ${view === 'cards'
+      ? (list.length ? `<div class="ac-grid">${list.map(accountCard).join('')}</div>` : `<div class="card">${emptyHtml}</div>`)
+      : `<div class="card"><div class="table-wrap"><table class="accounts">
+      <thead><tr>${sortHead('name', 'Account')}<th>Services</th><th>Status</th><th>Billing</th>${sortHead('permonth', 'Per Month', 'num')}${sortHead('since', 'Joined')}<th class="chev"><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody>${list.map(accountRow).join('') || `<tr><td colspan="7">${emptyHtml}</td></tr>`}</tbody>
+    </table></div></div>`}`;
+
   let timer;
   $('#q', mount).addEventListener('input', (e) => {
     clearTimeout(timer);
     timer = setTimeout(() => { filters.q = e.target.value; renderAccounts(mount).then(() => { const q = $('#q', mount); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }); }, 300);
   });
-  $('#status', mount).addEventListener('change', (e) => { filters.status = e.target.value; renderAccounts(mount); });
   $('#service', mount).addEventListener('change', (e) => { filters.service = e.target.value; renderAccounts(mount); });
+  $$('[data-tab]', mount).forEach((b) => b.addEventListener('click', () => { filters.tab = b.dataset.tab; renderAccounts(mount); }));
+  $$('[data-view]', mount).forEach((b) => b.addEventListener('click', () => { prefs.view = b.dataset.view; prefs.save(); renderAccounts(mount); }));
+  $('#sortBtn', mount).addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (e.currentTarget.getAttribute('aria-expanded') === 'true') closeRowMenu(); else openSortMenu(e.currentTarget, mount);
+  });
   $$('th[data-sort]', mount).forEach((th) => {
     const go = () => {
       const key = th.dataset.sort;
       sorting.dir = sorting.key === key ? -sorting.dir : 1;
       sorting.key = key;
+      prefs.save();
       renderAccounts(mount);
     };
     th.addEventListener('click', go);
     th.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
   });
-  $('#billing', mount).addEventListener('change', (e) => { filters.billing = e.target.value; renderAccounts(mount); });
-  $$('tr[data-id]', mount).forEach((tr) => tr.addEventListener('click', () => { window.location.hash = `#/accounts/${tr.dataset.id}`; }));
+  const byId = new Map(scoped.map((a) => [a.id, a]));
+  $$('[data-id]', mount).forEach((el) => {
+    const open = () => { window.location.hash = `#/accounts/${el.dataset.id}`; };
+    el.addEventListener('click', (e) => { if (!e.target.closest('.kebab')) open(); });
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === el) open(); });
+  });
+  $$('.kebab', mount).forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (b.getAttribute('aria-expanded') === 'true') closeRowMenu(); else openRowMenu(b, byId.get(b.dataset.menu), mount);
+  }));
+  const reset = () => { Object.assign(filters, { q: '', tab: '', service: '' }); renderAccounts(mount); };
+  $('#clear', mount)?.addEventListener('click', reset);
+  $('[data-showall]', mount)?.addEventListener('click', reset);
   $('#new', mount).addEventListener('click', () => newAccountDialog());
 }
 
@@ -831,16 +1057,19 @@ async function manageDialog(account, slug, svcs) {
 /* =========================================================================
  * Payments
  * ====================================================================== */
+/** The Payments page opens from our own data at once. If Stripe is on, the console then checks that Stripe
+ *  answers (a quick balance call) and, only if it does, loads the invoices. Each part says what it is doing, so
+ *  a slow or unreachable Stripe never leaves a blank page. The Test button runs the same check again. */
 async function renderPayments(mount) {
   const p = await api.get('/staff/payments');
   const s = p.stripe;
   mount.innerHTML = `
-    ${p.error ? banner('Stripe Error', p.error, 'warn') : ''}
     <div class="grid cols-2">
       <div class="card">
         <div class="card-head"><h2>Stripe</h2><div class="actions">
           <button class="sm" id="keys">${s.enabled ? 'Change Keys' : 'Add Keys'}</button>
           ${s.enabled ? '<button class="sm" id="test">Test</button>' : ''}</div></div>
+        <div id="stripeCheck" role="status" aria-live="polite"></div>
         <dl class="kv">
           <dt>Status</dt><dd>${s.enabled ? `<span class="pill ok">On</span> ${s.mode === 'live' ? '<span class="pill warn">Live</span>' : '<span class="pill">Test mode</span>'}` : '<span class="pill mute">Off</span>'}</dd>
           <dt>Secret key</dt><dd>${esc(s.secret_key_hint || '—')} ${s.source ? `<span class="hint">(${esc(s.source)})</span>` : ''}</dd>
@@ -871,15 +1100,60 @@ async function renderPayments(mount) {
           <td class="num">${money(x.monthly_total_cents)}</td></tr>`).join('') || `<tr><td colspan="6">${empty('No Subscriptions Yet', '')}</td></tr>`}</tbody>
       </table></div></div>
     <div class="card" style="margin-top:14px"><div class="card-head"><h2>Recent Invoices</h2></div>
-      ${p.invoices.length ? `<div class="table-wrap"><table>
+      <div id="invoices"></div></div>`;
+  $$('[data-account]', mount).forEach((tr) => tr.addEventListener('click', () => { window.location.hash = `#/accounts/${tr.dataset.account}`; }));
+
+  const check = $('#stripeCheck', mount);
+  const invoices = $('#invoices', mount);
+  const testBtn = $('#test', mount);
+  const gone = () => !check.isConnected;   // the page was left or redrawn while Stripe was answering
+  const spinner = (text) => `<div class="test-result pending"><strong><span class="mini-spin" aria-hidden="true"></span>${esc(text)}</strong></div>`;
+  const invoiceTable = (list) => (list.length ? `<div class="table-wrap"><table>
         <thead><tr><th>Date</th><th>Customer</th><th>Number</th><th>Status</th><th class="num">Amount</th><th></th></tr></thead>
-        <tbody>${p.invoices.map((i) => `<tr><td>${esc(fmtDate(i.created))}</td><td>${esc(i.customer_name || i.customer_email || i.customer || '—')}</td>
+        <tbody>${list.map((i) => `<tr><td>${esc(fmtDate(i.created))}</td><td>${esc(i.customer_name || i.customer_email || i.customer || '—')}</td>
           <td class="mono">${esc(i.number || i.id)}</td><td>${esc(i.status)}${i.attempt_count > 1 ? ` <span class="pill bad">${i.attempt_count} attempts</span>` : ''}</td>
           <td class="num">${money(i.status === 'paid' ? i.amount_paid : i.amount_due, i.currency)}</td>
           <td class="right">${i.hosted_invoice_url ? `<a class="btn sm" target="_blank" rel="noopener" href="${esc(i.hosted_invoice_url)}">View</a>` : ''}</td></tr>`).join('')}</tbody>
-      </table></div>` : empty('No Invoices', s.enabled ? '' : 'Stripe is not connected.')}
-    </div>`;
-  $$('[data-account]', mount).forEach((tr) => tr.addEventListener('click', () => { window.location.hash = `#/accounts/${tr.dataset.account}`; }));
+      </table></div>` : empty('No Invoices', ''));
+
+  if (!s.enabled) {
+    check.innerHTML = '';
+    invoices.innerHTML = empty('No Invoices', 'Stripe is not connected.');
+  }
+  let running = false;
+  const runCheck = async () => {
+    if (!s.enabled || running) return;
+    running = true;
+    if (testBtn) testBtn.disabled = true;
+    check.innerHTML = spinner('Checking that Stripe answers…');
+    invoices.innerHTML = `<p class="skeleton">Waiting for Stripe…</p>`;
+    let answered = false;
+    try {
+      const r = await api.post('/staff/payments/stripe/test');
+      if (gone()) return;
+      answered = true;
+      check.innerHTML = `<div class="test-result" role="status"><strong>Stripe answered</strong><span>${r.livemode ? 'Live' : 'Test'} mode key accepted. Checked at ${esc(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}.</span></div>`;
+    } catch (error) {
+      if (gone() || error.status === 401) return;
+      check.innerHTML = `<div class="test-result bad" role="status"><strong>Stripe did not answer</strong><span>${esc(error.message || 'Something went wrong.')}</span></div>`;
+      invoices.innerHTML = `<div class="state-line">Invoices need Stripe to answer. <button type="button" class="link" id="retryInv">Try again</button></div>`;
+      $('#retryInv', mount)?.addEventListener('click', runCheck);
+    } finally {
+      running = false;
+      if (testBtn && !gone()) testBtn.disabled = false;
+    }
+    if (!answered) return;
+    invoices.innerHTML = '<p class="skeleton">Loading invoices…</p>';
+    try {
+      const r = await api.get('/staff/payments/invoices');
+      if (!gone()) invoices.innerHTML = invoiceTable(r.invoices);
+    } catch (error) {
+      if (gone() || error.status === 401) return;
+      invoices.innerHTML = `<div class="state-line">Couldn’t load the invoices: ${esc(error.message || 'Stripe returned an error.')} <button type="button" class="link" id="retryInv">Try again</button></div>`;
+      $('#retryInv', mount)?.addEventListener('click', runCheck);
+    }
+  };
+
   $('#keys', mount).addEventListener('click', async () => {
     const ok = await dialog({ title: 'Stripe Keys', submitLabel: 'Save Keys',
       body: `${field({ name: 'secret_key', label: 'Secret key', type: 'password', placeholder: 'sk_live_… or sk_test_…' })}
@@ -894,18 +1168,19 @@ async function renderPayments(mount) {
       } });
     if (ok) renderPayments(mount);
   });
-  $('#test', mount)?.addEventListener('click', () => guard(async () => toast((await api.post('/staff/payments/stripe/test')).message, 'ok')));
+  testBtn?.addEventListener('click', runCheck);
+  runCheck();   // not awaited: the page is already on screen
 }
 
 /* =========================================================================
  * Catalog: services and packages
  * ====================================================================== */
-/* What each service's entitlements mean, as labelled limit boxes. A service not
- * listed here gets a JSON box instead. Empty = unlimited. */
+/* What each service's entitlements mean, as labelled limit boxes and table columns. A service not
+ * listed here gets a JSON box and a single text column instead. Empty = unlimited. */
 const LIMIT_FIELDS = {
   biometric: [
-    { key: 'max_employees', label: 'Employees', help: 'Badges matched to an Odoo employee. Lowering it never unmaps anyone; only new matches wait.' },
     { key: 'max_devices', label: 'Devices', help: 'Terminals the account has added. Punches from terminals beyond the limit are held until it covers them.' },
+    { key: 'max_employees', label: 'Employees', help: 'Badges matched to an Odoo employee. Lowering it never unmaps anyone; only new matches wait.' },
     { key: 'min_sync_interval_minutes', label: 'Fastest sync (min)', help: 'The fastest interval a customer on this package can choose.' },
   ],
 };
@@ -924,8 +1199,73 @@ function limitsText(ent) {
   return parts.join(' · ');
 }
 
+/** One limit as a table cell: a number, or what "no limit" means for that limit. */
+function limitCell(key, value) {
+  if (value == null) return `<td class="num muted">${key === 'min_sync_interval_minutes' ? 'Any' : 'Unlimited'}</td>`;
+  return `<td class="num">${esc(value)}${key === 'min_sync_interval_minutes' ? ' min' : ''}</td>`;
+}
+
 const dollars = (cents) => (cents == null ? '' : cents / 100);
 const cents = (v) => (v == null || v === '' ? null : Math.round(Number(v) * 100));
+
+/* ---- Stripe sync chips ------------------------------------------------------ */
+const SYNC_ICON = {
+  ok: '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M3.2 8.4l3 3 6.4-6.8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  alert: '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 2.2l6.4 11.2H1.6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6.6v3.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="11.7" r=".9" fill="currentColor"/></svg>',
+  dash: '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 8h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  spin: '<span class="mini-spin" aria-hidden="true"></span>',
+};
+
+/** A package's price for one billing period against Stripe. ``check`` is undefined while Stripe is being asked,
+ *  ``{enabled:false}`` when Stripe isn't connected, ``{failed:true}`` when the check itself broke. */
+function syncChip(p, interval, check) {
+  const month = interval === 'month';
+  const id = month ? p.stripe_price_id : p.stripe_yearly_price_id;
+  const price = month ? p.monthly_price_cents : p.yearly_price_cents;
+  const label = month ? 'Monthly' : 'Yearly';
+  let tone; let icon; let text; let tip;
+  if (!id) {
+    if (price == null) {
+      [tone, icon, text] = ['mute', 'dash', month ? 'Custom price' : 'Not offered'];
+      tip = month ? 'No price is set, so the pricing page shows “Custom”.' : 'No yearly option on the pricing page.';
+    } else {
+      [tone, icon, text] = ['warn', 'alert', 'no Stripe price'];
+      tip = `The catalog shows ${money(price, p.currency)} but there is no Stripe price, so ${month ? 'monthly' : 'yearly'} payment can't be bought online.`;
+    }
+  } else if (check === undefined) {
+    [tone, icon, text, tip] = ['mute', 'spin', 'checking', 'Asking Stripe…'];
+  } else if (!check || check.failed) {
+    [tone, icon, text, tip] = ['mute', 'dash', 'not checked', 'The check could not run. Use Recheck.'];
+  } else if (check.enabled === false) {
+    [tone, icon, text, tip] = ['mute', 'dash', 'not checked', 'Stripe isn’t connected, so the price can’t be checked.'];
+  } else {
+    const r = check.packages?.[p.id]?.[interval];
+    const known = { ok: ['ok', 'ok', ''], mismatch: ['bad', 'alert', 'out of sync'], notfound: ['bad', 'alert', 'not in Stripe'],
+      error: ['mute', 'dash', 'not checked'], missing: ['warn', 'alert', 'no Stripe price'] }[r?.state] || ['mute', 'dash', 'not checked'];
+    [tone, icon, text] = known;
+    tip = r?.detail || 'Stripe didn’t answer.';
+  }
+  const full = text && icon !== 'spin' ? `${label} · ${text}` : label;
+  return `<span class="pill ${tone} sync-chip" tabindex="0" data-tip="${esc(`${label}: ${tip}`)}" data-sync="${esc(p.id)}:${interval}" aria-label="${esc(`${label}: ${text || 'in sync'}. ${tip}`)}">${SYNC_ICON[icon]}${esc(full)}</span>`;
+}
+
+const syncCell = (p, check) => `<div class="sync-cell">${syncChip(p, 'month', check)}${syncChip(p, 'year', check)}</div>`;
+
+/* ---- where a price change lands, and what retiring does --------------------- */
+function priceImpact(service, pkg) {
+  const n = pkg?.accounts || 0;
+  const on = n ? `${n} account${n === 1 ? ' is' : 's are'} on ${esc(pkg.name)} now.` : '';
+  return `
+    <div class="impact" id="priceImpact">
+      <strong>Who a price change affects</strong>
+      <ul>
+        <li><b>Everyone, on screen.</b> The pricing page, the customer portal and the totals staff see all use the prices above, for new and existing customers alike. ${on}</li>
+        <li><b>New purchases and package changes</b> are charged the Stripe prices below.</li>
+        <li><b>Customers already paying</b> stay on the Stripe price they signed up with. Changing a price here doesn’t change what Stripe charges them. To change what they pay, create a new price in Stripe and paste its id below.</li>
+      </ul>
+      <div class="impact-live" id="priceLive" role="status" hidden></div>
+    </div>`;
+}
 
 function openPackageDialog(service, pkg, onSaved) {
   document.querySelector('dialog.plan-dialog')?.remove();
@@ -936,10 +1276,11 @@ function openPackageDialog(service, pkg, onSaved) {
   const limits = LIMIT_FIELDS[service.slug];
   const close = () => { dlg.close(); dlg.remove(); };
   const accounts = pkg?.accounts || 0;
+  const defaultTrial = service.trial_default_days ?? 14;
 
   dlg.innerHTML = `
     <div class="wiz-head">
-      <strong>${pkg ? `Edit ${esc(pkg.name)}` : `New ${esc(service.name)} Package`}</strong>
+      <strong>${pkg ? `Edit ${esc(pkg.name)}` : `New ${esc(service.name)} package`}</strong>
       <button type="button" class="link wiz-x" data-close aria-label="Close">&times;</button>
     </div>
     <div class="wiz-body">
@@ -947,10 +1288,11 @@ function openPackageDialog(service, pkg, onSaved) {
         <div class="grid cols-2">
           ${field({ name: 'name', label: 'Name', value: p.name || '', required: true, placeholder: 'Growth' })}
           ${field({ name: 'price', label: 'Price per month (USD)', type: 'number', value: dollars(p.monthly_price_cents),
-            tip: true, help: 'What the pricing page shows. Empty shows "Custom". What a customer is charged is the Stripe price below, so keep the two in step.' })}
+            tip: true, help: 'What the pricing page shows. Empty shows “Custom”. What a new customer is charged is the Stripe price below, so keep the two in step.' })}
         </div>
         ${field({ name: 'yearly_price', label: 'Price per year (USD)', type: 'number', value: dollars(p.yearly_price_cents),
           tip: true, help: 'Shown when a visitor switches to yearly. Empty means no yearly option.' })}
+        ${pkg ? priceImpact(service, pkg) : ''}
         ${field({ name: 'description', label: 'Description', value: p.description || '', placeholder: 'Growing teams on several devices.' })}
         ${field({ name: 'features', label: 'Features on the pricing page', type: 'textarea', value: (p.features || []).join('\n'),
           tip: true, help: 'One per line. Empty lists the limits below.' })}
@@ -968,10 +1310,10 @@ function openPackageDialog(service, pkg, onSaved) {
             tip: true, help: 'A recurring yearly Price. Empty means yearly payment cannot be bought online.' })}
         </div>
         <div class="grid cols-3">
-          ${field({ name: 'trial_days', label: 'Trial (days)', type: 'number', value: p.trial_days ?? '',
-            tip: true, help: 'Empty uses the platform default.' })}
+          ${field({ name: 'trial_days', label: 'Free trial (days)', type: 'number', value: p.trial_days ?? '', placeholder: String(defaultTrial),
+            tip: true, help: `Empty uses the platform default, ${defaultTrial} days. 0 means no trial. This sets the “ends in N d” shown for new accounts on this package.` })}
           ${field({ name: 'is_active', label: 'Status', value: String(p.is_active !== false), boolean: true, required: true,
-            options: [{ value: 'true', label: 'On Sale' }, { value: 'false', label: 'Retired: kept for accounts on it' }] })}
+            options: [{ value: 'true', label: 'On sale' }, { value: 'false', label: 'Retired: hidden from signup' }] })}
           ${field({ name: 'is_default', label: 'Recommended', value: String(!!p.is_default), boolean: true, required: true,
             options: [{ value: 'false', label: 'No' }, { value: 'true', label: 'Yes' }],
             tip: true, help: 'Marked on the pricing page and chosen when a signup picks nothing.' })}
@@ -981,12 +1323,35 @@ function openPackageDialog(service, pkg, onSaved) {
     </div>
     <div class="wiz-foot">
       <button type="button" class="link" data-close>Cancel</button>
-      <div class="actions"><button type="submit" form="pkgForm" class="primary save">${pkg ? 'Save Package' : 'Create Package'}</button></div>
+      <div class="actions"><button type="submit" form="pkgForm" class="primary save">${pkg ? 'Save package' : 'Create package'}</button></div>
     </div>`;
 
   $$('[data-close]', dlg).forEach((b) => b.addEventListener('click', close));
   dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });
   dlg.addEventListener('click', (e) => { if (e.target === dlg) close(); });
+
+  // Say, as the price is typed, exactly what saving it will and won't do.
+  if (pkg) {
+    const live = $('#priceLive', dlg);
+    const form = $('#pkgForm', dlg);
+    const update = () => {
+      const v = readForm(form);
+      const notes = [];
+      [['price', 'monthly_price_cents', 'stripe_price_id', 'month'], ['yearly_price', 'yearly_price_cents', 'stripe_yearly_price_id', 'year']].forEach(([f, col, idField, per]) => {
+        const next = cents(v[f]);
+        if (next === (pkg[col] ?? null)) return;
+        const was = pkg[col] == null ? 'no price' : `${money(pkg[col], pkg.currency)}/${per === 'month' ? 'mo' : 'yr'}`;
+        const now = next == null ? 'no price' : `${money(next, pkg.currency)}/${per === 'month' ? 'mo' : 'yr'}`;
+        const idSame = (v[idField] || '').trim() === (pkg[idField] || '');
+        notes.push(`<b>${per === 'month' ? 'Monthly' : 'Yearly'}: ${esc(was)} → ${esc(now)}.</b> ${accounts ? `The ${accounts} account${accounts === 1 ? '' : 's'} on ${esc(pkg.name)} will see this in the portal. ` : ''}${
+          idSame ? `The Stripe ${per === 'month' ? 'monthly' : 'yearly'} price is unchanged, so Stripe still charges the old amount to everyone, new purchases included, until you paste a new price id.`
+            : 'New purchases will be charged the new Stripe price; customers already paying keep theirs.'}`);
+      });
+      live.hidden = !notes.length;
+      live.innerHTML = notes.map((n) => `<p>${n}</p>`).join('');
+    };
+    form.addEventListener('input', update);
+  }
 
   $('#pkgForm', dlg).addEventListener('submit', (event) => {
     event.preventDefault();
@@ -1021,6 +1386,7 @@ function openPackageDialog(service, pkg, onSaved) {
 
 function serviceForm(s = {}) {
   return `
+    ${(s.url_warnings || []).map((w) => `<p class="err url-warn" role="alert">${esc(w.message)}</p>`).join('')}
     <div class="grid cols-2">
       ${s.id ? '' : field({ name: 'slug', label: 'Slug (token audience, never changes)', required: true, placeholder: 'marketplace' })}
       ${field({ name: 'name', label: 'Name', value: s.name || '', required: true })}
@@ -1035,42 +1401,178 @@ function serviceForm(s = {}) {
     <label><input type="checkbox" name="uses_odoo" ${s.uses_odoo ? 'checked' : ''}> Works on the customer's Odoo (is sent the account's Odoo connection)</label>`;
 }
 
-async function showSecret(secret, message) {
-  await dialog({ title: 'Client Secret', submitLabel: 'Done',
-    body: `<p>${esc(message || 'Set this as the service’s PLATFORM_CLIENT_SECRET. It is shown only once.')}</p><div class="secret-box">${esc(secret)}</div>` });
+async function showSecret(secret, message, name = 'the service') {
+  await dialog({ title: 'New client secret', submitLabel: 'Done',
+    body: `<p>${esc(message || `Set this as ${name}’s PLATFORM_CLIENT_SECRET and restart it. It is shown only once.`)}</p><div class="secret-box">${esc(secret)}</div>` });
+}
+
+/** Rotating the secret locks the service out until the new one is deployed, so the dialog says that first,
+ *  says what it costs, and won't go ahead on Enter alone: the box must be ticked. */
+async function confirmRotate(svc) {
+  const n = svc.accounts || 0;
+  const ok = await dialog({ title: `Rotate ${svc.name}’s client secret?`, danger: true, submitLabel: 'Rotate secret',
+    body: `
+      <p><strong>${esc(svc.name)} will stop authenticating until the new secret is deployed.</strong></p>
+      <ul class="impact-list">
+        <li>The current secret stops working the moment you rotate it.</li>
+        <li>The new secret is shown once. Set it as <code>PLATFORM_CLIENT_SECRET</code> on ${esc(svc.name)} and restart it.</li>
+        <li>Until then ${esc(svc.name)} can’t sign in to the platform${n ? `, so the ${n} account${n === 1 ? '' : 's'} using it can’t open it` : ''}.</li>
+      </ul>
+      <label class="ack"><input type="checkbox" name="ack"> I understand, and I’m ready to deploy the new secret.</label>`,
+    onSubmit: (form) => {
+      if (!form.elements.ack.checked) throw new Error('Tick the box to confirm.');
+      return api.post(`/staff/services/${svc.id}/secret`);
+    } });
+  if (ok && ok.client_secret) await showSecret(ok.client_secret, ok.message, svc.name);
+  return Boolean(ok);
+}
+
+/** Taking a package off sale hides it from new customers and leaves everyone on it alone. */
+async function confirmRetire(svc, pkg) {
+  const n = pkg.accounts || 0;
+  const others = svc.packages.filter((x) => x.is_active && x.id !== pkg.id);
+  const notes = [];
+  if (!others.length) notes.push(`<p class="err">It is the only package on sale for ${esc(svc.name)}. Visitors will have nothing to choose until you add or restore one.</p>`);
+  else if (pkg.is_default) notes.push(`<p class="hint">It is the recommended package, so signups will no longer start on it. Mark another one as recommended.</p>`);
+  const ok = await dialog({ title: `Retire ${pkg.name}?`, danger: true, submitLabel: 'Retire package',
+    body: `
+      <p><strong>${esc(pkg.name)}</strong> will be hidden from the pricing page, signup and package changes. Nobody new can choose it.</p>
+      <ul class="impact-list">
+        <li>${n ? `The ${n} account${n === 1 ? '' : 's'} on it ${n === 1 ? 'stays on it, keeps' : 'stay on it, keep'} the same limits and ${n === 1 ? 'keeps' : 'keep'} being billed.` : 'No accounts are on it.'}</li>
+        <li>You can put it back on sale at any time.</li>
+      </ul>${notes.join('')}`,
+    onSubmit: () => api.patch(`/staff/packages/${pkg.id}`, { is_active: false }) });
+  return Boolean(ok);
+}
+
+const CATALOG_STATUS = {
+  operational: ['ok', 'Operational'], degraded: ['warn', 'Degraded'], maintenance: ['warn', 'In maintenance'],
+  unavailable: ['bad', 'Not responding'], disabled: ['', 'Stopped'], not_deployed: ['warn', 'Not deployed yet'],
+};
+
+let showRetired = false;
+
+function serviceCard(s) {
+  const limits = LIMIT_FIELDS[s.slug];
+  const rows = s.packages.filter((p) => showRetired || p.is_active);
+  const warn = (field) => (s.url_warnings || []).find((w) => w.field === field);
+  const url = (value, field) => (value
+    ? `<span class="url">${esc(value)}</span>${warn(field) ? `<span class="url-warn" role="alert">${esc(warn(field).message)}</span>` : ''}`
+    : '');
+  const cols = limits ? limits.length : 1;
+  return `
+    <div class="card svc-card" style="margin-bottom:14px" data-svc="${esc(s.id)}">
+      <div class="card-head"><h2>${esc(s.name)} <span class="hint">${esc(s.slug)} · ${s.accounts} account${s.accounts === 1 ? '' : 's'}</span></h2>
+        <div class="actions">
+          ${!s.is_active ? '<span class="pill mute">Stopped</span>' : ''}${!s.is_public ? '<span class="pill">Unlisted</span>' : ''}
+          <button class="sm" data-edit-svc="${esc(s.id)}">Edit</button>
+          <button class="sm primary" data-new-pkg="${esc(s.id)}">New package</button>
+          <button type="button" class="kebab" data-svc-menu="${esc(s.id)}" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${esc(s.name)}">${KEBAB}</button></div></div>
+      <dl class="svc-facts">
+        <dt>Public URL</dt><dd>${url(s.base_url, 'base_url') || '<span class="muted">Not set</span>'}</dd>
+        <dt>Internal URL</dt><dd>${url(s.internal_url, 'internal_url') || '<span class="muted">Same as the public URL</span>'}</dd>
+        <dt>Status</dt><dd><span class="svc-status" data-status="${esc(s.id)}"><span class="mini-spin" aria-hidden="true"></span>Checking…</span>
+          <button type="button" class="link" data-test-svc="${esc(s.id)}">Test connection</button>
+          <span class="svc-test" data-test-out="${esc(s.id)}" role="status"></span></dd>
+        <dt>Client secret</dt><dd>${s.has_client_secret ? 'Set' : '<span class="url-warn">Not set yet. The service can’t sign in until it has one.</span>'}</dd>
+        <dt>Free trial</dt><dd>${s.trial_default_days} days by default<span class="muted"> (platform setting). A package can set its own; see the Trial column.</span></dd>
+      </dl>
+      <div class="table-wrap"><table class="catalog-table">
+        <thead><tr><th>Package</th><th class="num">Monthly</th><th class="num">Yearly</th>
+          <th><span data-tip="Each price is compared with Stripe: amount, currency, billing period, and whether it is archived.">Stripe sync</span></th>
+          ${limits ? limits.map((l) => `<th class="num">${esc(l.label.replace(' (min)', ''))}</th>`).join('') : '<th>Limits</th>'}
+          <th class="num"><span data-tip="Free days for a new account on this package. Drives the “ends in N d” shown for trials.">Trial</span></th><th></th></tr></thead>
+        <tbody>${rows.map((p) => `<tr class="${p.is_active ? '' : 'retired'}">
+          <td><strong>${esc(p.name)}</strong> ${p.is_default ? '<span class="pill ok">Recommended</span>' : ''}${!p.is_active ? ' <span class="pill mute">Retired</span>' : ''}
+            ${p.accounts ? `<div class="hint">${p.accounts} account${p.accounts === 1 ? '' : 's'}</div>` : ''}</td>
+          <td class="num">${money(p.monthly_price_cents, p.currency)}</td><td class="num">${money(p.yearly_price_cents, p.currency)}</td>
+          <td data-sync-cell="${esc(p.id)}">${syncCell(p, undefined)}</td>
+          ${limits ? limits.map((l) => limitCell(l.key, p.entitlements?.[l.key])).join('') : `<td>${esc(limitsText(p.entitlements))}</td>`}
+          <td class="num">${p.trial_days_effective === 0 ? '<span class="muted">No trial</span>'
+            : `${p.trial_days_effective} d${p.trial_is_default ? ' <span class="muted" data-tip="Uses the platform default.">default</span>' : ''}`}</td>
+          <td class="right nowrap"><button class="sm" data-edit-pkg="${esc(p.id)}">Edit</button>
+            <button type="button" class="kebab" data-pkg-menu="${esc(p.id)}" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${esc(p.name)}">${KEBAB}</button></td></tr>`).join('')
+          || `<tr><td colspan="${6 + cols}">${empty('No packages', s.packages.length ? 'Every package here is retired. Show retired to put one back on sale.' : 'Add the first one.')}</td></tr>`}</tbody>
+      </table></div>
+    </div>`;
 }
 
 async function renderCatalog(mount) {
   state.services = null;
   const svcs = await services();
+  const retired = svcs.reduce((n, s) => n + s.packages.filter((p) => !p.is_active).length, 0);
+  let stripeCheck;   // undefined = asking, then the answer
+  let checkedAt = null;
+
   mount.innerHTML = `
-    <div class="row" style="justify-content:flex-end;margin-bottom:14px"><button class="primary" id="newSvc">New Service</button></div>
-    ${svcs.map((s) => `
-      <div class="card" style="margin-bottom:14px">
-        <div class="card-head"><h2>${esc(s.name)} <span class="hint">${esc(s.slug)} · ${s.accounts} account${s.accounts === 1 ? '' : 's'}</span></h2>
-          <div class="actions">
-            ${!s.is_active ? '<span class="pill mute">Stopped</span>' : ''}${!s.is_public ? '<span class="pill">Unlisted</span>' : ''}
-            <button class="sm" data-edit-svc="${esc(s.id)}">Edit</button>
-            <button class="sm" data-secret="${esc(s.id)}">Rotate Secret</button>
-            <button class="sm primary" data-new-pkg="${esc(s.id)}">New Package</button></div></div>
-        <p class="hint">${esc(s.base_url)}${s.internal_url ? ` · internal ${esc(s.internal_url)}` : ''}${s.has_client_secret ? '' : ' · <strong>no client secret yet</strong>'}</p>
-        <div class="table-wrap"><table>
-          <thead><tr><th>Package</th><th class="num">Monthly</th><th class="num">Yearly</th><th>Stripe</th><th>Limits</th><th></th></tr></thead>
-          <tbody>${s.packages.map((p) => `<tr>
-            <td><strong>${esc(p.name)}</strong> ${p.is_default ? '<span class="pill ok">Recommended</span>' : ''}${!p.is_active ? ' <span class="pill mute">Retired</span>' : ''}</td>
-            <td class="num">${money(p.monthly_price_cents, p.currency)}</td><td class="num">${money(p.yearly_price_cents, p.currency)}</td>
-            <td>${p.stripe_price_id ? '<span class="pill ok">Monthly</span>' : ''} ${p.stripe_yearly_price_id ? '<span class="pill ok">Yearly</span>' : ''}
-              ${!p.stripe_price_id && !p.stripe_yearly_price_id ? '<span class="pill warn">Not buyable</span>' : ''}</td>
-            <td>${esc(limitsText(p.entitlements))}</td>
-            <td class="right"><button class="sm" data-edit-pkg="${esc(p.id)}">Edit</button></td></tr>`).join('')
-            || `<tr><td colspan="6">${empty('No Packages', '')}</td></tr>`}</tbody>
-        </table></div>
-      </div>`).join('') || `<div class="card">${empty('No Services', 'Add the first one.')}</div>`}`;
+    <div class="row catalog-bar">
+      <div class="hint" id="syncLine" role="status"></div>
+      <div class="actions">
+        ${retired ? `<button type="button" id="toggleRetired" aria-pressed="${showRetired}">${showRetired ? 'Hide' : 'Show'} retired (${retired})</button>` : ''}
+        <button class="primary" id="newSvc">New service</button></div></div>
+    <div id="catalogBody">${svcs.map(serviceCard).join('') || `<div class="card">${empty('No services', 'Add the first one.')}</div>`}</div>`;
   const reload = () => renderCatalog(mount);
+  const byPkg = new Map(svcs.flatMap((s) => s.packages.map((p) => [p.id, { svc: s, pkg: p }])));
+
+  /* -- Stripe sync: asked after the page is on screen, never before. -- */
+  const syncLine = $('#syncLine', mount);
+  const paintSync = () => {
+    byPkg.forEach(({ pkg }) => { const cell = $(`[data-sync-cell="${pkg.id}"]`, mount); if (cell) cell.innerHTML = syncCell(pkg, stripeCheck); });
+    if (stripeCheck === undefined) { syncLine.innerHTML = '<span class="mini-spin" aria-hidden="true"></span>Checking prices with Stripe…'; return; }
+    if (stripeCheck.failed) { syncLine.innerHTML = 'Couldn’t check prices with Stripe. <button type="button" class="link" data-recheck>Recheck</button>'; return; }
+    if (stripeCheck.enabled === false) { syncLine.textContent = 'Stripe isn’t connected, so prices can’t be checked against it. Set it up under Payments.'; return; }
+    const states = [...byPkg.values()].filter(({ pkg }) => pkg.is_active).flatMap(({ pkg }) => ['month', 'year'].map((i) => stripeCheck.packages?.[pkg.id]?.[i]?.state));
+    const bad = states.filter((x) => x === 'mismatch' || x === 'notfound').length;
+    const at = checkedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    syncLine.innerHTML = `${bad ? `<strong class="url-warn">${bad} price${bad === 1 ? '' : 's'} out of sync with Stripe.</strong>` : 'All prices match Stripe.'} Checked at ${esc(at)}. <button type="button" class="link" data-recheck>Recheck</button>`;
+  };
+  const runStripe = async () => {
+    stripeCheck = undefined; paintSync();
+    try { stripeCheck = await api.get('/staff/services/stripe-check'); } catch { stripeCheck = { failed: true }; }
+    if (!mount.isConnected) return;
+    checkedAt = new Date(); paintSync();
+  };
+  syncLine.addEventListener('click', (e) => { if (e.target.closest('[data-recheck]')) runStripe(); });
+  paintSync(); runStripe();
+
+  /* -- service status: also after the page is on screen. -- */
+  const paintStatus = (id, tone, text) => {
+    const el = $(`[data-status="${id}"]`, mount);
+    if (el) el.innerHTML = `<i class="dot ${tone}" aria-hidden="true"></i>${esc(text)}`;
+  };
+  api.get('/staff/services/health').then((health) => {
+    if (!mount.isConnected) return;
+    svcs.forEach((s) => {
+      const h = health[s.id];
+      if (!h) { paintStatus(s.id, '', 'Unknown'); return; }
+      const [tone, label] = CATALOG_STATUS[h.status] || ['', h.status];
+      const el = $(`[data-status="${s.id}"]`, mount);
+      paintStatus(s.id, tone, label + (h.latency_ms != null && h.status !== 'unavailable' ? ` · ${h.latency_ms} ms` : ''));
+      if (h.reason && el) el.title = h.reason;
+    });
+  }).catch(() => svcs.forEach((s) => paintStatus(s.id, '', 'Status unavailable')));
+
+  $$('[data-test-svc]', mount).forEach((b) => b.addEventListener('click', async () => {
+    const id = b.dataset.testSvc;
+    const out = $(`[data-test-out="${id}"]`, mount);
+    out.innerHTML = '<span class="mini-spin" aria-hidden="true"></span>Testing…';
+    b.disabled = true;
+    try {
+      const r = await api.post(`/staff/services/${id}/test`);
+      out.innerHTML = r.reachable
+        ? `<i class="dot ok" aria-hidden="true"></i>Reachable at ${esc(r.url)} in ${r.latency_ms} ms`
+        : `<i class="dot bad" aria-hidden="true"></i>${esc(r.error || 'Not reachable')} (${esc(r.url)})`;
+    } catch (error) {
+      out.innerHTML = `<i class="dot bad" aria-hidden="true"></i>${esc(error.message || 'The test could not run')}`;
+    } finally { b.disabled = false; }
+  }));
+
+  /* -- actions -- */
+  $('#toggleRetired', mount)?.addEventListener('click', () => { showRetired = !showRetired; reload(); });
   $('#newSvc', mount).addEventListener('click', async () => {
-    const r = await dialog({ title: 'New Service', submitLabel: 'Create', wide: true, body: serviceForm(),
+    const r = await dialog({ title: 'New service', submitLabel: 'Create', wide: true, body: serviceForm(),
       onSubmit: (form) => api.post('/staff/services', readForm(form)) });
-    if (r) { await showSecret(r.client_secret); reload(); }
+    if (r) { await showSecret(r.client_secret, null, r.name); reload(); }
   });
   $$('[data-edit-svc]', mount).forEach((b) => b.addEventListener('click', async () => {
     const s = svcs.find((x) => x.id === b.dataset.editSvc);
@@ -1078,18 +1580,31 @@ async function renderCatalog(mount) {
       onSubmit: (form) => api.patch(`/staff/services/${s.id}`, readForm(form)) });
     if (r) reload();
   }));
-  $$('[data-secret]', mount).forEach((b) => b.addEventListener('click', async () => {
-    const ok = await dialog({ title: 'Rotate Client Secret?', danger: true, submitLabel: 'Rotate',
-      body: '<p>Sign-ins into this service stop working until the new secret is set on it.</p>',
-      onSubmit: () => api.post(`/staff/services/${b.dataset.secret}/secret`) });
-    if (ok) await showSecret(ok.client_secret, ok.message);
+  $$('[data-svc-menu]', mount).forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (b.getAttribute('aria-expanded') === 'true') { closeRowMenu(); return; }
+    const svc = svcs.find((x) => x.id === b.dataset.svcMenu);
+    openMenu(b, [['secret', 'Rotate client secret…', 'danger']], async () => { await confirmRotate(svc); });
+  }));
+  $$('[data-pkg-menu]', mount).forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (b.getAttribute('aria-expanded') === 'true') { closeRowMenu(); return; }
+    const { svc, pkg } = byPkg.get(b.dataset.pkgMenu);
+    const items = pkg.is_active
+      ? [['retire', 'Retire package…', 'danger']]
+      : [['restore', 'Put back on sale']];
+    openMenu(b, items, async (act) => {
+      if (act === 'retire') { if (await confirmRetire(svc, pkg)) { toast(`${pkg.name} retired`, 'ok'); reload(); } return; }
+      const r = await guard(() => api.patch(`/staff/packages/${pkg.id}`, { is_active: true }));
+      if (r) { toast(`${pkg.name} is on sale again`, 'ok'); reload(); }
+    });
   }));
   $$('[data-new-pkg]', mount).forEach((b) => b.addEventListener('click', () => {
     openPackageDialog(svcs.find((x) => x.id === b.dataset.newPkg), null, reload);
   }));
   $$('[data-edit-pkg]', mount).forEach((b) => b.addEventListener('click', () => {
-    const svc = svcs.find((x) => x.packages.some((q) => q.id === b.dataset.editPkg));
-    openPackageDialog(svc, svc.packages.find((q) => q.id === b.dataset.editPkg), reload);
+    const { svc, pkg } = byPkg.get(b.dataset.editPkg);
+    openPackageDialog(svc, pkg, reload);
   }));
 }
 

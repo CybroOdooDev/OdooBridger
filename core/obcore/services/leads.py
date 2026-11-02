@@ -40,17 +40,26 @@ def create(db: Session, data: dict, *, source: str = "website", actor: str | Non
     return lead
 
 
-def move(db: Session, lead: Lead, stage: str, actor: str, *, lost_reason: str | None = None) -> None:
+def move(db: Session, lead: Lead, stage: str, actor: str, *, lost_reason: str | None = None,
+         converting: bool = False) -> None:
     if stage not in LEAD_STAGES:
         raise LeadError("Unknown stage.")
     if stage == lead.stage:
+        if stage == "lost" and lost_reason and lost_reason != lead.lost_reason:
+            # Same stage, a corrected reason: keep the history of what it said before.
+            record(db, lead, "note", actor, note=f"Lost reason changed to: {lost_reason}")
+            lead.lost_reason = lost_reason
         return
     if lead.stage == "won":
         raise LeadError("This lead is won and closed. It can't be moved to another stage.")
+    if stage == "won" and not converting:
+        raise LeadError("A lead becomes Won when it's converted to an account. Qualify it, then convert it.")
     record(db, lead, "stage", actor, from_value=lead.stage, to_value=stage,
            note=lost_reason if stage == "lost" else None)
     lead.stage = stage
     lead.stage_changed_at = utcnow()
+    if stage in ("won", "lost"):
+        lead.follow_up_on = None   # nothing left to follow up on
     if stage == "lost":
         lead.lost_reason = lost_reason or lead.lost_reason
     elif lead.lost_reason:
@@ -110,3 +119,66 @@ def acknowledge(lead: Lead) -> None:
             f"{lead.topic.lower()} request and will reply within one working day.\n\n"
             f"If anything changes, just reply to this email.\n\n— The OdooBridger team\n")
     try_send(lead.email, "We've got your OdooBridger request", body)
+
+
+# =============================================================================
+# Trends for the Leads page
+# =============================================================================
+def trends(db: Session, days: int = 30, now=None) -> dict:
+    """The four Leads figures with their comparison, built from the history, not from snapshots.
+
+    Open leads and pipeline value are *as of* a moment, so "then" is rebuilt from each lead's stage
+    moves (a lead that came in after that moment didn't exist yet). Won is a count over a window.
+    Conversion is a cohort: of the leads that came in during the window, how many are won. A lead's
+    amount is today's, since amounts aren't versioned. ``previous`` is None when there is nothing to
+    compare with (no leads existed then).
+    """
+    from datetime import timedelta
+
+    from obcore.models import OPEN_STAGES
+    from obcore.security import aware
+
+    now = now or utcnow()
+    t1, t2 = now - timedelta(days=days), now - timedelta(days=2 * days)
+    all_leads = db.scalars(select(Lead)).all()
+    moves: dict[str, list] = {}
+    for e in db.scalars(select(LeadEvent).where(LeadEvent.kind == "stage").order_by(LeadEvent.created_at)).all():
+        moves.setdefault(e.lead_id, []).append(e)
+
+    def stage_at(lead: Lead, when):
+        if aware(lead.created_at) > when:
+            return None
+        stage = "new"
+        for e in moves.get(lead.id, []):
+            if aware(e.created_at) <= when:
+                stage = e.to_value
+            else:
+                break
+        return stage
+
+    def open_at(when) -> tuple[int, int]:
+        picked = [lead for lead in all_leads if stage_at(lead, when) in OPEN_STAGES]
+        return len(picked), sum(lead.value_cents or 0 for lead in picked)
+
+    def won_between(a, b) -> int:
+        return len({e.lead_id for lead_id, evs in moves.items() for e in evs
+                    if e.to_value == "won" and a < aware(e.created_at) <= b})
+
+    def cohort(a, b) -> dict:
+        made = [lead for lead in all_leads if a < aware(lead.created_at) <= b]
+        won = sum(1 for lead in made if lead.stage == "won")
+        return {"total": len(made), "won": won, "rate": round(100 * won / len(made), 1) if made else None}
+
+    open_now, pipe_now = open_at(now)
+    open_then, pipe_then = open_at(t1)
+    existed_then = any(aware(lead.created_at) <= t1 for lead in all_leads)
+    cur, prev = cohort(t1, now), cohort(t2, t1)
+    return {
+        "days": days,
+        "open_leads": {"value": open_now, "previous": open_then if existed_then else None},
+        "pipeline_cents": {"value": pipe_now, "previous": pipe_then if existed_then else None},
+        "won": {"value": won_between(t1, now), "previous": won_between(t2, t1),
+                "all_time": sum(1 for lead in all_leads if lead.stage == "won")},
+        "conversion": {"value": cur["rate"], "previous": prev["rate"], "won": cur["won"], "total": cur["total"]},
+    }
+

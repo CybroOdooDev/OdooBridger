@@ -122,7 +122,8 @@ export function money(cents, currency = 'usd') {
   if (cents == null) return '—';
   const value = cents / 100;
   const symbol = { usd: '$', eur: '€', gbp: '£', inr: '₹', aed: 'AED ' }[String(currency).toLowerCase()] ?? '';
-  return `${symbol}${Number.isInteger(value) ? value : value.toFixed(2)}`;
+  const digits = Number.isInteger(value) ? 0 : 2;   // whole amounts stay bare; thousands are grouped: $2,500
+  return `${symbol}${value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
 export function fmtDate(iso) {

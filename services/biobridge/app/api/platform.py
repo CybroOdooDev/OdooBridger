@@ -2,7 +2,7 @@
 
 ``/platform/v1/accounts/{account_id}`` — PUT the account's state, DELETE the
 account and everything BioBridge holds for it, GET ``/usage`` for the staff
-console. ``/platform/v1/metrics`` — this service's health and integration
+console, GET ``/alerts`` (a count) for the customer bell in the portal. ``/platform/v1/metrics`` — this service's health and integration
 numbers across platform accounts, for the core's staff dashboard (token type
 ``metrics``, signed over an empty body, no account). Every call carries a core-signed RS256 token whose ``account_id``
 and ``body_sha256`` must match this exact request.
@@ -80,6 +80,20 @@ async def account_usage(account_id: str, request: Request, db: Session = Depends
     out = platform_link.usage(db, tenant, check_odoo=request.query_params.get("check_odoo") == "1")
     db.commit()
     return out
+
+
+@router.get("/accounts/{account_id}/alerts")
+async def account_alerts(account_id: str, request: Request, db: Session = Depends(get_db)) -> dict:
+    """What the OdooBridger bell shows for this account: ``{"count": n,
+    "severity": "bad"|"warn"|null}``. Only the number; the alerts themselves
+    are shown by BioBridge."""
+    await _verified(request, account_id)
+    tenant = platform_link.tenant_for(db, account_id)
+    if tenant is None:
+        return {"count": 0, "severity": None}
+    from app.services.platform_alerts import summary
+
+    return summary(db, tenant)
 
 
 @router.get("/metrics")

@@ -30,6 +30,13 @@ def _check_production() -> None:
         raise RuntimeError("JWT_SECRET must be set in production")
     if "dev-only" in settings.master_encryption_key:
         raise RuntimeError("MASTER_ENCRYPTION_KEY must be set in production")
+    from obcore.urlcheck import is_local
+
+    # The built-in BioBridge entry is created from these. Left at their dev defaults it would be a
+    # service nobody but a developer's own machine can reach.
+    for name in ("biometric_base_url", "biometric_internal_url"):
+        if settings.biometric_client_secret and is_local(getattr(settings, name, None)):
+            raise RuntimeError(f"{name.upper()} points at localhost; set the real address in production")
 
 
 @asynccontextmanager

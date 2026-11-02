@@ -54,6 +54,15 @@ def get_account(customer: Customer = Depends(get_customer), db: Session = Depend
     }
 
 
+@router.get("/notifications")
+def notifications(customer: Customer = Depends(get_customer), db: Session = Depends(get_db)) -> dict:
+    """The bell: what each of the account's services wants it to know right now.
+    Live, never stored; see ``services.notifications``."""
+    from obcore.services import notifications as bell
+
+    return bell.collect(db, customer.account)
+
+
 class AccountPatch(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=160)
     timezone: str | None = Field(default=None, max_length=64)

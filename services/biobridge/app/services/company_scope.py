@@ -94,33 +94,19 @@ def infer_device_companies(db: Session, tenant: Tenant) -> list[str]:
     if not open_devices:
         return notes
     by_key = {(d.source_id, d.serial_number): d for d in open_devices}
+    by_id = {d.id: d for d in open_devices}
 
-    rows = db.execute(
-        select(
-            PunchRecord.source_id, PunchRecord.terminal_sn,
-            EmployeeMapping.odoo_company_id, EmployeeMapping.odoo_company_name,
-        )
-        .join(
-            EmployeeMapping,
-            (EmployeeMapping.tenant_id == PunchRecord.tenant_id)
-            & (EmployeeMapping.emp_code == PunchRecord.emp_code),
-        )
-        .where(
-            PunchRecord.tenant_id == tenant.id,
-            PunchRecord.terminal_sn.is_not(None),
-            EmployeeMapping.status == MappingStatus.mapped.value,
-            EmployeeMapping.odoo_company_id.is_not(None),
-        )
-        .distinct()
-    ).all()
+    seen: dict[str, dict[int, str | None]] = {}
+    for device_id, people in _people_companies(db, tenant).items():
+        if device_id in by_id:
+            seen[device_id] = people
+    for (source_id, serial), people in _people_companies(db, tenant, by="serial").items():
+        device = by_key.get((source_id, serial))
+        if device is not None:
+            seen.setdefault(device.id, {}).update(people)
 
-    seen: dict[tuple[str, str], dict[int, str | None]] = {}
-    for source_id, serial, company_id, company_name in rows:
-        if (source_id, serial) in by_key:
-            seen.setdefault((source_id, serial), {})[company_id] = company_name
-
-    for key, companies in seen.items():
-        device = by_key[key]
+    for device_id, companies in seen.items():
+        device = by_id[device_id]
         label = device.alias or device.serial_number
         if len(companies) == 1:
             (company_id, company_name), = companies.items()
@@ -133,6 +119,55 @@ def infer_device_companies(db: Session, tenant: Tenant) -> list[str]:
             notes.append(f"Terminal {label} is used by employees of several companies ({names}); "
                          "choose its company on the Terminals page")
     return notes
+
+
+def _people_companies(db: Session, tenant: Tenant, by: str = "device") -> dict:
+    """Companies of the matched employees who punched on each terminal.
+
+    A punch names its terminal two ways: the link made at fetch time
+    (``device_id``) and the serial number it carried. Either can be the only
+    one present, so both are read — keyed by device id or by (source, serial).
+    """
+    key_col = PunchRecord.device_id if by == "device" else PunchRecord.terminal_sn
+    cols = [key_col] if by == "device" else [PunchRecord.source_id, key_col]
+    rows = db.execute(
+        select(*cols, EmployeeMapping.odoo_company_id, EmployeeMapping.odoo_company_name)
+        .join(
+            EmployeeMapping,
+            (EmployeeMapping.tenant_id == PunchRecord.tenant_id)
+            & (EmployeeMapping.emp_code == PunchRecord.emp_code),
+        )
+        .where(
+            PunchRecord.tenant_id == tenant.id,
+            key_col.is_not(None),
+            EmployeeMapping.status == MappingStatus.mapped.value,
+            EmployeeMapping.odoo_company_id.is_not(None),
+        )
+        .distinct()
+    ).all()
+    out: dict = {}
+    for row in rows:
+        *key, company_id, company_name = row
+        out.setdefault(key[0] if by == "device" else tuple(key), {})[company_id] = company_name
+    return out
+
+
+def why_terminal_has_no_company(db: Session, tenant: Tenant, device) -> str:
+    """A sentence on why a terminal's company could not be worked out, for the
+    hold message — so the person knows whether to wait, fix an employee in Odoo
+    or just pick the company."""
+    people: dict[int, str | None] = {}
+    if device is not None:
+        people.update(_people_companies(db, tenant).get(device.id, {}))
+        people.update(_people_companies(db, tenant, by="serial").get(
+            (device.source_id, device.serial_number), {}))
+    if len(people) > 1:
+        names = ", ".join(sorted(n or f"company {i}" for i, n in people.items()))
+        return f"Its employees belong to several companies ({names}), so BioBridge can't pick one."
+    if not people:
+        return ("BioBridge works it out from the company of the employees who punch on it, "
+                "and none of them has an Odoo company on record yet.")
+    return ""
 
 
 def terminal_company_id(db: Session, device) -> int | None:

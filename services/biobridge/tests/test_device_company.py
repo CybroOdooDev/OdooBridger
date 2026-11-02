@@ -293,3 +293,67 @@ def test_terminal_with_only_unmapped_employees_is_not_registered_in_odoo(
     mapping.status = "mapped"
     db.flush()
     assert terminal_may_register_in_odoo(db, device) is True
+
+
+def test_terminal_is_worked_out_even_when_punches_only_carry_the_device_link(db, tenant, local_day, monkeypatch):
+    """Some punches name their terminal only through the stored device link."""
+    odoo = FakeOdoo()
+    odoo.companies = COMPANIES
+    run(db, tenant, odoo, [punch(1, "1001", local_day.replace(hour=8))], monkeypatch)
+    _source, device = _terminal(db, tenant)
+    for p in db.scalars(select(PunchRecord)):
+        p.device_id = device.id
+        p.terminal_sn = None
+    _mappings_in(db, tenant, ("1001", A, "Acme A"))
+    db.commit()
+
+    infer_device_companies(db, tenant)
+    assert db.scalar(select(Device)).company_id == A
+
+
+def test_held_message_says_why_the_company_could_not_be_worked_out(db, tenant, local_day, monkeypatch):
+    odoo = FakeOdoo()
+    odoo.companies = COMPANIES
+    run(db, tenant, odoo, [punch(1, "1001", local_day.replace(hour=8))], monkeypatch)
+    msg = db.scalar(select(PunchRecord)).error_message
+    assert "company not set for terminal" in msg
+    assert "none of them has an Odoo company on record" in msg
+    assert "Choose this terminal's company on the Terminals page" in msg
+
+    _terminal(db, tenant)
+    _mappings_in(db, tenant, ("1001", A, "Acme A"))
+    from app.services.company_scope import why_terminal_has_no_company
+    device = db.scalar(select(Device))
+    assert why_terminal_has_no_company(db, tenant, device) == ""
+
+
+def _unlisted_terminal_run(db, tenant, local_day, monkeypatch):
+    from tests import test_server_inventory as inv
+
+    odoo = FakeOdoo({"1001": (7, "Jane")})
+    odoo.companies = COMPANIES
+    rows = [inv.punch(1, "1001", local_day.replace(hour=8), "OLD-TERMINAL")]
+    inv.run(db, tenant, rows, ["GATE-02"], monkeypatch, odoo=odoo)
+    return inv, odoo
+
+
+def test_punch_from_a_terminal_the_server_does_not_list_follows_the_employees_company(db, tenant, local_day, monkeypatch):
+    """No terminal record exists, so the employee's own company decides."""
+    inv, odoo = _unlisted_terminal_run(db, tenant, local_day, monkeypatch)
+    p = db.scalar(select(PunchRecord))
+    assert p.device_id is None and p.process_state == PunchState.held.value
+    assert "not in the device list" in p.error_message
+
+    _mappings_in(db, tenant, ("1001", A, "Acme A"))
+    inv.run(db, tenant, [], ["GATE-02"], monkeypatch, odoo=odoo)
+    assert db.scalar(select(PunchRecord)).process_state == PunchState.synced.value
+    assert {d.serial_number for d in db.scalars(select(Device))} == {"GATE-02"}
+
+
+def test_unlisted_terminal_with_the_employees_company_switched_off_is_held(db, tenant, local_day, monkeypatch):
+    inv, odoo = _unlisted_terminal_run(db, tenant, local_day, monkeypatch)
+    _mappings_in(db, tenant, ("1001", 999, "Acme Z"))
+    inv.run(db, tenant, [], ["GATE-02"], monkeypatch, odoo=odoo)
+    p = db.scalar(select(PunchRecord))
+    assert p.process_state == PunchState.held.value
+    assert "switched off" in p.error_message

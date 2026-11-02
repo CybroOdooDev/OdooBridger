@@ -59,9 +59,13 @@ def _mix(account: Account) -> str:
 
 
 TRIAL_WARNING_DAYS = 7
+#: A trial with fewer days than this left is red; up to TRIAL_WARNING_DAYS it is amber.
+TRIAL_URGENT_DAYS = 3
 
-#: Lower is more urgent: what staff should look at first in the accounts list.
-URGENCY = {"past_due": 0, "suspended": 1, "trial_ending": 2, "trial": 3, "mixed": 4, "paying": 5, "none": 6}
+#: "Needs Attention": lower is more urgent, and the order staff are told about (the sort's tooltip
+#: words it the same way). A suspended account sits below a failed payment and a trial about to end
+#: within days, because someone has already dealt with it.
+URGENCY = {"past_due": 0, "trial_urgent": 1, "suspended": 2, "trial_ending": 3, "trial": 4, "mixed": 5, "paying": 6, "none": 7}
 
 
 def billing_state(account: Account, now: datetime | None = None) -> dict[str, Any]:
@@ -90,7 +94,8 @@ def billing_state(account: Account, now: datetime | None = None) -> dict[str, An
         if past:
             out.update(key="past_due", label="Payment Due", tone="bad", note=f"{len(past)} of {len(rows)} services" if many else None)
         elif soonest is not None and soonest <= TRIAL_WARNING_DAYS:
-            out.update(key="trial_ending", label=f"Trial · {when}", tone="warn", note=counts if many and paying else None)
+            out.update(key="trial_ending", label=f"Trial · {when}", note=counts if many and paying else None,
+                       tone="bad" if soonest < TRIAL_URGENT_DAYS else "warn")
         elif paying and trials:
             out.update(key="mixed", label="Paying + Trial", tone="ok", note=counts, renews_at=renews)
         elif paying:
@@ -99,7 +104,13 @@ def billing_state(account: Account, now: datetime | None = None) -> dict[str, An
             out.update(key="trial", label=f"Trial · {when}" if when else "Trial", tone="trialing")
         out["trial_days"] = soonest
     suspended = account.status == AccountStatus.suspended.value
-    out["rank"] = URGENCY["suspended"] if suspended and out["key"] != "past_due" else URGENCY[out["key"]]
+    urgent = out["key"] == "trial_ending" and out["trial_days"] < TRIAL_URGENT_DAYS
+    if out["key"] == "past_due":
+        out["rank"] = URGENCY["past_due"]
+    elif urgent:
+        out["rank"] = URGENCY["trial_urgent"]
+    else:
+        out["rank"] = URGENCY["suspended"] if suspended else URGENCY[out["key"]]
     return out
 
 

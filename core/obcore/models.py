@@ -446,6 +446,8 @@ class Lead(Base, UUIDPk, Timestamped):
     owner_staff_id: Mapped[str | None] = mapped_column(String(32))
     #: Expected monthly value, for the pipeline total.
     value_cents: Mapped[int | None] = mapped_column(Integer)
+    #: The day staff plan to follow up on (a calendar date, no time); cleared when the lead closes.
+    follow_up_on: Mapped[date | None] = mapped_column(Date)
     #: The account it became, once won and converted.
     account_id: Mapped[str | None] = mapped_column(String(32), index=True)
 
@@ -456,7 +458,7 @@ class LeadEvent(Base, UUIDPk, Timestamped):
     __tablename__ = "lead_event"
 
     lead_id: Mapped[str] = mapped_column(ForeignKey("lead.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(10))          # stage | demo | note | convert
+    kind: Mapped[str] = mapped_column(String(10))          # stage | demo | note | convert | owner | followup
     from_value: Mapped[str | None] = mapped_column(String(20))
     to_value: Mapped[str | None] = mapped_column(String(20))
     note: Mapped[str | None] = mapped_column(Text)

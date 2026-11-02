@@ -202,7 +202,9 @@ function mountShell() {
         <div class="side-foot">
           <div class="side-user" id="sideUser"></div>
           <div class="theme-toggle" id="themeSwitch" role="group" aria-label="Theme"></div>
-          <button class="link" id="signOut" style="padding-left:0">Sign Out</button>
+          ${platform.on && auth.scope !== 'staff'
+            ? ''
+            : '<button class="link" id="signOut" style="padding-left:0">Sign Out</button>'}
         </div>
       </aside>
       <div class="main">
@@ -219,7 +221,9 @@ function mountShell() {
       </div>
     </div>`;
 
-  $('#signOut', root).addEventListener('click', async () => {
+  // Under OdooBridger there is no Sign Out here: the sign-in is OdooBridger's, and
+  // the sidebar's "All Services & Billing" leads back to it.
+  $('#signOut', root)?.addEventListener('click', async () => {
     // Failure is ignored: signing out locally is what actually matters.
     for (const token of auth.allRefreshTokens()) {
       try {

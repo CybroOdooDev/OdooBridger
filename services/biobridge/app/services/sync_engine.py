@@ -59,6 +59,7 @@ from app.services.company_scope import (
     enabled_company_ids,
     infer_device_companies,
     is_multi_company,
+    why_terminal_has_no_company,
 )
 from app.services.device_links import device_for_punch, restore_terminals_from_punches, sync_inventory
 from app.services.connections import (
@@ -444,7 +445,7 @@ class SyncEngine:
             self.run.status = SyncStatus.failed.value
             self.run.error_message = str(exc)
             self._log(str(exc), "error")
-            self._mark_degraded_if_needed()
+            self._mark_degraded_if_needed(odoo=False)       # the biometric side failed
         except SyncAborted as exc:
             self._recover()
             self.run.status = SyncStatus.failed.value
@@ -464,7 +465,8 @@ class SyncEngine:
                 odoo_conn.status = ConnectionStatus.failed.value
                 odoo_conn.status_message = friendly_odoo_message(exc)
                 odoo_conn.last_checked_at = datetime.now(timezone.utc)
-            self._mark_degraded_if_needed()
+            from_odoo = isinstance(exc, OdooError)
+            self._mark_degraded_if_needed(sources=not from_odoo, odoo=from_odoo)
         except Exception as exc:  # noqa: BLE001 — a worker must never die silently
             self._recover()
             self.tenant.consecutive_failures += 1
@@ -1372,11 +1374,32 @@ class SyncEngine:
                 company_name = source.default_company_name
         label = (device.alias or device.serial_number) if device is not None else (
             punch.terminal_sn or "this terminal")
+        if company_id is None and device is None and mapping.odoo_company_id is not None:
+            # The punch names a terminal the source doesn't list (BioTime's device
+            # endpoint doesn't know it), so there is no terminal record to give a
+            # company and nothing on the Terminals page to choose. The employee's
+            # own Odoo company is explicit, so it decides, and the attendance goes
+            # to that employee as always.
+            if enabled is not None and mapping.odoo_company_id not in enabled:
+                return (
+                    f"Held: company mismatch: {mapping.odoo_employee_name or punch.emp_code} is in "
+                    f"{mapping.odoo_company_name or f'company {mapping.odoo_company_id}'}, "
+                    "which is switched off for this connection."
+                )
+            return None
         if company_id is None:
             if enabled is not None and len(enabled) > 1:
+                if device is None:
+                    return (
+                        f"Held: terminal {label} is not in the device list of your biometric "
+                        "server, and this employee has no Odoo company on record yet, so "
+                        "BioBridge can't tell which company it belongs to."
+                    )
+                why = why_terminal_has_no_company(self.db, self.tenant, device)
                 return (
                     f"Held: company not set for terminal {label}. Your Odoo has several "
-                    "companies on, so choose this terminal's company on the Terminals page."
+                    f"companies on. {why + ' ' if why else ''}"
+                    "Choose this terminal's company on the Terminals page."
                 )
             return None
         if enabled is not None and company_id not in enabled:
@@ -2263,14 +2286,22 @@ class SyncEngine:
             stmt = stmt.where(DeviceSource.id == self.only_source_id)
         return list(self.db.scalars(stmt).all())
 
-    def _mark_degraded_if_needed(self) -> None:
+    def _mark_degraded_if_needed(self, *, sources: bool = True, odoo: bool = True) -> None:
+        """Badge the connections that keep failing as degraded.
+
+        ``sources`` / ``odoo`` say which side the failure came from. A biometric
+        server that is down must not make a healthy Odoo read "Degraded" (and
+        the reverse): only the side that failed is marked. The streak itself,
+        and so the slow lane, is the whole account's.
+        """
         if self.only_source_id:
             return  # see __init__: a one-connection sync never degrades the rest
         if self.tenant.consecutive_failures < settings.max_consecutive_failures:
             return
-        for source in self._active_sources():
-            source.status = ConnectionStatus.degraded.value
-        conn = self._active_odoo_connection()
+        if sources:
+            for source in self._active_sources():
+                source.status = ConnectionStatus.degraded.value
+        conn = self._active_odoo_connection() if odoo else None
         if conn:
             conn.status = ConnectionStatus.degraded.value
         self._log(
