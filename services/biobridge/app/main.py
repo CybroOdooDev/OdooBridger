@@ -87,6 +87,19 @@ async def lifespan(app: FastAPI):
         if settings.cors_origins.strip() == "*":
             raise RuntimeError("CORS_ORIGINS must name real origins in production")
 
+    # A sync that was running when the last process stopped would otherwise count as
+    # "in progress" for an hour and block every sync of that account meanwhile.
+    try:
+        from app.db.session import session_scope
+        from app.services.sync_engine import close_runs_left_by_a_stopped_process
+
+        with session_scope() as db:
+            closed = close_runs_left_by_a_stopped_process(db)
+        if closed:
+            log.warning("Closed %d sync run(s) left running by a stopped process", closed)
+    except Exception:  # noqa: BLE001 — never stop the boot over housekeeping
+        log.exception("Could not close interrupted sync runs")
+
     if settings.staff_email or settings.staff_password:
         # A fixed staff login from the settings; never allowed to stop the boot.
         try:

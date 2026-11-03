@@ -148,6 +148,19 @@ def close_abandoned_runs(db: Session, tenant_id: str, keep_id: str | None = None
     return done
 
 
+def close_runs_left_by_a_stopped_process(db: Session) -> int:
+    """At process start, without the advisory lock (SQLite: one process): every run still
+    "running" belongs to the process that just stopped, so it is marked failed now rather
+    than blocking the account's syncs until ``RUN_STALE_AFTER`` passes."""
+    if TenantRunLock.supported():
+        return 0   # other processes may be mid-cycle; each cycle closes its own tenant's leftovers
+    done = db.execute(update(SyncRun).where(SyncRun.status == SyncStatus.running.value).values(
+        status=SyncStatus.failed.value, finished_at=datetime.now(timezone.utc),
+        error_message="Interrupted: the process running this sync stopped before it finished.",
+    )).rowcount or 0
+    return done
+
+
 def latest_run(db: Session, tenant_id: str) -> SyncRun | None:
     return db.scalars(select(SyncRun).where(SyncRun.tenant_id == tenant_id)
                       .order_by(SyncRun.started_at.desc()).limit(1)).first()
@@ -334,11 +347,11 @@ class SyncEngine:
             # Each source is isolated. With several sites, letting one failure
             # propagate would skip every other site's punches — data loss
             # disguised as a failed run.
-            reachable = 0
+            reached: list[DeviceSource] = []
             for source in sources:
                 try:
                     self._fetch_and_ingest(source)
-                    reachable += 1
+                    reached.append(source)
                 except (ProviderError, UnsafeTargetError) as exc:
                     source.status = ConnectionStatus.failed.value
                     source.status_message = str(exc)[:500]
@@ -346,7 +359,8 @@ class SyncEngine:
                     self.run.error_count += 1
                     self._log(f"'{source.name}' unreachable: {str(exc)}", "error")
 
-            if reachable == 0:
+            sources_down: str | None = None
+            if not reached:
                 # The run list shows this message and nothing else, so it has to
                 # carry the reason — "none could be reached" tells a customer
                 # only what they already suspected. The per-source handler above
@@ -362,9 +376,14 @@ class SyncEngine:
                     )
                 else:
                     detail = f"None of the {len(sources)} connected platforms could be reached."
-                raise AllSourcesUnreachable(
-                    f"{detail} Punches already in the ledger are unaffected."
-                )
+                sources_down = f"{detail} Punches already in the ledger are unaffected."
+                # The Odoo half does not depend on the device side. Punches already in the
+                # ledger still need pushing and shifts left open still need closing at the
+                # limit, so carry on when Odoo is there; only stop if it isn't.
+                if odoo_conn is None:
+                    raise AllSourcesUnreachable(sources_down)
+                self._log(f"{sources_down} Still pushing pending punches and closing open shifts in Odoo.",
+                          "warning")
 
             # Knowing *which badges punched* needs no Odoo — it is in the punch
             # stream. Registering them now means the Employees page lists
@@ -401,11 +420,13 @@ class SyncEngine:
             # cycle can, at the earliest, match on the very next one (once
             # someone has actually enrolled their biometric at the terminal
             # and they've punched for real).
-            self._provision_employees(odoo, sources)
+            if reached:
+                self._provision_employees(odoo, reached)
 
             # Both ends are connected: bring in everyone the device already
             # knows who matches an Odoo employee, without waiting for a punch.
-            self._import_matched_employees(odoo, sources)
+            if reached:
+                self._import_matched_employees(odoo, reached)
 
             self._reconcile_company_scope(odoo)
             self._resolve_mappings(odoo)
@@ -429,13 +450,22 @@ class SyncEngine:
             # Then bring in what Odoo has that this copy doesn't: records entered
             # there by hand, from a kiosk, or split or edited there.
             self._follow_odoo_attendance(odoo)
+            self._merge_detached_duplicates()
 
-            self.tenant.consecutive_failures = 0
             odoo_conn.status = ConnectionStatus.connected.value
             odoo_conn.last_checked_at = datetime.now(timezone.utc)
-            self.run.status = (
-                SyncStatus.partial.value if self.run.error_count else SyncStatus.success.value
-            )
+            if sources_down:
+                # Odoo was served, but no device platform could be read: still a failed run
+                # (with the streak and slow lane), marking only the biometric side degraded.
+                self.tenant.consecutive_failures += 1
+                self.run.status = SyncStatus.failed.value
+                self.run.error_message = sources_down
+                self._mark_degraded_if_needed(odoo=False)
+            else:
+                self.tenant.consecutive_failures = 0
+                self.run.status = (
+                    SyncStatus.partial.value if self.run.error_count else SyncStatus.success.value
+                )
 
         except AllSourcesUnreachable as exc:
             self._recover()
@@ -1339,8 +1369,16 @@ class SyncEngine:
                     punch.error_message = str(exc)[:500]
                     punch.attempts += 1
                 self._log(f"{emp_code}: {exc}", "error")
+            # Committed per employee: what Odoo now holds for this person is on record here
+            # too. If the process stops mid-push, only the employee in hand is pushed again
+            # (and settled by the checks against Odoo), not everyone before them.
+            self._commit_progress()
 
         self.db.flush()
+
+    def _commit_progress(self) -> None:
+        """Commit the work so far without losing the run row's place in the session."""
+        self.db.commit()
 
     # -- terminal <-> company isolation ------------------------------------
     def _enabled_company_ids(self, odoo: OdooClient) -> list[int] | None:
@@ -1857,6 +1895,41 @@ class SyncEngine:
         except Exception as exc:  # noqa: BLE001 — a copy for display must never fail a sync
             log.warning("following Odoo's attendance skipped for %s: %s", self.tenant.slug, exc)
 
+    def _merge_detached_duplicates(self) -> None:
+        """Fold a local row that lost its Odoo id into the row that now carries it.
+
+        A changed database name makes ``release_old_odoo`` cut every local attendance row loose
+        from its Odoo id. When the "new" database is really the same Odoo, the same shifts then
+        come back through _follow_odoo_attendance as fresh rows, and the orphaned one stays open
+        for ever beside its twin. A twin is the same badge with the same check-in; the orphan's
+        device and pairing details move onto it and the orphan goes.
+        """
+        try:
+            orphans = self.db.scalars(select(AttendanceRecord).where(
+                AttendanceRecord.tenant_id == self.tenant.id,
+                AttendanceRecord.odoo_attendance_id.is_(None))).all()
+            merged = 0
+            for orphan in orphans:
+                twin = self.db.scalars(select(AttendanceRecord).where(
+                    AttendanceRecord.tenant_id == self.tenant.id,
+                    AttendanceRecord.emp_code == orphan.emp_code,
+                    AttendanceRecord.check_in == orphan.check_in,
+                    AttendanceRecord.odoo_attendance_id.is_not(None))).first()
+                if twin is None:
+                    continue
+                twin.device_serial = twin.device_serial or orphan.device_serial
+                twin.pairing_mode = twin.pairing_mode or orphan.pairing_mode
+                if twin.origin == "odoo":
+                    twin.origin = orphan.origin
+                self.db.delete(orphan)
+                merged += 1
+            if merged:
+                self.db.flush()
+                self._log(f"{merged} duplicate attendance row(s) from before the Odoo connection changed "
+                          "were merged into the matching Odoo records", "info")
+        except Exception as exc:  # noqa: BLE001 — tidying a display copy must never fail a sync
+            log.warning("duplicate merge skipped for %s: %s", self.tenant.slug, exc)
+
     def _refresh_open_mirror(self, odoo: OdooClient) -> None:
         """Bring records BioBridge shows as open in step with Odoo.
 
@@ -1993,10 +2066,11 @@ class SyncEngine:
         The tell, checked first and entirely locally (no Odoo call, so an
         ordinary create pays nothing extra for this): the punch pairing
         used as this interval's check-in was itself recorded with direction
-        "out". A real shift's opening punch is never that — either "in", or
-        "unknown" on a device that does not report state at all, which is
-        deliberately left alone here rather than risk a false positive and
-        silently drop what might be a genuine new shift.
+        "out". A real shift's opening punch is never that. A punch with no
+        direction at all (a device that does not report state) is checked
+        too, but only counts as a replay when the record ending at its time
+        was closed by a real punch, not by one of BioBridge's own guesses —
+        see the body.
 
         Only then is Odoo asked whether some record already carries this
         exact check-out. A match means the punch already did its job; this
@@ -2007,12 +2081,24 @@ class SyncEngine:
         returns that record's id so the caller writes nothing further.
         """
         check_in_punch = by_id.get(interval.check_in_punch_id or "")
-        if check_in_punch is None or check_in_punch.direction != Direction.outward.value:
+        if check_in_punch is None or check_in_punch.direction == Direction.inward.value:
             return None
 
         real = odoo.attendance_closed_at(employee_id, interval.check_in)
         if real is None:
             return None
+        if check_in_punch.direction == Direction.unknown.value:
+            # A device that reports no direction: a replayed check-out and a genuine new
+            # check-in look the same. The tell is how the record ending here was closed.
+            # Closed by a real punch: this punch is that punch, replayed. Closed by
+            # BioBridge's own guess (the shift limit, or shortened to where this punch
+            # starts): the guess ended there *because* a new shift begins here, so this is
+            # a check-in and the record must be created.
+            mirror = self.db.scalars(select(AttendanceRecord).where(
+                AttendanceRecord.tenant_id == self.tenant.id,
+                AttendanceRecord.odoo_attendance_id == int(real["id"]))).first()
+            if mirror is not None and mirror.is_auto_closed:
+                return None
 
         real_check_out = interval.check_in
         interval.check_in = parse_dt(real.get("check_in")) or real_check_out

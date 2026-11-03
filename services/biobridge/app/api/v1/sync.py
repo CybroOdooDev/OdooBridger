@@ -44,6 +44,9 @@ from app.schemas import (
     MappingOut,
     MappingUpdate,
     MessageOut,
+    PunchBulkIn,
+    PunchBulkOut,
+    PunchSelectableOut,
     PunchOut,
     ScheduleOut,
     SyncRunOut,
@@ -398,6 +401,35 @@ def list_runs(
 # ===========================================================================
 # Ledger and mappings
 # ===========================================================================
+def _synced():
+    return (PunchRecord.process_state == PunchState.synced.value) | PunchRecord.odoo_attendance_id.is_not(None)
+
+
+def _punch_filter(stmt, tenant_id: str, *, state=None, emp_code=None, terminal_sn=None, run_id=None,
+                  date_from=None, date_to=None, exclude_synced=False):
+    """The ledger's filters, shared by the list and by "select every matching punch"."""
+    stmt = stmt.where(PunchRecord.tenant_id == tenant_id)
+    if exclude_synced:
+        stmt = stmt.where(~_synced())
+    if state:
+        stmt = stmt.where(PunchRecord.process_state == state)
+    else:
+        # Deleted punches are only listed when asked for by name.
+        stmt = stmt.where(PunchRecord.process_state != PunchState.deleted.value)
+    if emp_code:
+        stmt = stmt.where(PunchRecord.emp_code == emp_code)
+    if terminal_sn:
+        stmt = stmt.where(PunchRecord.terminal_sn == terminal_sn)
+    if run_id:
+        stmt = stmt.where(PunchRecord.first_seen_run_id == run_id)
+    if date_from:
+        stmt = stmt.where(PunchRecord.punch_time_utc >= datetime.combine(date_from, time.min))
+    if date_to:
+        # Inclusive: a user asking for the 14th means the whole of the 14th.
+        stmt = stmt.where(PunchRecord.punch_time_utc < datetime.combine(date_to, time.min) + timedelta(days=1))
+    return stmt
+
+
 @router.get("/punches", response_model=list[PunchOut])
 def list_punches(
     state: str | None = None,
@@ -427,23 +459,8 @@ def list_punches(
     purpose, and those stay attributed to the run that first saw them. The run's
     own ``punches_fetched`` and ``punches_new`` counters give the arithmetic.
     """
-    stmt = select(PunchRecord).where(PunchRecord.tenant_id == principal.tenant.id)
-    if state:
-        stmt = stmt.where(PunchRecord.process_state == state)
-    else:
-        # Deleted punches are only listed when asked for by name.
-        stmt = stmt.where(PunchRecord.process_state != PunchState.deleted.value)
-    if emp_code:
-        stmt = stmt.where(PunchRecord.emp_code == emp_code)
-    if terminal_sn:
-        stmt = stmt.where(PunchRecord.terminal_sn == terminal_sn)
-    if run_id:
-        stmt = stmt.where(PunchRecord.first_seen_run_id == run_id)
-    if date_from:
-        stmt = stmt.where(PunchRecord.punch_time_utc >= datetime.combine(date_from, time.min))
-    if date_to:
-        # Inclusive: a user asking for the 14th means the whole of the 14th.
-        stmt = stmt.where(PunchRecord.punch_time_utc < datetime.combine(date_to, time.min) + timedelta(days=1))
+    stmt = _punch_filter(select(PunchRecord), principal.tenant.id, state=state, emp_code=emp_code,
+                         terminal_sn=terminal_sn, run_id=run_id, date_from=date_from, date_to=date_to)
     stmt = stmt.order_by(PunchRecord.punch_time_utc.desc()).offset(offset).limit(limit)
     return list(db.scalars(stmt).all())
 
@@ -505,6 +522,107 @@ def delete_punch(
     )
     db.commit()
     return MessageOut(message="Punch deleted")
+
+
+#: What "Move to pending" applies to: the states Retry and Restore are offered for.
+REQUEUEABLE_STATES = DELETABLE_STATES + (PunchState.deleted.value,)
+
+
+@router.post("/punches/bulk", response_model=PunchBulkOut)
+def bulk_punches(
+    payload: PunchBulkIn,
+    request: Request,
+    principal: Principal = Depends(require_writer),
+    db: Session = Depends(get_db),
+) -> PunchBulkOut:
+    """Retry / restore or delete several punches. The same rules as one at a time; a punch they
+    don't apply to (already in Odoo, already pending, synced, another account's) is skipped and
+    counted, so one odd row in a selection never blocks the rest."""
+    allowed = DELETABLE_STATES if payload.action == "delete" else REQUEUEABLE_STATES
+    if payload.filter is not None:
+        return _bulk_by_filter(payload, allowed, request, principal, db)
+    ids = list(dict.fromkeys(payload.ids or []))
+    rows = db.scalars(select(PunchRecord).where(
+        PunchRecord.tenant_id == principal.tenant.id, PunchRecord.id.in_(ids))).all()
+    changed = 0
+    for punch in rows:
+        if punch.odoo_attendance_id or punch.process_state not in allowed:
+            continue
+        previous = punch.process_state
+        if payload.action == "delete":
+            punch.process_state = PunchState.deleted.value
+            punch.error_message = f"Deleted (was {previous})"
+            audit(db, principal, "punch.delete", punch.id,
+                  f"{punch.emp_code} at {punch.punch_time_utc:%Y-%m-%d %H:%M:%S} UTC, was {previous} (bulk)",
+                  request)
+        else:
+            punch.process_state = PunchState.pending.value
+            punch.attempts = 0
+            punch.error_message = None
+        changed += 1
+    db.commit()
+    skipped = len(ids) - changed
+    noun = "punch" if changed == 1 else "punches"
+    done = f"{changed} {noun} deleted" if payload.action == "delete" else f"{changed} {noun} queued for the next sync"
+    return PunchBulkOut(changed=changed, skipped=skipped,
+                        message=done + (f", {skipped} skipped" if skipped else ""))
+
+
+def _eligible(stmt, allowed):
+    return stmt.where(PunchRecord.odoo_attendance_id.is_(None), PunchRecord.process_state.in_(allowed))
+
+
+@router.get("/punches/selectable", response_model=PunchSelectableOut)
+def selectable_punches(
+    state: str | None = None,
+    emp_code: str | None = None,
+    terminal_sn: str | None = None,
+    run_id: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    exclude_synced: bool = False,
+    principal: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> PunchSelectableOut:
+    """How many punches matching the ledger's filters each bulk action would change, across every
+    page: what "Select all N matching punches" offers."""
+    base = _punch_filter(select(func.count(PunchRecord.id)), principal.tenant.id, state=state,
+                         emp_code=emp_code, terminal_sn=terminal_sn, run_id=run_id,
+                         date_from=date_from, date_to=date_to, exclude_synced=exclude_synced)
+    return PunchSelectableOut(
+        synced=db.scalar(base.where(_synced())) or 0,
+        matching=db.scalar(base) or 0,   # everything the filters match, whatever its state
+        rerun=db.scalar(_eligible(base, REQUEUEABLE_STATES)) or 0,
+        delete=db.scalar(_eligible(base, DELETABLE_STATES)) or 0,
+    )
+
+
+def _bulk_by_filter(payload: PunchBulkIn, allowed, request: Request, principal: Principal,
+                    db: Session) -> PunchBulkOut:
+    """Every punch matching the filters, not just the page on screen. Done as one update; the audit
+    trail gets one entry naming the filter and the count, not one per punch."""
+    f = payload.filter
+    ids_stmt = _eligible(_punch_filter(select(PunchRecord.id), principal.tenant.id, **f.model_dump()), allowed)
+    ids = list(db.scalars(ids_stmt).all())
+    if not ids:
+        return PunchBulkOut(changed=0, skipped=0, message="Nothing to change: no matching punch can be "
+                            + ("deleted" if payload.action == "delete" else "rerun"))
+    query = db.query(PunchRecord).filter(PunchRecord.id.in_(ids))
+    if payload.action == "delete":
+        # Each keeps what it was in its note, like a single delete.
+        for state in allowed:
+            query.filter(PunchRecord.process_state == state).update(
+                {"process_state": PunchState.deleted.value, "error_message": f"Deleted (was {state})"},
+                synchronize_session=False)
+        described = ", ".join(f"{k}={v}" for k, v in f.model_dump().items() if v) or "no filter"
+        audit(db, principal, "punch.bulk_delete", None, f"{len(ids)} punches matching {described}", request)
+    else:
+        query.update({"process_state": PunchState.pending.value, "attempts": 0, "error_message": None},
+                     synchronize_session=False)
+    db.commit()
+    noun = "punch" if len(ids) == 1 else "punches"
+    return PunchBulkOut(changed=len(ids), skipped=0, message=(
+        f"{len(ids)} {noun} deleted" if payload.action == "delete" else f"{len(ids)} {noun} queued for the next sync"))
 
 
 _DETAILS_CHECKED: dict[str, float] = {}

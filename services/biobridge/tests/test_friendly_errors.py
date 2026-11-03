@@ -25,3 +25,24 @@ def test_each_common_failure_says_what_to_check():
 def test_unknown_errors_never_leak_internals():
     msg = friendly(OdooError("Traceback KeyError: 'foo' at line 12"))
     assert "Traceback" not in msg and msg.startswith("Connection failed")
+
+
+def test_each_http_status_keeps_its_own_cause():
+    def raw(status, call="/json/2/res.users/context_get"):
+        return OdooError(f"Could not reach Odoo's API at https://x: hint (HTTP {status} on {call})")
+    assert "redirects" in friendly(raw(301))
+    assert "firewall" in friendly(raw(403))
+    assert "not responding" in friendly(raw(502))
+    assert "Server URL" in friendly(raw(404))
+    missing = friendly(raw(404, "/json/2/hr.attendance/create"))
+    assert "hr.attendance" in missing and "Attendances" in missing
+
+
+def test_no_database_selected_points_at_the_database_name():
+    import httpx
+    from app.integrations.odoo import _json2_error
+    resp = httpx.Response(404, text="<!DOCTYPE html><title>404 Not Found</title><p>No database is selected "
+                          "and the requested URL was not found in the server-wide controllers.</p>")
+    err = _json2_error("https://x", "res.users", "context_get", "bio_bridge_v19", resp)
+    assert isinstance(err, OdooAuthError) and "bio_bridge_v19" in str(err)
+    assert friendly(err) == "Connection failed. Check the Database name."

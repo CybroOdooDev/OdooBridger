@@ -1309,6 +1309,11 @@ button.icon-btn:hover, button.icon-btn:focus-visible {
   opacity: 1; color: var(--bad, #c0392b); background: var(--bg); border-color: var(--rule);
 }
 
+/* Retry is not destructive: it turns accent on hover, not red. */
+button.icon-btn.retry:hover, button.icon-btn.retry:focus-visible { color: var(--accent); }
+button.icon-btn.working { opacity: .5; cursor: progress; }
+button.icon-btn.working svg { animation: spin .8s linear infinite; }
+
 /* Accounts table: line the Save / Configure buttons up down the page. The
    cell used to be right-aligned, so a row with a shorter set of buttons
    (Delete present or not, Activate vs Deactivate) shifted them sideways. */
@@ -1614,3 +1619,24 @@ td.nowrap { white-space: nowrap; }
 /* A badge whose badge and name point at different people: the suggestion sits above the picker. */
 .suggest-box { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; padding: 8px 10px;
   border: 1px solid var(--warn-soft); background: var(--warn-soft); border-radius: var(--radius-sm, 8px); }
+
+/* --- Activity: bulk select ------------------------------------------------ */
+.punch-table .sel-cell { display: inline-flex; align-items: flex-start; gap: 12px; }
+.punch-table .sel-cell input[type=checkbox] { width: 16px; height: 16px; margin: 2px 0 0; flex: none; cursor: pointer; accent-color: var(--accent); }
+.punch-table .sel-gap { width: 16px; flex: none; }
+.punch-table tbody tr.selected > td, .scroll .punch-table tbody tr.selected > td:first-child { background: var(--accent-soft); }
+.bulk-bar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin: 10px 0 8px; padding: 8px 12px; border: 1px solid var(--rule); border-radius: var(--radius-sm); background: var(--panel-2); }
+.bulk-bar[hidden] { display: none; }
+.bulk-count { font-size: 13px; font-weight: 600; margin-right: 6px; }
+.bulk-bar .link { margin-left: auto; }
+
+.bulk-warn { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 16px;
+  margin-top: 6px; padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--rule); background: var(--panel); font-size: 13px; line-height: 1.5; }
+.bulk-warn[hidden] { display: none; }
+.bulk-warn.warn { border-color: var(--warn); background: var(--warn-soft); }
+.bulk-warn-text p { margin: 0 0 4px; }
+.bulk-warn-text p:last-child { margin: 0; }
+.bulk-warn-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bulk-bar .bulk-warn .link { margin-left: 0; }
+

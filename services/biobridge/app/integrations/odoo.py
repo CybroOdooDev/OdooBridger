@@ -274,6 +274,13 @@ def _json2_error(url: str, model: str, method: str, db: str, resp: httpx.Respons
         data = resp.json()
     except ValueError:
         data = None
+    if status == 404 and "no database is selected" in resp.text.lower():
+        # Odoo itself answering: the X-Odoo-Database header named a database this
+        # server doesn't serve (wrong name, renamed, or excluded by its dbfilter).
+        return _with_status(OdooAuthError(
+            f"Odoo has no database named {db!r} at {url}. Check the database name; "
+            "it may have been renamed or recreated."
+        ), status)
     if not isinstance(data, dict) or not (data.get("message") or data.get("name")):
         # Not Odoo's own error document: a proxy, a WAF, or no Odoo at all.
         hint = _TRANSPORT_HINTS.get(status, f"the endpoint answered HTTP {status}.")

@@ -728,8 +728,10 @@ async function renderOdoo(mount, route) {
   ]);
   // The connection actually in use: in platform mode, the one set in OdooBridger.
   const odoo = odooList.find((c) => c.managed && c.is_active) || odooList.find((c) => c.is_active) || odooList[0] || null;
-  // Badges can only be matched once a biometric connection is working too.
-  const biometricUp = sources.some((x) => x.status === 'connected');
+  // Matching a badge needs Odoo (to search its employees), not a healthy terminal: the badges are
+  // already here, delivered by an earlier sync. A terminal that is down right now, or last synced a
+  // while ago, must not hide the badges waiting for a match.
+  const hasBadges = sources.length > 0 || mappings.length > 0 || removedBadges.length > 0;
   const readonly = !auth.canWrite;
   // Platform mode: OdooBridger owns the address, database, login and key.
   // Only the company switches are set here.
@@ -822,10 +824,10 @@ async function renderOdoo(mount, route) {
       </form>
       ${inSetup && actions ? `<div class="setup-foot actions">${actions}</div>` : ''}
     </div>
-    ${odoo && biometricUp && mappings.some(needsMatch) ? unmappedCard(mappings.filter(needsMatch)) : ''}
-    ${odoo && biometricUp ? deletedBadgesCard(removedBadges) : ''}`;
+    ${odoo && hasBadges && mappings.some(needsMatch) ? unmappedCard(mappings.filter(needsMatch)) : ''}
+    ${odoo && hasBadges ? deletedBadgesCard(removedBadges) : ''}`;
 
-  if (odoo && biometricUp) wireUnmapped(mount, () => renderOdoo(mount));
+  if (odoo && hasBadges) wireUnmapped(mount, () => renderOdoo(mount));
   // "Show unmapped employees" on the Employees page lands here.
   if (route?.query?.show === 'unmapped') {
     const card = $('#unmapped', mount);

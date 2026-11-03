@@ -15,6 +15,8 @@ if the engine ever tries — so this is a strict check, not just a count.
 from __future__ import annotations
 
 import pytest
+from datetime import timedelta
+from tests.test_odoo_outage_recovery import DUBAI_OFFSET
 
 from sqlalchemy import select
 
@@ -155,3 +157,76 @@ def test_a_genuine_new_shift_is_never_suppressed(db, tenant, local_day, monkeypa
     assert len(odoo.attendances) == 1, odoo.attendances
     row = db.scalars(select(PunchRecord).where(PunchRecord.external_id == "solo")).one()
     assert row.process_state == PunchState.synced.value
+
+
+# --------------------------------------------------------------------------- #
+# Devices that report no direction: the same crash, told apart from a real check-in
+# --------------------------------------------------------------------------- #
+@pytest.mark.usefixtures("no_stale_close")
+def test_crash_after_close_on_a_device_without_direction(db, tenant, local_day, monkeypatch):
+    tenant.pairing_mode = "alternating"
+    db.commit()
+    odoo = FakeOdoo()
+    check_in = local_day.replace(hour=8)
+    check_out = local_day.replace(hour=17)
+    run(db, tenant, odoo, [punch("in1", "1001", check_in)], monkeypatch)
+    (open_id,) = odoo.attendances
+    run(db, tenant, odoo, [punch("in1", "1001", check_in), punch("out1", "1001", check_out)], monkeypatch)
+    assert odoo.attendances[open_id]["check_out"] is not None
+
+    out_row = db.scalars(select(PunchRecord).where(PunchRecord.external_id == "out1")).one()
+    assert out_row.direction == "unknown"
+    out_row.process_state = PunchState.pending.value
+    out_row.odoo_attendance_id = None
+    db.commit()
+
+    run(db, tenant, odoo, [punch("in1", "1001", check_in), punch("out1", "1001", check_out)], monkeypatch)
+    assert len(odoo.attendances) == 1, f"phantom record: {odoo.attendances}"
+    out_row = db.scalars(select(PunchRecord).where(PunchRecord.external_id == "out1")).one()
+    assert out_row.process_state == PunchState.synced.value and out_row.odoo_attendance_id == open_id
+
+
+@pytest.mark.usefixtures("no_stale_close")
+def test_a_check_in_where_a_guessed_close_ended_still_opens_a_shift(db, tenant, local_day, monkeypatch):
+    """A record BioBridge itself auto-closed at the limit, with a new punch at exactly that
+    time from a no-direction device: that punch is a check-in, not a replayed check-out."""
+    tenant.pairing_mode = "alternating"
+    db.commit()
+    odoo = FakeOdoo()
+    check_in = local_day.replace(hour=8)
+    run(db, tenant, odoo, [punch("in1", "1001", check_in)], monkeypatch)
+    (old_id,) = odoo.attendances
+    limit_end = check_in + timedelta(hours=tenant.max_shift_hours)
+    # The shift-limit sweep closed it (auto-closed), and the local copy says so.
+    odoo.attendances[old_id]["check_out"] = limit_end - DUBAI_OFFSET
+    mirror = db.scalars(select(AttendanceRecord).where(AttendanceRecord.odoo_attendance_id == old_id)).one()
+    mirror.check_out = limit_end - DUBAI_OFFSET
+    mirror.is_auto_closed = True
+    db.commit()
+
+    run(db, tenant, odoo, [punch("in1", "1001", check_in), punch("in2", "1001", limit_end)], monkeypatch)
+    assert len(odoo.attendances) == 2, "the new shift must be created"
+
+
+# --------------------------------------------------------------------------- #
+# The push commits after each employee, so a crash repeats one person, not all
+# --------------------------------------------------------------------------- #
+def test_push_commits_after_each_employee(db, tenant, local_day, monkeypatch):
+    odoo = FakeOdoo()
+    commits = []
+    real_commit = db.commit
+
+    def commit_spy():
+        # What is synced at the moment of each commit.
+        commits.append(sorted(p.external_id for p in db.scalars(select(PunchRecord))
+                              if p.process_state == PunchState.synced.value))
+        real_commit()
+
+    monkeypatch.setattr(db, "commit", commit_spy)
+    run(db, tenant, odoo, [punch("a", "1001", local_day.replace(hour=8)),
+                           punch("b", "1002", local_day.replace(hour=9))], monkeypatch)
+    assert len(odoo.attendances) == 2
+    # One commit saw only the first employee's punch synced: it landed before the second
+    # employee was pushed, so a crash there would re-push one person, not both.
+    assert ["a"] in commits, commits
+    assert ["a", "b"] in commits

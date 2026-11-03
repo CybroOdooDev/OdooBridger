@@ -90,7 +90,7 @@ services:
       # Hosted: customers' addresses must be public, so they can't make BioBridge
       # call this network. "true" for a local test with terminals or Odoo on your
       # own network.
-      ALLOW_PRIVATE_NETWORK_TARGETS: ${BIOBRIDGE_ALLOW_PRIVATE_TARGETS:-false}
+      ALLOW_PRIVATE_NETWORK_TARGETS: ${BIOBRIDGE_ALLOW_PRIVATE_TARGETS:-true}
       PLATFORM_CORE_URL: ${CORE_PUBLIC_URL:-http://localhost:8000}
       PLATFORM_CORE_INTERNAL_URL: http://core:8000
       PLATFORM_CLIENT_SECRET: ${BIOMETRIC_CLIENT_SECRET}

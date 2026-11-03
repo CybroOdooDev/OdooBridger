@@ -9,6 +9,10 @@ const TRASH_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" 
   + 'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
   + '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
 
+const RETRY_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+  + 'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+  + '<path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5"/></svg>';
+
 /* --- Attendance ----------------------------------------------------------- */
 
 /** Quick ranges: the question is almost always "today", "yesterday" or "this
@@ -555,6 +559,177 @@ function wireRunLogs(mount) {
     });
   });
 }
+/** The Activity list's checkboxes: pick punches, then move them all to pending or delete them.
+ *  ("Rerun punches" moves them back to pending.) Delete arms first, like the single-row delete: a second click within a few seconds confirms. */
+/* The selection outlives a re-render of the same list, so "Show more" (which only raises the
+ * limit) keeps it: ticked punches stay ticked, and a ticked header box takes in the new rows too.
+ * Any other filter starts afresh. */
+const BULK = { key: null, ids: new Set(), allOnPage: false, everything: null };
+const resetBulk = (key = null) => Object.assign(BULK, { key, ids: new Set(), allOnPage: false, everything: null });
+
+/** "3,422 punches" with nothing narrowed, "1,234 matching" with a filter or state tab, and
+ *  "· showing 100" while the page holds fewer than that. Falls back to the page length. */
+function ledgerCount(totals, shown, narrowed) {
+  const total = totals ? totals.matching : shown;
+  const n = Number(total).toLocaleString();
+  const label = narrowed ? `${n} matching` : `${n} punch${total === 1 ? '' : 'es'} in total`;
+  return shown < total ? `${label} · showing ${Number(shown).toLocaleString()}` : label;
+}
+
+function wireBulk(mount, rerender, { filter, mayHaveMore, total: sectionTotal }) {
+  const boxes = [...mount.querySelectorAll('[data-sel]')];
+  const key = JSON.stringify(filter);
+  if (BULK.key !== key) resetBulk(key);
+  boxes.forEach((b) => { b.checked = (Boolean(BULK.everything) || BULK.allOnPage || BULK.ids.has(b.dataset.sel)); });
+  if (BULK.everything?.excludeSynced) boxes.forEach((b) => { if (b.dataset.synced) b.checked = false; });
+  const all = $('#selAll', mount);
+  const bar = $('#bulkBar', mount);
+  const warn = $('#bulkWarn', mount);
+  const pendingBtn = $('#bulkPending', mount);
+  const deleteBtn = $('#bulkDelete', mount);
+  const everythingBtn = $('#bulkEverything', mount);
+  const fmt = (n) => Number(n).toLocaleString();
+  const plural = (n, one, many) => `${fmt(n)} ${n === 1 ? one : many}`;
+  //: Set once "Select every matching punch" is chosen: the counts across every page.
+  let everything = BULK.everything;
+  const chosen = () => boxes.filter((b) => b.checked);
+  const remember = () => {
+    const picked = chosen();
+    BULK.ids = new Set(picked.map((b) => b.dataset.sel));
+    BULK.allOnPage = picked.length > 0 && picked.length === boxes.length;
+    BULK.everything = everything;
+  };
+  // How many of the selection each action applies to, and how many are already in Odoo.
+  const counts = () => {
+    if (everything) {
+      return { total: everything.matching, rerun: everything.rerun, del: everything.delete, synced: everything.synced || 0 };
+    }
+    const picked = chosen();
+    return { total: picked.length, rerun: picked.filter((b) => b.dataset.rerun).length,
+             del: picked.filter((b) => b.dataset.del).length, synced: picked.filter((b) => b.dataset.synced).length };
+  };
+  const hideWarn = () => { warn.hidden = true; warn.innerHTML = ''; };
+
+  const paint = () => {
+    remember();
+    const picked = chosen();
+    const { total, rerun, del } = counts();
+    bar.hidden = !picked.length && !everything;
+    if (bar.hidden) hideWarn();
+    const wholePage = picked.length > 0 && picked.length === boxes.length;
+    $('#bulkCount', mount).textContent = everything
+      ? `All ${fmt(total)} matching punches selected${everything.excludeSynced ? ' (synced left out)' : ''}`
+      : wholePage && mayHaveMore ? `All ${picked.length} on this page selected` : `${picked.length} selected`;
+    everythingBtn.hidden = !(wholePage && mayHaveMore && !everything);
+    everythingBtn.textContent = sectionTotal ? `Select all ${fmt(sectionTotal)}` : 'Select all';
+    if (pendingBtn) {
+      pendingBtn.textContent = `Rerun punches (${fmt(rerun)})`;
+      pendingBtn.disabled = !total;
+      pendingBtn.title = 'Queue them again for the next sync. Deleted punches are restored.';
+    }
+    if (deleteBtn) {
+      deleteBtn.textContent = `Delete (${fmt(del)})`;
+      deleteBtn.disabled = !total;
+      deleteBtn.title = 'Take them out of the queue. They won’t be pushed or come back on the next sync.';
+    }
+    all.checked = Boolean(everything) || wholePage;
+    all.indeterminate = !everything && picked.length > 0 && picked.length < boxes.length;
+    boxes.forEach((b) => b.closest('tr').classList.toggle('selected', b.checked));
+  };
+
+  /* Before acting: say what will and won't happen. Synced punches are already Odoo attendance, so
+   * they are never rerun or deleted; the warning names them and offers to take them out of the
+   * selection. Delete always asks here, synced or not, so this box is also its confirmation. */
+  const ask = (action) => {
+    const c = counts();
+    const n = action === 'delete' ? c.del : c.rerun;
+    const verb = action === 'delete' ? 'deleted' : 'rerun';
+    const other = c.total - c.synced - n;   // pending, held or already deleted: not touched either
+    if (action === 'pending' && !c.synced && !other) { hideWarn(); send(pendingBtn, 'pending'); return; }
+    const lines = [];
+    if (c.synced) {
+      lines.push(`<strong>${plural(c.synced, 'selected punch is', 'selected punches are')} already synced to Odoo</strong>
+        and can't be ${verb}. ${c.synced === 1 ? 'It is' : 'They are'} part of an Odoo attendance record;
+        to change ${c.synced === 1 ? 'it' : 'them'}, edit the attendance in Odoo.`);
+    }
+    if (other > 0) {
+      lines.push(`${plural(other, 'other punch', 'other punches')} ${other === 1 ? 'is' : 'are'} ${action === 'delete'
+        ? 'pending, held or deleted already' : 'pending or held'} and ${other === 1 ? 'is' : 'are'} left as ${other === 1 ? 'it is' : 'they are'}.`);
+    }
+    if (action === 'delete' && n) {
+      lines.push(`${plural(n, 'punch', 'punches')} will be taken out of the queue. ${n === 1 ? 'It' : 'They'} won't be pushed to Odoo or come back on the next sync.`);
+    }
+    if (!n) lines.push(`None of the selected punches can be ${verb}.`);
+    warn.className = `bulk-warn${c.synced || !n ? ' warn' : ''}`;
+    warn.innerHTML = `
+      <div class="bulk-warn-text">${lines.map((l) => `<p>${l}</p>`).join('')}</div>
+      <div class="bulk-warn-actions">
+        ${c.synced ? '<button type="button" class="sm" data-w="deselect">Deselect synced punches</button>' : ''}
+        ${n ? `<button type="button" class="sm ${action === 'delete' ? 'danger' : 'primary'}" data-w="go">${
+          action === 'delete' ? `Delete ${plural(n, 'punch', 'punches')}` : `Rerun ${plural(n, 'punch', 'punches')}`}</button>` : ''}
+        <button type="button" class="sm link" data-w="cancel">Cancel</button>
+      </div>`;
+    warn.hidden = false;
+    warn.querySelector('[data-w="go"]')?.addEventListener('click', (e) => send(e.currentTarget, action));
+    warn.querySelector('[data-w="cancel"]').addEventListener('click', hideWarn);
+    warn.querySelector('[data-w="deselect"]')?.addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      await deselectSynced();
+      ask(action);   // show what is left, ready to go
+    });
+    (warn.querySelector('[data-w="go"]') || warn.querySelector('[data-w="cancel"]')).focus();
+  };
+
+  async function deselectSynced() {
+    boxes.forEach((b) => { if (b.dataset.synced) b.checked = false; });
+    if (everything) {
+      const q = new URLSearchParams(Object.entries({ ...filter, exclude_synced: 'true' }).filter(([, v]) => v));
+      const fresh = await guard(() => api.get(`/punches/selectable?${q}`));
+      everything = fresh && fresh.matching ? { ...fresh, excludeSynced: true } : null;
+    }
+    paint();
+  }
+
+  // Any change to the ticks on the page goes back to "just these".
+  boxes.forEach((b) => b.addEventListener('change', () => { everything = null; hideWarn(); paint(); }));
+  all.addEventListener('change', () => {
+    everything = null;
+    hideWarn();
+    if (!boxes.length) { if (all.checked) selectEverything(); else paint(); return; }
+    boxes.forEach((b) => { b.checked = all.checked; }); paint();
+  });
+  $('#bulkClear', mount).addEventListener('click', () => { everything = null; boxes.forEach((b) => { b.checked = false; }); hideWarn(); paint(); });
+  async function selectEverything() {
+    everythingBtn.disabled = true;
+    all.disabled = true;
+    const q = new URLSearchParams(Object.entries(filter).filter(([, v]) => v));
+    const fresh = await guard(() => api.get(`/punches/selectable?${q}`));
+    everythingBtn.disabled = false;
+    all.disabled = false;
+    if (fresh && !fresh.matching) toast('No punch matches these filters.', 'ok');
+    everything = fresh && fresh.matching > boxes.length ? fresh : null;
+    hideWarn(); paint();
+  }
+  everythingBtn.addEventListener('click', selectEverything);
+
+  const send = async (button, action) => {
+    const fits = (b) => (action === 'delete' ? b.dataset.del : b.dataset.rerun);
+    const body = everything
+      ? { filter: { ...filter, exclude_synced: Boolean(everything.excludeSynced) }, action }
+      : { ids: chosen().filter(fits).map((b) => b.dataset.sel), action };
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Working…';
+    const r = await guard(() => api.post('/punches/bulk', body));
+    if (r) { toast(r.message, 'ok'); resetBulk(key); await rerender(); return; }
+    button.disabled = false;
+    button.textContent = label;
+  };
+  pendingBtn?.addEventListener('click', () => ask('pending'));
+  deleteBtn?.addEventListener('click', () => ask('delete'));
+  paint();
+}
+
 export async function renderActivity(mount, route) {
   const stateFilter = route.query.state || '';
   const badge = route.query.emp_code || '';
@@ -578,10 +753,14 @@ export async function renderActivity(mount, route) {
   if (from) params.set('date_from', from);
   if (to) params.set('date_to', to);
 
-  const [runs, punches, devices] = await Promise.all([
+  // The total behind the page: same filters, no limit (the list itself stops at ``limit``).
+  const countParams = new URLSearchParams(params);
+  countParams.delete('limit');
+  const [runs, punches, devices, totals] = await Promise.all([
     api.get('/sync/runs?limit=20'),
     api.get(`/punches?${params}`),
     api.get('/devices').catch(() => []),
+    view === 'punches' ? api.get(`/punches/selectable?${countParams}`).catch(() => null) : null,
   ]);
 
   const states = ['', 'pending', 'synced', 'unmapped', 'error', 'held', 'skipped', 'deleted'];
@@ -651,12 +830,18 @@ export async function renderActivity(mount, route) {
     return;
   }
 
+  // Every punch can be selected (for an export, say); each action then counts only the punches it
+  // applies to: Rerun the ones that never reached Odoo, Delete those that aren't deleted already.
+  const REQUEUE = ['error', 'skipped', 'unmapped', 'deleted'];
+  const DELETABLE = ['error', 'skipped', 'unmapped'];
+  const canRerun = (p) => !p.odoo_attendance_id && REQUEUE.includes(p.process_state);
+  const canDelete = (p) => !p.odoo_attendance_id && DELETABLE.includes(p.process_state);
+  const anySelectable = punches.length > 0;
+
   mount.innerHTML = `
     ${viewTabs}
     <div class="card">
-      <h2>Punch Ledger <span class="hint">${filtered
-        ? `${punches.length} punch${punches.length === 1 ? '' : 'es'} matching`
-        : 'every punch ever pulled'}</span></h2>
+      <h2>Punch Ledger <span class="hint" id="punchTotal">${ledgerCount(totals, punches.length, filtered || stateFilter)}</span></h2>
       ${shownRun ? `
         <div class="banner" style="margin:0 0 12px">
           <strong>The sync that started ${esc(fmtUtc(shownRun.started_at))}</strong>
@@ -700,14 +885,25 @@ export async function renderActivity(mount, route) {
         </div>
       </form>
       ${punches.length ? `
+        ${anySelectable ? `
+        <div class="bulk-bar" id="bulkBar" hidden role="region" aria-label="Selected punches">
+          <span class="bulk-count" id="bulkCount" aria-live="polite"></span>
+          <button type="button" class="sm link" id="bulkEverything" hidden></button>
+          ${auth.canWrite ? `<button type="button" class="sm" id="bulkPending"></button>
+          <button type="button" class="sm danger-outline" id="bulkDelete"></button>` : ''}
+          <button type="button" class="sm link" id="bulkClear">Clear selection</button>
+          <div class="bulk-warn" id="bulkWarn" hidden role="alert"></div>
+        </div>` : ''}
         <div class="scroll">
-          <table>
-            <thead><tr><th>Punch Time</th><th>Badge</th><th>Dir</th><th>Device</th><th>State</th><th class="num">Odoo</th><th>Detail</th><th></th></tr></thead>
+          <table class="punch-table">
+            <thead><tr><th>${anySelectable ? `<span class="sel-cell"><input type="checkbox" id="selAll" aria-label="Select every punch on this page"><span>Punch Time</span></span>` : 'Punch Time'}</th><th>Badge</th><th>Dir</th><th>Device</th><th>State</th><th class="num">Odoo</th><th>Detail</th><th></th></tr></thead>
             <tbody>
               ${punches.map((p) => `
-                <tr>
-                  <td><div class="mono">${esc(fmtUtc(p.punch_time_local || p.punch_time_utc))}</div>
-                      <div class="hint mono">${esc(fmtUtc(p.punch_time_utc))} UTC</div></td>
+                <tr data-row="${esc(p.id)}">
+                  <td>${anySelectable ? `<span class="sel-cell"><input type="checkbox" data-sel="${esc(p.id)}"
+                               ${canRerun(p) ? 'data-rerun="1"' : ''} ${canDelete(p) ? 'data-del="1"' : ''} ${p.odoo_attendance_id || p.process_state === 'synced' ? 'data-synced="1"' : ''}
+                               aria-label="Select the ${esc(p.emp_code)} punch at ${esc(fmtUtc(p.punch_time_local || p.punch_time_utc))}"><span>` : ''}<div class="mono">${esc(fmtUtc(p.punch_time_local || p.punch_time_utc))}</div>
+                      <div class="hint mono">${esc(fmtUtc(p.punch_time_utc))} UTC</div>${anySelectable ? '</span></span>' : ''}</td>
                   <td class="mono">${esc(p.emp_code)}</td>
                   <td>${esc(p.direction)}</td>
                   <td class="mono">${esc(p.terminal_sn || '—')}</td>
@@ -716,7 +912,8 @@ export async function renderActivity(mount, route) {
                   <td style="color:var(--muted);font-size:12.5px">${esc(p.error_message || '—')}</td>
                   <td class="actions-cell"><div class="row-actions">
                     ${auth.canWrite && !p.odoo_attendance_id && ['error', 'skipped', 'unmapped'].includes(p.process_state)
-                      ? `<button class="sm" data-retry="${esc(p.id)}">Retry</button>
+                      ? `<button type="button" class="icon-btn retry" data-retry="${esc(p.id)}" aria-label="Retry punch"
+                                 title="Retry — queue it again for the next sync.">${RETRY_ICON}</button>
                          <button type="button" class="icon-btn" data-delete="${esc(p.id)}" aria-label="Delete punch"
                                  title="Delete — removes it from the queue. It won't be pushed, and won't come back on the next sync.">${TRASH_ICON}</button>` : ''}
                     ${auth.canWrite && p.process_state === 'deleted'
@@ -729,7 +926,7 @@ export async function renderActivity(mount, route) {
         </div>
         ${punches.length >= limit && limit < 500 ? `
           <div class="row" style="justify-content:center;margin-top:12px">
-            <a class="btn" href="${linkFor({ limit: String(Math.min(limit + 100, 500)) })}">Show More</a>
+            <a class="btn" id="showMore" href="${linkFor({ limit: String(Math.min(limit + 100, 500)) })}">Show more</a>
           </div>` : punches.length >= 500 ? '<div class="hint" style="text-align:center;margin-top:10px">Showing the latest 500 — narrow the filters to see older ones.</div>' : ''}
         ` : empty(
           'No Punches',
@@ -748,16 +945,42 @@ export async function renderActivity(mount, route) {
   });
 
   wireRunLogs(mount);
+  // Show more loads the next rows under these without jumping back to the top; the selection
+  // carries over (see BULK).
+  $('#showMore', mount)?.addEventListener('click', async (event) => {
+    event.preventDefault();
+    const href = event.currentTarget.getAttribute('href');
+    const y = window.scrollY;
+    history.replaceState(null, '', href);
+    const query = Object.fromEntries(new URLSearchParams(href.split('?')[1] || ''));
+    await renderActivity(mount, { ...route, query });
+    window.scrollTo(0, y);
+  });
+
+  if (anySelectable) {
+    wireBulk(mount, () => renderActivity(mount, route), {
+      // What "every matching punch" means: the filters on screen, across all pages.
+      filter: { state: stateFilter || null, emp_code: badge || null, terminal_sn: terminal || null,
+                run_id: runId || null, date_from: from || null, date_to: to || null },
+      // A full page means there may be more beyond it.
+      mayHaveMore: punches.length >= limit,
+      total: totals?.matching,
+    });
+  }
 
   mount.querySelectorAll('[data-retry]').forEach((button) => {
-    button.addEventListener('click', () =>
-      busy(button, () =>
-        guard(async () => {
-          await api.post(`/punches/${button.dataset.retry}/retry`);
-          await renderActivity(mount, route);
-        }, 'Queued For The Next Sync')
-      )
-    );
+    // An icon button has no text for busy() to swap, so it is disabled while the request runs.
+    const iconOnly = button.classList.contains('icon-btn');
+    button.addEventListener('click', () => {
+      const run = () => guard(async () => {
+        await api.post(`/punches/${button.dataset.retry}/retry`);
+        await renderActivity(mount, route);
+      }, 'Queued For The Next Sync');
+      if (!iconOnly) return busy(button, run);
+      button.disabled = true;
+      button.classList.add('working');
+      return run().finally(() => { button.disabled = false; button.classList.remove('working'); });
+    });
   });
 
   // Two clicks, no confirm() dialog (nothing in this app uses one): the first

@@ -8,11 +8,11 @@ forget to call, and no placeholder that could be mistaken for a real value.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class ORMModel(BaseModel):
@@ -953,6 +953,53 @@ class MappingUpdate(BaseModel):
     status: Literal["mapped", "unmapped", "ignored", "ambiguous"] | None = None
     #: "Not the same person": drop the suggestion and do not make it again.
     dismiss_suggestion: bool = False
+
+
+class PunchFilterIn(BaseModel):
+    """The Activity ledger's filters, as on GET /punches."""
+
+    state: str | None = None
+    emp_code: str | None = None
+    terminal_sn: str | None = None
+    run_id: str | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+    #: Leave out punches already synced to Odoo ("Deselect synced punches").
+    exclude_synced: bool = False
+
+
+class PunchSelectableOut(BaseModel):
+    #: Every punch the filters match (what a selection covers, e.g. for an export); ``rerun`` and
+    #: ``delete`` are how many of them each action would change.
+    matching: int
+    rerun: int
+    delete: int
+    #: How many of ``matching`` are already in Odoo: never rerun or deleted.
+    synced: int = 0
+
+
+class PunchBulkIn(BaseModel):
+    """Several punches from the Activity list at once."""
+
+    #: The punches ticked on the page; or leave it out and send ``filter`` for every matching punch.
+    ids: list[str] | None = Field(default=None, min_length=1, max_length=500)
+    filter: PunchFilterIn | None = None
+    #: ``pending`` queues them again for the next sync (Retry / Restore); ``delete`` takes them out.
+    action: Literal["pending", "delete"]
+
+
+    @model_validator(mode="after")
+    def _one_target(self):
+        if (self.ids is None) == (self.filter is None):
+            raise ValueError("Send either ids or filter")
+        return self
+
+
+class PunchBulkOut(BaseModel):
+    changed: int
+    #: Punches that were not touched: already in Odoo, in a state the action doesn't apply to, or not found.
+    skipped: int
+    message: str
 
 
 class PunchOut(ORMModel):
