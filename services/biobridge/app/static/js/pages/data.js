@@ -119,6 +119,12 @@ export async function renderAttendance(mount, route) {
 
 function flags(record) {
   const out = [];
+  if (record.overtime_hours > 0) {
+    const ot = Number(record.overtime_hours);
+    const worked = Number(record.worked_hours || 0);
+    out.push(`<span class="pill" title="One shift here. In Odoo, its overtime rule split it into ${(worked - ot).toFixed(2)} h attendance and ${ot.toFixed(2)} h overtime.">A + OT ${ot.toFixed(2)} h</span>`);
+  }
+  if (record.origin === 'odoo') out.push('<span class="pill" title="Found in Odoo for a matched employee: entered there by hand, from a kiosk, or by another app. Not built from punches.">added in Odoo</span>');
   if (record.is_auto_closed) out.push('<span class="pill warn">auto-closed</span>');
   if (record.is_orphan_out) out.push('<span class="pill bad">orphan out</span>');
   return out.join(' ') || '<span class="pill ok">clean</span>';

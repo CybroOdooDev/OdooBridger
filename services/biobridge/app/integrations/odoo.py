@@ -899,9 +899,51 @@ class OdooClient:
             "hr.attendance",
             "search_read",
             [[("id", "in", list(attendance_ids)), *company_domain]],
-            {"fields": ["id", "check_in", "check_out"]},
+            {"fields": self._attendance_fields("id", "employee_id", "check_in", "check_out")},
         )
         return {int(r["id"]): r for r in rows}
+
+    # -- Odoo 20 time rules: one shift, several records ----------------------
+    def splits_shifts(self) -> bool:
+        """Whether this Odoo has time rules (Odoo 20+): a rule such as overtime cuts a
+        record at the employee's schedule and puts the rest in new records linked back
+        to it by ``source_attendance_id``. Those records are Odoo's workflow, not shifts
+        of their own."""
+        try:
+            return "source_attendance_id" in self.fields_of("hr.attendance")
+        except OdooError:
+            return False
+
+    def _attendance_fields(self, *names: str) -> list[str]:
+        fields = list(names)
+        if self.splits_shifts():
+            fields.append("source_attendance_id")
+        return fields
+
+    def attendance_pieces(self, root_ids: list[int]) -> list[dict[str, Any]]:
+        """The records Odoo's time rules made out of these ones (overtime and the like),
+        each with ``source_attendance_id`` naming the record it was cut from."""
+        ids = sorted({int(i) for i in root_ids if i})
+        if not ids or not self.splits_shifts():
+            return []
+        return self.execute(
+            "hr.attendance", "search_read",
+            [[("source_attendance_id", "in", ids)]],
+            {"fields": ["id", "check_in", "check_out", "source_attendance_id", "time_rule_id"],
+             "order": "check_in asc"},
+        ) or []
+
+    def time_rule_operators(self, rule_ids: list[int]) -> dict[int, str]:
+        """hr.time.rule id -> "exceed" (overtime) or "less_than" (undertime). Empty when
+        the rules can't be read with this user's rights."""
+        ids = sorted({int(i) for i in rule_ids if i})
+        if not ids:
+            return {}
+        try:
+            rows = self.execute("hr.time.rule", "read", [ids], {"fields": ["threshold_operator"]})
+        except OdooError:
+            return {}
+        return {int(r["id"]): r.get("threshold_operator") for r in rows or []}
 
     def open_attendances(self, employee_ids: list[int], started_before: datetime) -> list[dict[str, Any]]:
         """Every record still open for these employees that began before
@@ -937,7 +979,8 @@ class OdooClient:
                     "search_read",
                     [[("employee_id", "in", ids[start:start + 500]), ("write_date", ">=", fmt_dt(since)),
                       ("check_in", ">=", fmt_dt(check_in_from)), *company_domain]],
-                    {"fields": ["id", "employee_id", "check_in", "check_out", "write_date"],
+                    {"fields": self._attendance_fields("id", "employee_id", "check_in", "check_out",
+                                                       "write_date"),
                      "order": "write_date asc, id asc", "limit": 2000, "offset": offset},
                 )
                 out.extend(page)
@@ -958,6 +1001,62 @@ class OdooClient:
             "search_read",
             [[("employee_id", "=", employee_id), ("check_in", ">", fmt_dt(moment)), *company_domain]],
             {"fields": ["id", "check_in"], "limit": 1, "order": "check_in asc"},
+        )
+        return rows[0] if rows else None
+
+    def attendance_starting_between(self, employee_id: int, start: datetime, end: datetime) -> dict[str, Any] | None:
+        """The earliest record whose check-in falls in [start, end): first/last's record for
+        that shift day, looked up in Odoo itself rather than inferred from the local ledger."""
+        company_domain = self._company_domain(self.fields_of("hr.attendance"))
+        rows = self.execute(
+            "hr.attendance",
+            "search_read",
+            [[("employee_id", "=", employee_id), ("check_in", ">=", fmt_dt(start)),
+              ("check_in", "<", fmt_dt(end)), *company_domain]],
+            {"fields": ["id", "check_in", "check_out"], "limit": 1, "order": "check_in asc"},
+        )
+        return rows[0] if rows else None
+
+    def existing_attendance_ids(self, ids: list[int]) -> set[int]:
+        """Which of these hr.attendance ids still exist — a record deleted in Odoo is
+        simply absent from the answer."""
+        wanted = sorted({int(i) for i in ids if i})
+        if not wanted:
+            return set()
+        found = self.execute("hr.attendance", "search", [[("id", "in", wanted)]])
+        return {int(i) for i in (found or [])}
+
+    def attendances_starting_between(
+        self, employee_id: int, start: datetime, end: datetime
+    ) -> list[dict[str, Any]]:
+        """Every record whose check-in falls in [start, end), earliest first: all of a shift
+        day's records, where ``attendance_starting_between`` gives only the first."""
+        company_domain = self._company_domain(self.fields_of("hr.attendance"))
+        return self.execute(
+            "hr.attendance",
+            "search_read",
+            [[("employee_id", "=", employee_id), ("check_in", ">=", fmt_dt(start)),
+              ("check_in", "<", fmt_dt(end)), *company_domain]],
+            {"fields": self._attendance_fields("id", "check_in", "check_out"), "order": "check_in asc, id asc"},
+        ) or []
+
+    def attendance_overlapping(
+        self, employee_id: int, start: datetime, end: datetime, exclude_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """The earliest record, other than ``exclude_id``, that shares time with
+        [start, end) — the one Odoo's overlap check trips on when a record is written
+        with that span. Open records count as running on for ever."""
+        company_domain = self._company_domain(self.fields_of("hr.attendance"))
+        domain: list[Any] = [
+            ("employee_id", "=", employee_id), ("check_in", "<", fmt_dt(end)),
+            "|", ("check_out", "=", False), ("check_out", ">", fmt_dt(start)),
+            *company_domain,
+        ]
+        if exclude_id:
+            domain.append(("id", "!=", int(exclude_id)))
+        rows = self.execute(
+            "hr.attendance", "search_read", [domain],
+            {"fields": ["id", "check_in", "check_out"], "limit": 1, "order": "check_in asc"},
         )
         return rows[0] if rows else None
 

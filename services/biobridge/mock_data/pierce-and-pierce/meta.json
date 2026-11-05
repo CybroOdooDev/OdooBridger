@@ -1,0 +1,10 @@
+{
+  "tenant": "pierce-and-pierce",
+  "odoo": {
+    "url": "https://bio-bridge-v19.easyinstance.com",
+    "db": "ei_bio_bridge_v19"
+  },
+  "companies": [
+    1
+  ]
+}

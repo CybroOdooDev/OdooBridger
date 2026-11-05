@@ -124,6 +124,29 @@ services:
       MOCK_INTERVAL: ${MOCK_INTERVAL:-20}
     volumes: [mockdata:/data]
 
+  mock-biotime-pnp:
+    <<: *restart
+    profiles: [mock]
+    image: ${BIOBRIDGE_IMAGE:-odoobridger-biobridge:latest}
+    user: root                      # dev only: lets it write the data volume
+    working_dir: /app
+    depends_on:
+      postgres: {condition: service_healthy}
+    command: ["python", "tools/mock_biotime.py", "--tenant", "pierce-and-pierce",
+              "--host", "0.0.0.0", "--port", "8099", "--interval", "300",
+              "--tz", "Asia/Kolkata", "--data-dir", "/data"]
+    ports: ["8098:8099"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://odoobridger:${POSTGRES_PASSWORD}@postgres:5432/biobridge
+      JWT_SECRET: ${BIOBRIDGE_JWT_SECRET}
+      MASTER_ENCRYPTION_KEY: ${BIOBRIDGE_MASTER_KEY}
+      ODOO_URL: https://bio-bridge-v19.easyinstance.com
+      ODOO_DB: ei_bio_bridge_v19
+      ODOO_USER: beevi@cybrosys.com
+      ODOO_KEY: ${MOCK_ODOO_KEY:?set MOCK_ODOO_KEY}
+    volumes: [mockodoo:/data]
+
 volumes:
   pgdata:
   mockdata:
+  mockodoo: 

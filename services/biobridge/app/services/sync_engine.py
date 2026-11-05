@@ -26,6 +26,7 @@ import logging
 import time
 from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
+from datetime import time as _time
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -1488,15 +1489,44 @@ class SyncEngine:
         # inputs: they are never re-marked or re-skipped), and the day's one
         # record is then updated in place.
         day_record: dict[object, int] = {}
+        several_records: dict[object, list[dict]] = {}
+        deleted_in_odoo: set[int] = set()
+        earlier: list[PunchRecord] = []
         pairing_input = list(punches)
         if config.mode is PairingMode.first_last:
             earlier = self._synced_punches_for_days(punches, config)
             for p in earlier:
                 by_id[p.id] = p
             pairing_input += earlier
+            # The ledger remembers the record each punch went into, but someone may have
+            # deleted it in Odoo since. Writing to a deleted record fails on every retry
+            # ("Record does not exist"), so those ids are dropped: the day is written again
+            # from all of its punches, and the punches are pointed at the new record.
+            remembered = {p.odoo_attendance_id for p in earlier if p.odoo_attendance_id}
+            deleted_in_odoo = remembered - odoo.existing_attendance_ids(list(remembered)) if remembered else set()
             for p in sorted(earlier, key=lambda x: x.punch_time_utc):
-                if p.odoo_attendance_id:
+                if p.odoo_attendance_id and p.odoo_attendance_id not in deleted_in_odoo:
                     day_record.setdefault(day_of(p.punch_time_utc, config), p.odoo_attendance_id)
+            # The day's record may exist in Odoo without the ledger knowing (its punches were
+            # deleted or rerun here, a reinstall, a crash before the commit): Odoo decides.
+            # Without this, a later batch of the same day would open a second record.
+            for day in {day_of(p.punch_time_utc, config) for p in punches}:
+                start_local = datetime.combine(day, _time.min) + timedelta(hours=config.day_boundary_hour)
+                rows = [r for r in odoo.attendances_starting_between(
+                    employee_id, local_to_utc(start_local, config.timezone),
+                    local_to_utc(start_local + timedelta(days=1), config.timezone))
+                    if not self._source_of(r)]          # overtime pieces belong to their shift
+                if rows and day not in day_record:
+                    day_record[day] = int(rows[0]["id"])
+                if len(rows) > 1 and self._made_here(int(rows[-1]["id"])):
+                    # Several records already: the day was paired another way before the
+                    # account switched to first/last. One record from the first punch to
+                    # the last would overlap the others, so the latest one is extended.
+                    several_records[day] = [
+                        {"id": int(r["id"]), "check_in": parse_dt(r.get("check_in")),
+                         "check_out": parse_dt(r.get("check_out"))}
+                        for r in rows
+                    ]
 
         result = pair_punches(
             [
@@ -1522,9 +1552,18 @@ class SyncEngine:
         for warning in result.warnings:
             self._log(warning, "warning")
 
+        failed: list = []
         for interval in result.intervals:
+            target_id: int | None = None
+            day_rows = (several_records.get(day_of(interval.check_in, config))
+                        if config.mode is PairingMode.first_last else None)
             try:
-                if interval.closes_attendance_id is not None:
+                if day_rows:
+                    target_id = day_rows[-1]["id"]
+                    attendance_id = self._extend_latest_of_day(
+                        odoo, mapping, interval, day_rows, used_mode)
+                elif interval.closes_attendance_id is not None:
+                    target_id = interval.closes_attendance_id
                     # Closes a shift opened in an earlier cycle. No new record is
                     # created — this is the case a naive engine turns into a phantom.
                     self._clip_to_next_record(odoo, mapping, interval, interval.check_in)
@@ -1540,13 +1579,16 @@ class SyncEngine:
                 ):
                     # The day already has its record from an earlier cycle: move its
                     # check-in / check-out to the day's current first and last punch.
-                    odoo.update_attendance(
-                        day_id, interval.check_in, interval.check_out, pairing_mode=used_mode,
-                        auto_closed=interval.auto_closed,
-                    )
+                    target_id = day_id
+                    if not self._update_split_day(odoo, day_id, interval, used_mode):
+                        odoo.update_attendance(
+                            day_id, interval.check_in, interval.check_out, pairing_mode=used_mode,
+                            auto_closed=interval.auto_closed,
+                        )
                     attendance_id = day_id
                 else:
                     existing = odoo.attendance_exists(employee_id, interval.check_in)
+                    target_id = existing or None
                     if existing:
                         if interval.check_out:
                             self._clip_to_next_record(odoo, mapping, interval, interval.check_in)
@@ -1590,6 +1632,14 @@ class SyncEngine:
 
                 self._mark(by_id, interval, attendance_id)
                 self._record_interval(mapping, interval, attendance_id, by_id, used_mode)
+                if day_rows:
+                    self._settle_day_with_several_records(
+                        by_id, pending_ids, day_rows, day_of(interval.check_in, config), config)
+                if deleted_in_odoo:
+                    day = day_of(interval.check_in, config)
+                    for p in earlier:
+                        if p.odoo_attendance_id in deleted_in_odoo and day_of(p.punch_time_utc, config) == day:
+                            p.odoo_attendance_id = attendance_id
 
                 # Carry the open shift forward for the next cycle. This is the state
                 # that makes a later lone check-out resolvable.
@@ -1603,14 +1653,218 @@ class SyncEngine:
                 # One interval Odoo refuses must not take the employee's other
                 # intervals down with it: only its own punches are marked, the
                 # rest of the batch is still sent.
-                self._interval_failed(mapping, interval, by_id, pending_ids, exc)
+                failed.append(interval)
+                self._interval_failed(mapping, interval, by_id, pending_ids,
+                                      self._explain_blocked(odoo, mapping, interval, exc, target_id))
+
+        if deleted_in_odoo:
+            # The local copies of the deleted records would show next to the re-written day.
+            gone = self.db.scalars(select(AttendanceRecord).where(
+                AttendanceRecord.tenant_id == self.tenant.id,
+                AttendanceRecord.odoo_attendance_id.in_(deleted_in_odoo))).all()
+            for row in gone:
+                self.db.delete(row)
+            self._log(f"{mapping.emp_code}: attendance {', '.join(map(str, sorted(deleted_in_odoo)))} "
+                      "was deleted in Odoo; the day was written again from its punches", "warning")
 
         if config.mode is PairingMode.first_last:
-            self._settle_covered_punches(punches, result.intervals, by_id)
+            # Punches inside a day whose record could not be written are not settled: they
+            # show the error and are tried again, instead of reading as synced while the
+            # day's record in Odoo is stuck.
+            self._settle_covered_punches(punches, [i for i in result.intervals if i not in failed], by_id)
+            for interval in failed:
+                self._fail_covered_punches(punches, interval, pending_ids)
 
         mapping.last_synced_at = datetime.now(timezone.utc)
         if punches:
             mapping.last_punch_at = max(p.punch_time_utc for p in punches)
+
+    def _explain_blocked(
+        self, odoo: OdooClient, mapping: EmployeeMapping, interval, exc: OdooError,
+        target_id: int | None = None,
+    ) -> OdooError:
+        """Odoo's "already checked in on <time>" names the symptom; say which record is in
+        the way and who made it, so the fix (adjust or remove it in Odoo) is clear from the
+        Activity page. The record being written is never the one named: Odoo refuses the
+        write because of a *different* record inside the new span."""
+        if "already checked in" not in str(exc) or interval.check_out is None:
+            return exc
+        try:
+            other = odoo.attendance_overlapping(
+                mapping.odoo_employee_id, interval.check_in, interval.check_out, exclude_id=target_id)
+        except OdooError:
+            return exc
+        if other is None:
+            return exc
+        starts, ends = parse_dt(other.get("check_in")), parse_dt(other.get("check_out"))
+        if starts is None:
+            return exc
+        tz = self.tenant.timezone
+        span = f"{utc_to_local(starts, tz):%Y-%m-%d %H:%M}"
+        span += f" to {utc_to_local(ends, tz):%H:%M}" if ends else " (still open)"
+        made = ("made by BioBridge from earlier punches" if self._made_here(int(other["id"]))
+                else "entered in Odoo, not made from punches")
+        what = f"attendance {target_id}" if target_id else "the record"
+        return OdooError(
+            f"Can't write {what} as {utc_to_local(interval.check_in, tz):%H:%M} to "
+            f"{utc_to_local(interval.check_out, tz):%H:%M}: Odoo has another record for this "
+            f"employee inside that time, {span} (attendance {other['id']}, {made}). "
+            "Adjust or remove that record in Odoo, then retry."
+        )
+
+    @staticmethod
+    def _source_of(row: dict) -> int | None:
+        """The record an Odoo time rule cut this one from, or None for a shift's own record."""
+        src = row.get("source_attendance_id")
+        if isinstance(src, (list, tuple)):
+            src = src[0] if src else None
+        return int(src) if src else None
+
+    def _whole_shifts(self, odoo: OdooClient, roots: dict[int, dict]) -> dict[int, tuple]:
+        """root id -> (check_in, check_out, id of the record holding the check-out, overtime
+        hours): the shift as punched, put back together from the record BioBridge wrote and the pieces
+        Odoo's time rules cut from it. Only pieces that continue the shift count: an
+        undertime record Odoo places in a free slot elsewhere is not part of it."""
+        if not roots:
+            return {}
+        pieces = odoo.attendance_pieces(list(roots))
+        rule_ids = []
+        for p in pieces:
+            rule = p.get("time_rule_id")
+            rule_ids.append(rule[0] if isinstance(rule, (list, tuple)) and rule else rule)
+        operators = odoo.time_rule_operators([r for r in rule_ids if r]) if any(rule_ids) else {}
+        by_root: dict[int, list[dict]] = {}
+        for p, rule in zip(pieces, rule_ids):
+            if rule and operators.get(int(rule)) == "less_than":
+                continue
+            by_root.setdefault(self._source_of(p), []).append(p)
+        out = {}
+        for rid, r in roots.items():
+            start, end, end_id = parse_dt(r.get("check_in")), parse_dt(r.get("check_out")), rid
+            overtime = 0.0
+            for p in sorted(by_root.get(rid, []), key=lambda x: x.get("check_in") or ""):
+                p_in, p_out = parse_dt(p.get("check_in")), parse_dt(p.get("check_out"))
+                if end is None or p_in is None or p_out is None:
+                    break
+                if p_in <= end + timedelta(seconds=1) and p_out > end:
+                    if p.get("time_rule_id"):          # a rule's output; a remainder keeps the normal type
+                        overtime += (p_out - max(p_in, end)).total_seconds() / 3600
+                    end, end_id = p_out, int(p["id"])
+            out[rid] = (start, end, end_id, round(overtime, 4) or None)
+        return out
+
+    def _pieces_copied_here_before(self, odoo: OdooClient, floor: datetime) -> dict[int, int]:
+        """Odoo pieces an earlier version copied in as "added in Odoo" rows: piece id ->
+        the record it was cut from."""
+        ids = [r for r in self.db.scalars(select(AttendanceRecord.odoo_attendance_id).where(
+            AttendanceRecord.tenant_id == self.tenant.id, AttendanceRecord.origin == "odoo",
+            AttendanceRecord.odoo_attendance_id.is_not(None), AttendanceRecord.check_in >= floor))]
+        if not ids:
+            return {}
+        return {i: self._source_of(r) for i, r in odoo.attendances_by_id(ids).items() if self._source_of(r)}
+
+    def _update_split_day(self, odoo: OdooClient, day_id: int, interval, used_mode: str) -> bool:
+        """First/last on a day Odoo's time rules have already split. The day's record ends
+        where the customer's rule cut it, and the overtime record after it carries the rest,
+        so writing the whole day onto the first record would collide with that overtime
+        (Odoo refuses the overlap) and undo the customer's workflow. Instead only what moved
+        is written: an earlier first punch on the day's record, a later last punch on the
+        record that now ends the shift. Odoo's rules then run on those writes as usual.
+        Returns False when the day isn't split, for the ordinary in-place update."""
+        if not odoo.splits_shifts():
+            return False
+        root = odoo.attendances_by_id([day_id]).get(day_id)
+        if root is None:
+            return False
+        start, end, end_id, _ot = self._whole_shifts(odoo, {day_id: root})[day_id]
+        if end_id == day_id or start is None or end is None:
+            return False
+        if interval.check_in < start:
+            odoo.update_attendance(day_id, check_in=interval.check_in, pairing_mode=used_mode)
+            start = interval.check_in
+        if interval.check_out is not None and interval.check_out > end:
+            odoo.update_attendance(end_id, check_out=interval.check_out, auto_closed=interval.auto_closed)
+            end = interval.check_out
+        interval.check_in, interval.check_out = start, end
+        return True
+
+    def _made_here(self, attendance_id: int) -> bool:
+        """Whether BioBridge wrote this Odoo record from punches (not one it only copied
+        from Odoo as "added in Odoo")."""
+        row = self.db.scalars(select(AttendanceRecord).where(
+            AttendanceRecord.tenant_id == self.tenant.id,
+            AttendanceRecord.odoo_attendance_id == attendance_id)).first()
+        return row is not None and row.origin != "odoo"
+
+    def _extend_latest_of_day(
+        self, odoo: OdooClient, mapping: EmployeeMapping, interval, rows: list[dict], used_mode: str,
+    ) -> int:
+        """First/last on a day that already holds several records — written under the
+        pairing method the account used before switching. Rebuilding the day as one
+        record from its first to its last punch would overlap the others, which Odoo
+        refuses, so the day's latest record (BioBridge's own) takes the new last punch
+        as its check-out and the earlier records stay as they are.
+
+        ``interval`` is rewritten to what Odoo now holds for that record, so the mirror
+        and the open-shift carried forward describe it rather than the whole day.
+        """
+        latest = rows[-1]
+        rec_in, rec_out = latest["check_in"], latest["check_out"]
+        end = interval.check_out
+        interval.check_in = rec_in
+        interval.notes.append(
+            f"This day already had {len(rows)} records from before first-in/last-out; "
+            "the latest one was extended")
+        if end is not None and end > rec_in and (rec_out is None or end > rec_out):
+            self._clip_to_next_record(odoo, mapping, interval, rec_in)
+            odoo.close_attendance(latest["id"], interval.check_out, pairing_mode=used_mode,
+                                  auto_closed=interval.auto_closed)
+            latest["check_out"] = interval.check_out
+            self.run.attendances_closed += 1
+        else:
+            interval.check_out = rec_out   # nothing later than what Odoo has: leave it
+        return latest["id"]
+
+    def _settle_day_with_several_records(
+        self, by_id: dict[str, PunchRecord], pending_ids: set, rows: list[dict], day,
+        config: PairingConfig,
+    ) -> None:
+        """The punches of such a day, once its latest record is written: each one inside
+        one of the day's records is synced against that record; one outside all of them
+        (before the first, or in a gap the earlier method left) is skipped with the
+        reason, instead of erroring on every cycle."""
+        for punch in by_id.values():
+            if punch.id not in pending_ids or day_of(punch.punch_time_utc, config) != day:
+                continue
+            at = punch.punch_time_utc
+            holder = next((r for r in rows if r["check_in"] <= at
+                           and (r["check_out"] is None or at <= r["check_out"])), None)
+            if holder is not None:
+                punch.process_state = PunchState.synced.value
+                punch.odoo_attendance_id = holder["id"]
+                punch.error_message = None
+            else:
+                punch.process_state = PunchState.skipped.value
+                punch.odoo_attendance_id = None
+                punch.error_message = ("Not added: this day's records were made before the switch "
+                                       "to first-in/last-out, and this punch falls outside them")
+
+    def _fail_covered_punches(self, punches: list[PunchRecord], interval, pending_ids: set) -> None:
+        """The pending punches a failed first/last interval covers carry its error too."""
+        end = interval.check_out
+        message = None
+        for punch in punches:
+            if punch.id not in pending_ids or punch.process_state in (PunchState.synced.value, PunchState.skipped.value):
+                continue
+            if punch.process_state == PunchState.error.value and punch.error_message:
+                message = message or punch.error_message
+        for punch in punches:
+            if punch.id not in pending_ids or punch.process_state != PunchState.pending.value:
+                continue
+            if interval.check_in <= punch.punch_time_utc and (end is None or punch.punch_time_utc <= end):
+                punch.process_state = PunchState.error.value
+                punch.error_message = message or "The day's attendance record could not be written in Odoo"
+                punch.attempts += 1
 
     def _interval_failed(
         self, mapping: EmployeeMapping, interval, by_id: dict[str, PunchRecord],
@@ -1854,7 +2108,28 @@ class SyncEngine:
             last = self.tenant.odoo_attendance_synced_at
             since = (last - self.FOLLOW_ODOO_OVERLAP) if last else floor
             rows = odoo.attendances_changed_since(list(mappings), since, floor)
+            spans: dict[int, tuple] = {}
+            pieces: set[int] = set()
+            if odoo.splits_shifts():
+                # Odoo 20's time rules cut a long shift into attendance + overtime records.
+                # That is the customer's workflow in Odoo; here it stays one shift, so a
+                # piece is never a row of its own, and a changed piece refreshes its shift.
+                roots = {int(r["id"]): r for r in rows if not self._source_of(r)}
+                pieces = {int(r["id"]): self._source_of(r) for r in rows if self._source_of(r)}
+                # Rows an earlier version copied in for pieces go too, and their shifts are
+                # read again: Odoo won't list those as changed, and they still end at the cut.
+                pieces.update(self._pieces_copied_here_before(odoo, floor))
+                missing = set(pieces.values()) - set(roots)
+                if missing:
+                    roots.update(odoo.attendances_by_id(sorted(missing)))
+                spans = self._whole_shifts(odoo, roots)
+                rows = list(roots.values())
             with self.db.begin_nested():   # a database error here undoes only this step
+                if pieces:
+                    for stale in self.db.scalars(select(AttendanceRecord).where(
+                            AttendanceRecord.tenant_id == self.tenant.id,
+                            AttendanceRecord.odoo_attendance_id.in_(list(pieces)))).all():
+                        self.db.delete(stale)
                 known = {r.odoo_attendance_id: r for r in self.db.scalars(select(AttendanceRecord).where(
                     AttendanceRecord.tenant_id == self.tenant.id,
                     AttendanceRecord.odoo_attendance_id.in_([int(r["id"]) for r in rows] or [0])))}
@@ -1864,11 +2139,15 @@ class SyncEngine:
                     emp = rec.get("employee_id")
                     mapping = mappings.get(int(emp[0] if isinstance(emp, (list, tuple)) else emp))
                     check_in = parse_dt(rec.get("check_in"))
+                    check_out = parse_dt(rec.get("check_out"))
+                    overtime = None
+                    if int(rec["id"]) in spans:
+                        check_in, check_out, _end_id, overtime = spans[int(rec["id"])]
                     if mapping is None or check_in is None:
                         continue
-                    check_out = parse_dt(rec.get("check_out"))
                     row = known.get(int(rec["id"]))
-                    if row is not None and row.check_in == check_in and row.check_out == check_out:
+                    if (row is not None and row.check_in == check_in and row.check_out == check_out
+                            and row.overtime_hours == overtime):
                         continue
                     if row is None:
                         row = AttendanceRecord(tenant_id=self.tenant.id, odoo_attendance_id=int(rec["id"]),
@@ -1887,6 +2166,7 @@ class SyncEngine:
                     row.check_out_local = utc_to_local(check_out, tz) if check_out else None
                     row.shift_date = row.check_in_local.strftime("%Y-%m-%d")
                     row.worked_hours = (check_out - check_in).total_seconds() / 3600 if check_out else None
+                    row.overtime_hours = overtime
                 self.tenant.odoo_attendance_synced_at = started
                 self.db.flush()
                 if added or updated:
@@ -1957,11 +2237,16 @@ class SyncEngine:
         except OdooError as exc:
             log.warning("open-record refresh skipped for %s: %s", self.tenant.slug, exc)
             return
+        spans = (self._whole_shifts(odoo, {i: r for i, r in live.items() if r.get("check_out")})
+                 if odoo.splits_shifts() else {})
         limit = timedelta(hours=self.tenant.max_shift_hours)
         fixed = 0
         for row in rows:
             found = live.get(row.odoo_attendance_id)
             end = parse_dt(found.get("check_out")) if found else None
+            if row.odoo_attendance_id in spans:
+                end = spans[row.odoo_attendance_id][1]
+                row.overtime_hours = spans[row.odoo_attendance_id][3]
             if end is None:
                 continue
             row.check_out = end

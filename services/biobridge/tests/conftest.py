@@ -183,6 +183,52 @@ class FakeOdoo:
         #: Every company the Odoo user can see, as list_companies() answers;
         #: empty by default so scope-None means "a single-company Odoo".
         self.companies: list[dict] = []
+        #: Odoo 20's overtime time rule: a closed record longer than this many hours is
+        #: cut there, and the rest becomes a separate record linked back to it
+        #: (source_attendance_id). None = an Odoo without time rules.
+        self.split_after_hours: float | None = None
+
+    def _fmt_row(self, rec):
+        fmt = "%Y-%m-%d %H:%M:%S"
+        row = {"id": rec["id"], "check_in": rec["check_in"].strftime(fmt),
+               "check_out": rec["check_out"].strftime(fmt) if rec["check_out"] else False}
+        if self.split_after_hours is not None:
+            src = rec.get("source_attendance_id")
+            row["source_attendance_id"] = [src, "x"] if src else False
+            row["time_rule_id"] = [rec["time_rule_id"], "Overtime"] if rec.get("time_rule_id") else False
+        return row
+
+    def _apply_time_rules(self, attendance_id):
+        """What hr.time.rule does on a write: cut the source at the schedule and put the
+        excess in a new, linked record. Earlier pieces are left in place (Odoo only flags
+        them stale)."""
+        if self.split_after_hours is None:
+            return
+        rec = self.attendances.get(attendance_id)
+        if rec is None or rec.get("source_attendance_id") or rec["check_out"] is None:
+            return
+        limit = rec["check_in"] + timedelta(hours=self.split_after_hours)
+        if rec["check_out"] <= limit:
+            return
+        end = rec["check_out"]
+        rec["check_out"] = limit
+        self._next_id += 1
+        self.attendances[self._next_id] = {
+            "id": self._next_id, "employee_id": rec["employee_id"], "check_in": limit,
+            "check_out": end, "ref": None, "device_id": None, "pairing_mode": None,
+            "auto_closed": False, "source_attendance_id": attendance_id, "time_rule_id": 1,
+        }
+
+    def time_rule_operators(self, rule_ids):
+        return {}
+
+    def splits_shifts(self):
+        return self.split_after_hours is not None
+
+    def attendance_pieces(self, root_ids):
+        wanted = set(root_ids)
+        return [self._fmt_row(r) for r in self.attendances.values()
+                if r.get("source_attendance_id") in wanted]
 
     def list_companies(self):
         return self.companies
@@ -230,11 +276,12 @@ class FakeOdoo:
     def attendances_changed_since(self, employee_ids, since, check_in_from):
         wanted = set(employee_ids)
         fmt = lambda v: v.strftime("%Y-%m-%d %H:%M:%S") if v else False  # noqa: E731
+        only = getattr(self, "changed_only", None)    # a test can narrow it to what "changed"
         return [
-            {"id": rec["id"], "employee_id": [rec["employee_id"], "x"],
-             "check_in": fmt(rec["check_in"]), "check_out": fmt(rec["check_out"])}
+            {**self._fmt_row(rec), "employee_id": [rec["employee_id"], "x"]}
             for rec in sorted(self.attendances.values(), key=lambda r: r["id"])
             if rec["employee_id"] in wanted and rec["check_in"] >= check_in_from
+            and (only is None or rec["id"] in only)
         ]
 
     def open_attendances(self, employee_ids, started_before):
@@ -259,16 +306,8 @@ class FakeOdoo:
         return None
 
     def attendances_by_id(self, attendance_ids):
-        fmt = "%Y-%m-%d %H:%M:%S"
-        return {
-            i: {
-                "id": i,
-                "check_in": self.attendances[i]["check_in"].strftime(fmt),
-                "check_out": self.attendances[i]["check_out"].strftime(fmt)
-                if self.attendances[i]["check_out"] else False,
-            }
-            for i in attendance_ids if i in self.attendances
-        }
+        return {i: {**self._fmt_row(self.attendances[i]), "employee_id": [self.attendances[i]["employee_id"], "x"]}
+                for i in attendance_ids if i in self.attendances}
 
     def attendance_covering(self, employee_id, moment):
         """Mirrors OdooClient.attendance_covering: the latest record starting at
@@ -327,7 +366,40 @@ class FakeOdoo:
             "auto_closed": auto_closed,
         }
         self.calls.append(f"create:{self._next_id}")
-        return self._next_id
+        new_id = self._next_id
+        self._apply_time_rules(new_id)
+        return new_id
+
+    def attendance_starting_between(self, employee_id, start, end):
+        rows = [r for r in self.attendances.values()
+                if r["employee_id"] == employee_id and start <= r["check_in"] < end]
+        if not rows:
+            return None
+        first = min(rows, key=lambda r: r["check_in"])
+        fmt = "%Y-%m-%d %H:%M:%S"
+        return {"id": first["id"], "check_in": first["check_in"].strftime(fmt),
+                "check_out": first["check_out"].strftime(fmt) if first["check_out"] else False}
+
+    def existing_attendance_ids(self, ids):
+        return {int(i) for i in ids if int(i) in self.attendances}
+
+    def attendances_starting_between(self, employee_id, start, end):
+        fmt = "%Y-%m-%d %H:%M:%S"
+        rows = sorted((r for r in self.attendances.values()
+                       if r["employee_id"] == employee_id and start <= r["check_in"] < end),
+                      key=lambda r: (r["check_in"], r["id"]))
+        return [self._fmt_row(r) for r in rows]
+
+    def attendance_overlapping(self, employee_id, start, end, exclude_id=None):
+        fmt = "%Y-%m-%d %H:%M:%S"
+        rows = [r for r in self.attendances.values()
+                if r["employee_id"] == employee_id and r["id"] != exclude_id
+                and r["check_in"] < end and (r["check_out"] is None or r["check_out"] > start)]
+        if not rows:
+            return None
+        first = min(rows, key=lambda r: r["check_in"])
+        return {"id": first["id"], "check_in": first["check_in"].strftime(fmt),
+                "check_out": first["check_out"].strftime(fmt) if first["check_out"] else False}
 
     def attendance_after(self, employee_id, moment):
         later = [
@@ -356,6 +428,7 @@ class FakeOdoo:
         if pairing_mode:
             self.attendances[attendance_id]["pairing_mode"] = pairing_mode
         self.calls.append(f"close:{attendance_id}")
+        self._apply_time_rules(attendance_id)
         return True
 
     def attendance_pairing_methods(self, attendance_ids):
@@ -365,7 +438,21 @@ class FakeOdoo:
         self, attendance_id, check_in=None, check_out=None, reopen=False, pairing_mode=None,
         auto_closed=False,
     ):
+        if attendance_id not in self.attendances:
+            from app.integrations.odoo import OdooError
+            raise OdooError("Odoo hr.attendance.write failed: Record does not exist or has been deleted. "
+                            f"(Record: hr.attendance({attendance_id},), User: 2)")
         rec = self.attendances[attendance_id]
+        if check_out is not None:
+            # Same rule as close_attendance: a check-out may not reach past the next record.
+            start = check_in if check_in is not None else rec["check_in"]
+            for other in self.attendances.values():
+                if (other["id"] != attendance_id and other["employee_id"] == rec["employee_id"]
+                        and start < other["check_in"] < check_out):
+                    from app.integrations.odoo import OdooError
+                    raise OdooError(
+                        "Odoo hr.attendance.write failed: Cannot create new attendance record for "
+                        f"{rec['employee_id']}, the employee was already checked in on {other['check_in']}")
         if pairing_mode:
             rec["pairing_mode"] = pairing_mode
         if check_in is not None:
@@ -375,6 +462,7 @@ class FakeOdoo:
         elif reopen:
             rec["check_out"] = None
         self.calls.append(f"update:{attendance_id}")
+        self._apply_time_rules(attendance_id)
         return True
 
     def create_employee(self, name, emp_code):  # pragma: no cover
@@ -382,7 +470,8 @@ class FakeOdoo:
 
     # Introspection used by the engine's companion-addon check.
     def fields_of(self, model):
-        return {"check_in", "check_out", "employee_id"}
+        base = {"check_in", "check_out", "employee_id"}
+        return base | {"source_attendance_id"} if self.split_after_hours is not None else base
 
     # Stands in for the optional biobridge_attendance add-on's model. Keyed
     # on serial number, same identity BioBridge's own Device row uses, so a

@@ -1051,6 +1051,7 @@ class AttendanceOut(ORMModel):
     is_orphan_out: bool
     notes: str | None
     origin: str = "biobridge"
+    overtime_hours: float | None = None
 
 
 class ScheduleOut(BaseModel):

@@ -223,6 +223,9 @@ class AttendanceRecord(Base, UUIDPk, Timestamped):
     is_late: Mapped[bool] = mapped_column(Boolean, default=False)
     late_minutes: Mapped[int] = mapped_column(Integer, default=0)
     notes: Mapped[str | None] = mapped_column(Text)
+    #: Hours of this shift that Odoo's time rules (Odoo 20+) moved into overtime
+    #: records of their own. The shift stays one row here; this is the "A + OT" remark.
+    overtime_hours: Mapped[float | None] = mapped_column(Float)
     #: "biobridge" (written by a sync) or "odoo" (found in Odoo for a matched
     #: employee: entered by hand, from a kiosk, or split there). Odoo is the
     #: record of truth, so the copy here follows it either way.
