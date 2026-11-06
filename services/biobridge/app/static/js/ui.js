@@ -60,9 +60,12 @@ export function fmtIn(value) {
   return `in ${plural(Math.round(seconds / 86400), 'day')}`;
 }
 
+/** A duration given in hours, as "4 h 20 m" (rounded to the minute). */
 export function fmtHours(value) {
-  if (value === null || value === undefined) return '—';
-  return `${Number(value).toFixed(2)} h`;
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+  const minutes = Math.round(Math.abs(Number(value)) * 60);
+  const sign = Number(value) < 0 && minutes ? '-' : '';
+  return `${sign}${Math.floor(minutes / 60)} h ${minutes % 60} m`;
 }
 
 export function todayISO(offsetDays = 0) {
@@ -87,14 +90,14 @@ export const pill = (state, label) =>
 /* --- components ----------------------------------------------------------- */
 /** A number tile. With ``href`` the whole tile is a link to the list behind
  * the number — "2 errors" should take you to the two errors. */
-export const stat = ({ label, value, note, tone: t, href }) => {
+export const stat = ({ label, value, note, tone: t, href, tip, id }) => {
   const inner = `
     <div class="k">${esc(label)}</div>
     <div class="v ${t || ''}">${esc(value)}</div>
-    ${note ? `<div class="note">${esc(note)}</div>` : ''}`;
+    ${[].concat(note || []).map((n) => `<div class="note">${esc(n)}</div>`).join('')}`;
   return href
-    ? `<a class="stat stat-link" href="${esc(href)}">${inner}<span class="stat-go" aria-hidden="true">&rsaquo;</span></a>`
-    : `<div class="stat">${inner}</div>`;
+    ? `<a class="stat stat-link"${id ? ` id="${esc(id)}"` : ''} href="${esc(href)}"${tip ? ` data-tip="${esc(tip)}"` : ''}>${inner}<span class="stat-go" aria-hidden="true">&rsaquo;</span></a>`
+    : `<div class="stat"${id ? ` id="${esc(id)}"` : ''}${tip ? ` data-tip="${esc(tip)}"` : ''}>${inner}</div>`;
 };
 
 export const empty = (title, body) => `

@@ -260,6 +260,36 @@ def test_service_readiness_is_shown_and_its_auth_failure_marks_the_connection(cl
     assert r.json()["connections"][0]["services"][0]["ready"] is True
 
 
+def test_a_service_signing_in_again_clears_the_failure(client, catalog, odoo, service_app):
+    """The service saw Odoo refuse the key (the core marked the connection failed); once
+    it reports Odoo ready again, the core re-tests on its own instead of staying failed
+    until someone presses Test. A key that still fails the core's own test stays failed."""
+    from obcore.services.jobs import refresh_odoo_readiness
+
+    headers = signup(client)
+    connect(client, headers)
+    service_app.readiness = {"ready": False, "message": "Odoo rejected the API key.", "auth_failed": True}
+    db = SessionLocal()
+    refresh_odoo_readiness(db, now=utcnow() + timedelta(hours=1))
+    db.commit()
+    assert db.query(OdooConnection).one().status == "failed"
+
+    # Still refused by Odoo itself: the service's word alone does not clear it.
+    odoo["acme.odoo.com"].key = "rotated-elsewhere-1"
+    service_app.readiness = {"ready": True, "message": "Ready.", "auth_failed": False}
+    refresh_odoo_readiness(db, now=utcnow() + timedelta(hours=2))
+    db.commit()
+    assert db.query(OdooConnection).one().status == "failed"
+
+    # Odoo accepts the key again: the connection recovers by itself.
+    odoo["acme.odoo.com"].key = GOOD_KEY
+    refresh_odoo_readiness(db, now=utcnow() + timedelta(hours=3))
+    db.commit()
+    row = db.query(OdooConnection).one()
+    assert row.status == "connected" and row.failing_since is None
+    db.close()
+
+
 def test_key_expiry_is_warned_once(client, catalog, odoo):
     headers = signup(client)
     soon = (utcnow() + timedelta(days=5)).date().isoformat()

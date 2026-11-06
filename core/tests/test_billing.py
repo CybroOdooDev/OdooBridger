@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
+import pytest
+
 from obcore.db import SessionLocal
 from obcore.models import AccountService
 from obcore.security import utcnow
@@ -169,6 +171,30 @@ def test_staff_overrides_reach_the_service(client, catalog, service_app):
     client.patch(f"/api/v1/staff/accounts/{account_id}/services/biometric", headers=staff,
                  json={"entitlement_overrides": {"max_devices": 8}})
     assert service_app.accounts[account_id]["entitlements"] == {"max_devices": 8, "max_employees": 50}
+
+
+@pytest.mark.parametrize("bad", [-1, 0, 2.5, "ten"])
+def test_staff_overrides_the_service_cannot_use_are_refused(client, catalog, service_app, bad):
+    """A custom limit reaches the service verbatim: 0 would read as "no limit" there,
+    and a negative, a fraction or text would fail every provisioning call."""
+    headers = signup(client)
+    account_id = _account(client, headers)["id"]
+    staff = staff_headers(client)
+    r = client.patch(f"/api/v1/staff/accounts/{account_id}/services/biometric", headers=staff,
+                     json={"entitlement_overrides": {"max_devices": bad}})
+    assert r.status_code == 400 and "max_devices" in r.json()["detail"]
+    assert service_app.accounts[account_id]["entitlements"].get("max_devices") != bad
+
+
+def test_a_blank_override_falls_back_to_the_package(client, catalog, service_app):
+    headers = signup(client)
+    account_id = _account(client, headers)["id"]
+    staff = staff_headers(client)
+    url = f"/api/v1/staff/accounts/{account_id}/services/biometric"
+    client.patch(url, headers=staff, json={"entitlement_overrides": {"max_devices": 8}})
+    r = client.patch(url, headers=staff, json={"entitlement_overrides": {"max_devices": None}})
+    assert r.status_code == 200, r.text
+    assert service_app.accounts[account_id]["entitlements"]["max_devices"] == 2
 
 
 def test_checkout_without_stripe_says_so(client, catalog):

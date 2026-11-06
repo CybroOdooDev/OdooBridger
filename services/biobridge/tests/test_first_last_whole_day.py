@@ -144,3 +144,18 @@ def test_records_are_stamped_with_the_method_that_wrote_them(db, tenant, local_d
     from app.models import AttendanceRecord
     local = sorted(r.pairing_mode for r in db.scalars(select(AttendanceRecord)))
     assert local == ["alternating", "first_last"]
+
+
+def test_a_run_that_only_moves_the_days_record_counts_it_as_updated(db, tenant, local_day, monkeypatch):
+    """New punches, nothing created or closed: the Overview needs to say they updated an existing record."""
+    _first_last(db, tenant)
+    odoo = FakeOdoo()
+    d = local_day
+    rows = [punch("u1", "1001", d.replace(hour=8, minute=0)), punch("u2", "1001", d.replace(hour=8, minute=10))]
+    first = cycle(db, tenant, odoo, rows, monkeypatch)
+    assert first.attendances_created == 1 and first.attendances_updated == 0
+
+    rows += [punch("u3", "1001", d.replace(hour=17, minute=0))]
+    second = cycle(db, tenant, odoo, rows, monkeypatch)
+    assert second.punches_new == 1 and second.attendances_created == 0
+    assert second.attendances_updated == 1

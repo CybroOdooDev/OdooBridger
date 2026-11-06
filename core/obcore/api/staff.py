@@ -297,6 +297,9 @@ def update_subscription(account_id: str, slug: str, payload: SubscriptionPatch, 
     account = _account(db, account_id)
     row = _subscription(account, slug)
     data = payload.model_dump(exclude_unset=True)
+    # Checked before anything changes — a package change may already reach Stripe.
+    overrides = (_clean_entitlements(payload.entitlement_overrides or {})
+                 if "entitlement_overrides" in data else None)
     try:
         if payload.package_id:
             package = db.get(ServicePackage, payload.package_id)
@@ -313,8 +316,9 @@ def update_subscription(account_id: str, slug: str, payload: SubscriptionPatch, 
                     and row.status == ServiceStatus.past_due.value and not row.stripe_item_id:
                 row.status = ServiceStatus.trialing.value   # extending an ended trial reopens it
         if "entitlement_overrides" in data:
-            row.entitlement_overrides = {k: v for k, v in (payload.entitlement_overrides or {}).items()
-                                         if v is not None and v != ""} or None
+            # The same checks as a package's limits: a custom limit reaches the service verbatim,
+            # and one it can't use (a negative, a fraction, text) fails every provisioning call.
+            row.entitlement_overrides = {k: v for k, v in overrides.items() if v is not None} or None
     except (billing.SubscriptionError, stripe.BillingError) as exc:
         db.rollback()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -647,7 +651,10 @@ class PackageIn(BaseModel):
     sort_order: int | None = None
 
 
-LIMIT_KEYS = {"max_devices": 0, "max_employees": 0, "max_seats": 0, "min_sync_interval_minutes": 1}
+#: The smallest value each limit takes. Devices and employees start at 1: the
+#: services read 0 as "no limit" (empty is how the core says that), so a 0 typed
+#: here would give an account unlimited use instead of none.
+LIMIT_KEYS = {"max_devices": 1, "max_employees": 1, "max_seats": 0, "min_sync_interval_minutes": 1}
 
 
 def _clean_entitlements(raw: dict) -> dict:

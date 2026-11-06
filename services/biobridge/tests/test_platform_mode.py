@@ -234,3 +234,60 @@ def test_platform_endpoints_are_off_in_standalone_mode(client, monkeypatch):
     monkeypatch.setattr(settings, "platform_mode", False)
     assert put(client, state()).status_code == 404
     assert client.get("/api/v1/auth/mode").json() == {"platform_mode": False}
+
+
+def test_a_user_removed_from_one_account_can_join_another(client):
+    """Removed from account A in the core, then invited to account B with the same
+    email: B's provisioning must not be refused for ever because A's old row holds it."""
+    people = [{"id": "u" * 32, "email": "owner@acme.com", "full_name": "Olive", "role": "owner"},
+              {"id": "m" * 32, "email": "mo@acme.com", "full_name": "Mo", "role": "admin"}]
+    assert put(client, state(users=people)).status_code == 200
+    assert put(client, state(users=people[:1], revision=2)).status_code == 200     # Mo removed from A
+
+    other = "b" * 32
+    b_state = state(account={"id": other, "name": "Beta Co", "slug": "beta", "timezone": "UTC"},
+                    users=[{"id": "n" * 32, "email": "mo@acme.com", "full_name": "Mo", "role": "owner"}])
+    r = put(client, b_state, account_id=other)
+    assert r.status_code == 200, r.text
+    db = client.Session()
+    mo = db.scalar(select(User).where(User.email == "mo@acme.com"))
+    beta = db.scalar(select(Tenant).where(Tenant.platform_account_id == other))
+    assert mo.tenant_id == beta.id and mo.is_active and mo.role == "owner"
+    old = db.scalar(select(User).where(User.platform_user_id == "m" * 32))
+    assert old.tenant_id != beta.id and not old.is_active and old.email.endswith("@users.invalid")
+    db.close()
+
+
+def test_an_active_user_of_another_account_still_blocks_the_email(client):
+    assert put(client, state()).status_code == 200
+    other = "b" * 32
+    b_state = state(account={"id": other, "name": "Beta Co", "slug": "beta", "timezone": "UTC"},
+                    users=[{"id": "n" * 32, "email": "owner@acme.com", "full_name": "O", "role": "owner"}])
+    assert put(client, b_state, account_id=other).status_code == 409
+
+
+def test_setup_counts_as_complete_only_after_a_working_sync(client):
+    """A run that only said "No attendance platform is connected" is not a finished setup."""
+    from datetime import datetime, timezone
+
+    from app.models import SyncRun
+
+    put(client, state())
+    bearer = token("provision", {"account_id": ACCOUNT, "body_sha256": hashlib.sha256(b"").hexdigest()})
+
+    def setup_complete():
+        r = client.get(f"/platform/v1/accounts/{ACCOUNT}/usage", headers={"Authorization": f"Bearer {bearer}"})
+        return r.json()["setup_complete"]
+
+    assert setup_complete() is False
+    db = client.Session()
+    tenant_id = db.scalar(select(Tenant.id).where(Tenant.platform_account_id == ACCOUNT))
+    now = datetime.now(timezone.utc)
+    db.add(SyncRun(tenant_id=tenant_id, status="failed", started_at=now,
+                   error_message="No attendance platform is connected."))
+    db.commit()
+    assert setup_complete() is False
+    db.add(SyncRun(tenant_id=tenant_id, status="success", started_at=now))
+    db.commit()
+    db.close()
+    assert setup_complete() is True

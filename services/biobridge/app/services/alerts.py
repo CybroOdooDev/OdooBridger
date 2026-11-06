@@ -156,15 +156,25 @@ def tenant_alerts(db: Session, tenant: Tenant, *, now: datetime | None = None) -
     source_ids = [s.id for s in sources]
     if source_ids:
         cutoff = now - timedelta(minutes=TERMINAL_SILENT_MINUTES)
+        # A heartbeat is the only honest sign a terminal is down: a push terminal's own call-in,
+        # or, for one read through a platform, the contact time the platform's device list gives
+        # (not its last punch: a quiet door is not a dead one).
+        heard: dict[str, tuple[datetime, str]] = {}
+        for dev in db.scalars(select(Device).where(
+                Device.tenant_id == tenant.id, Device.source_id.in_(source_ids),
+                Device.last_contact_at.is_not(None))).all():
+            heard[dev.serial_number] = (ensure_aware(dev.last_contact_at), "reported by its platform")
         for dev in db.scalars(select(AdmsDevice).where(AdmsDevice.source_id.in_(source_ids))).all():
-            seen = ensure_aware(dev.last_seen_at)
-            if seen is not None and seen < cutoff:
-                label = _terminal_label(db, tenant.id, dev.serial_number) or dev.serial_number
+            if dev.last_seen_at is not None:
+                heard[dev.serial_number] = (ensure_aware(dev.last_seen_at), "contacted BioBridge")
+        for serial, (seen, how) in heard.items():
+            if seen < cutoff:
+                label = _terminal_label(db, tenant.id, serial) or serial
                 out.append(_alert(
-                    f"terminal-offline-{dev.serial_number}", WARN, f"Terminal {label} is offline",
-                    f"It last contacted BioBridge {_ago(seen, now)} ago. Check its power and network — "
+                    f"terminal-offline-{serial}", WARN, f"Terminal {label} is offline",
+                    f"It last {how} {_ago(seen, now)} ago. Check its power and network — "
                     "punches made meanwhile stay on the terminal and arrive when it reconnects.",
-                    "#/terminals", "View terminals"))
+                    "#/settings/biometric", "Manage terminals"))
         missing = db.scalars(select(Device).where(
             Device.tenant_id == tenant.id, Device.missing_since.is_not(None), Device.is_enabled.is_(True))).all()
         if missing:
@@ -172,7 +182,7 @@ def tenant_alerts(db: Session, tenant: Tenant, *, now: datetime | None = None) -
             out.append(_alert(
                 "terminals-missing", WARN, f"{_plural(len(missing), 'terminal is', 'terminals are')} no longer reported",
                 f"{names} — its platform stopped listing it. It may have been removed or renamed there.",
-                "#/terminals", "View terminals"))
+                "#/settings/biometric", "Manage terminals"))
 
     out.sort(key=lambda a: 0 if a["severity"] == BAD else 1)
     return out

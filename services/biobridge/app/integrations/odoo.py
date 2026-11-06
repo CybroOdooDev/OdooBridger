@@ -46,6 +46,7 @@ import ssl
 import threading
 import time
 import xmlrpc.client
+from xml.parsers.expat import ExpatError
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -161,6 +162,15 @@ def _transport_error(url: str, exc: Exception, endpoint: str = "/xmlrpc/2/common
         return OdooError(
             f"{url} answered, but with a web page instead of Odoo's API. Something "
             "is serving HTML where the API should be."
+        )
+    if isinstance(exc, ExpatError):
+        # A 200 reply whose body isn't XML at all: a proxy's or host's error page,
+        # an empty body from a worker that was restarting, a cut-off reply. Usually
+        # passing — the punches stay pending and the next sync sends them.
+        return OdooError(
+            f"{url} sent back a reply that isn't Odoo API data on {endpoint} (often a "
+            "proxy error page or Odoo restarting). Nothing was lost: the punches are "
+            "sent on the next sync."
         )
     if isinstance(exc, ssl.SSLError):
         if "WRONG_VERSION_NUMBER" in str(exc):
@@ -368,6 +378,7 @@ class _TimeoutSafeTransport(_TimeoutMixin, xmlrpc.client.SafeTransport):
 _XMLRPC_TRANSPORT_ERRORS = (
     xmlrpc.client.ProtocolError,
     xmlrpc.client.ResponseError,
+    ExpatError,
     ssl.SSLError,
     OSError,
     socket.timeout,

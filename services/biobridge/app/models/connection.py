@@ -230,7 +230,12 @@ class Device(Base, UUIDPk, Timestamped):
     #: original implementation, the engine actually reads this.
     pairing_override: Mapped[str | None] = mapped_column(String(20))
 
+    #: The last PUNCH from this terminal (not a heartbeat).
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When its platform last heard from the terminal itself, as the platform's
+    #: device list says (BioTime's ``last_activity``). Null when the platform
+    #: doesn't say; push terminals use ``AdmsDevice.last_seen_at`` instead.
+    last_contact_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     punch_count: Mapped[int] = mapped_column(Integer, default=0)
 
     #: Set the first time an "Import terminals" run for this device's source

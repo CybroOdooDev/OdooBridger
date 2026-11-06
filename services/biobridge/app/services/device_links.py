@@ -227,6 +227,7 @@ def sync_inventory(db: Session, tenant: Tenant, source: DeviceSource, terminals)
         device.area = terminal.area or device.area
         device.ip_address = terminal.ip_address or device.ip_address
         device.model = terminal.model or device.model
+        device.last_contact_at = terminal.last_contact_at or device.last_contact_at
         device.missing_since = None
         touched.append(device)
     # An empty list is not trusted to mean "every terminal was deleted": an

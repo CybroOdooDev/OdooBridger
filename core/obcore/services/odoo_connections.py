@@ -285,6 +285,11 @@ def record_readiness(db: Session, row: AccountService, report: dict[str, Any] | 
     if conn is not None and report.get("auth_failed") and conn.status != OdooConnectionStatus.failed.value:
         _fail(conn, report.get("message") or f"{row.service.name} could not sign in to Odoo.")
         _changed(conn)
+    elif conn is not None and report.get("ready") is True and conn.status == OdooConnectionStatus.failed.value:
+        # The service signs in fine again (the customer fixed the user in Odoo, say). Without
+        # this the connection stayed "failed" — on the dashboard and the customer's Odoo page —
+        # until someone pressed Test. The core's own test decides, so a still-broken key stays failed.
+        test(db, conn)
 
 
 def refresh_readiness(db: Session, conn: OdooConnection, *, live: bool = False) -> None:

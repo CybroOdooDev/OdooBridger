@@ -240,9 +240,9 @@ function mountShell() {
     if (button) setTheme(button.dataset.themeChoice);
   });
 
-  // Sync now, from any screen — it used to live only on the Overview card.
-  $('#topActions', root).addEventListener('click', async (event) => {
-    const button = event.target.closest('#topSync');
+  // Sync Now lives in the Overview's Sync & Connections card; any button marked data-sync-now does it.
+  root.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-sync-now]');
     if (!button) return;
     button.disabled = true;
     button.classList.add('spinning');
@@ -337,8 +337,7 @@ function renderChrome(path) {
       </a>`;
     }).join('')}`).join('');
 
-  // The top bar's sync button: a customer session, a role that can write,
-  // and both sides connected — otherwise it would only fail.
+  // The top bar: the bell and when the last sync ran. (Sync Now is on the Overview card.)
   const run = syncState.lastRun;
   $('#topActions').innerHTML = auth.tenant && !auth.isStaffSession ? `
     ${bellHtml()}
@@ -346,9 +345,7 @@ function renderChrome(path) {
       ${run ? `<span class="dot ${run.status === 'success' ? 'ok' : run.status === 'failed' ? 'bad' : 'warn'}"></span>
         Synced ${esc(fmtAgo(run.started_at))}` : 'Never Synced'}
     </span>
-    ${auth.canWrite ? `<button class="sm" id="topSync" aria-label="Sync Now" ${syncState.needsSetup ? 'disabled title="Connect Odoo and a biometric source first"' : ''}>
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/></svg>
-      <span class="sync-label">Sync Now</span></button>` : ''}` : '';
+    ` : '';
 
   const portal = $('#portalLink');
   if (portal) portal.outerHTML = '';

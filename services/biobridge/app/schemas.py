@@ -1029,6 +1029,10 @@ class SyncRunOut(ORMModel):
     punches_new: int
     attendances_created: int
     attendances_closed: int
+    #: Existing Odoo records a punch moved (a later check-out, a day's first/last punch): the
+    #: reason a run can have new punches and still create or close nothing.
+    attendances_updated: int = 0
+    punches_skipped: int = 0
     employees_matched: int
     error_count: int
     error_message: str | None
@@ -1075,9 +1079,73 @@ class ScheduleOut(BaseModel):
     interval_widened: bool = False
 
 
+class OdooLinkOut(BaseModel):
+    """The Odoo connection in use, for the dashboard card."""
+
+    host: str
+    status: str
+    message: str | None = None
+    last_checked_at: datetime | None = None
+    #: Set in OdooBridger: the fix is made there, not here.
+    managed: bool = False
+    active: bool = True
+
+
+class TerminalLinkOut(BaseModel):
+    """One terminal. ``state``: online / offline (judged by a heartbeat: a push terminal's
+    own, or the contact time a platform reports; for a standalone device, the answer to the
+    last check of it: unreachable / unchecked), waiting (a push terminal that has not
+    called in yet), reporting / missing (read through a platform that gives no heartbeat,
+    so only known to be listed or not). ``last_punch_at`` is activity, never health."""
+
+    id: str
+    name: str
+    kind: str
+    state: str
+    #: False for a standalone connection whose terminal record is not made yet
+    #: (``id`` is then the connection's, not a terminal's).
+    registered: bool = True
+    last_contact_at: datetime | None = None
+    last_punch_at: datetime | None = None
+    punches_today: int = 0
+
+
+class ConnectionsOut(BaseModel):
+    odoo: OdooLinkOut | None = None
+    terminals: list[TerminalLinkOut] = []
+    #: total, plus a count per state, over every enabled terminal (the list is capped).
+    terminal_counts: dict[str, int] = {}
+    last_punch_at: datetime | None = None
+
+
+class WeekDayOut(BaseModel):
+    date: str
+    count: int
+
+
+class LatestPunchOut(BaseModel):
+    """One recent punch with where it stands: ``state`` is the punch's process state
+    (synced / pending / error / held / skipped)."""
+    id: str
+    name: str
+    emp_code: str
+    terminal: str | None = None
+    time: datetime
+    #: The punch's clock time at the site (naive, the account's own zone), for showing "9:41 am".
+    time_local: datetime | None = None
+    direction: str
+    state: str
+
+
 class DashboardOut(BaseModel):
     tenant: TenantOut
     punches_today: int
+    #: Distinct people who punched today, and how many badges are matched to an Odoo employee.
+    people_today: int = 0
+    people_total: int = 0
+    #: Punches per day for the last seven days in the account's timezone, oldest first.
+    punches_week: list[WeekDayOut] = []
+    latest_punches: list[LatestPunchOut] = []
     punches_pending: int
     punches_error: int
     #: Kept but not sent to Odoo: from a terminal over the plan's device limit.
@@ -1088,6 +1156,8 @@ class DashboardOut(BaseModel):
     #: How many biometric connections there are, and in which state.
     source_counts: dict[str, int] = {}
     schedule: ScheduleOut
+    #: What the "Sync & connections" card shows: the Odoo in use and each terminal.
+    connections: ConnectionsOut = ConnectionsOut()
     #: None right up until the subscription is genuinely close to lapsing —
     #: see app.services.scheduling.renewal_warning. The overview page is the
     #: one place this is rendered as a banner.

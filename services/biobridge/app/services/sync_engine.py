@@ -28,7 +28,7 @@ from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 from datetime import time as _time
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -443,6 +443,7 @@ class SyncEngine:
                 for note in infer_device_companies(self.db, self.tenant):
                     self._log(note, "info", ui=False)
             self._sync_odoo_devices(odoo, odoo_conn)
+            self._drop_records_deleted_in_odoo(odoo)
             self._refresh_open_mirror(odoo)
             self._push(odoo, odoo_conn)
             # Shifts nobody badged out of: closed at the limit on every run,
@@ -502,8 +503,11 @@ class SyncEngine:
             self._recover()
             self.tenant.consecutive_failures += 1
             self.run.status = SyncStatus.failed.value
-            self.run.error_message = f"Unexpected error: {exc}"
-            self._log(f"Unexpected error: {exc}", "exception")
+            # The type matters: a bare KeyError(0) reads as just "0". The traceback
+            # goes to the server log (log.exception), where support can find the line.
+            what = f"Unexpected error ({type(exc).__name__}): {exc}"
+            self.run.error_message = what
+            self._log(what, "exception")
             self._mark_degraded_if_needed()
         finally:
             self._recover()
@@ -1562,6 +1566,7 @@ class SyncEngine:
                     target_id = day_rows[-1]["id"]
                     attendance_id = self._extend_latest_of_day(
                         odoo, mapping, interval, day_rows, used_mode)
+                    self.run.attendances_updated += 1
                 elif interval.closes_attendance_id is not None:
                     target_id = interval.closes_attendance_id
                     # Closes a shift opened in an earlier cycle. No new record is
@@ -1585,6 +1590,7 @@ class SyncEngine:
                             day_id, interval.check_in, interval.check_out, pairing_mode=used_mode,
                             auto_closed=interval.auto_closed,
                         )
+                    self.run.attendances_updated += 1
                     attendance_id = day_id
                 else:
                     existing = odoo.attendance_exists(employee_id, interval.check_in)
@@ -2209,6 +2215,50 @@ class SyncEngine:
                           "were merged into the matching Odoo records", "info")
         except Exception as exc:  # noqa: BLE001 — tidying a display copy must never fail a sync
             log.warning("duplicate merge skipped for %s: %s", self.tenant.slug, exc)
+
+    #: Below this many records, "Odoo no longer has any of them" can be real deletions.
+    #: Above it, every record vanishing at once means the connection now reaches another
+    #: database, or the user lost access — and the copy is kept, not emptied.
+    DELETED_ALL_AT_ONCE = 5
+
+    def _drop_records_deleted_in_odoo(self, odoo: OdooClient) -> None:
+        """Remove from BioBridge's Attendance page the records someone deleted in Odoo.
+
+        The copy is otherwise only ever updated: the read-back fetches records that
+        *changed*, and a deleted record never shows up there, so its row (an open one
+        above all, shown "Open" for ever) stayed. Odoo is asked plainly which ids still
+        exist — without BioBridge's company filter, so a record in a company switched
+        off here still counts as existing and stays. Only the follow window is checked,
+        plus every row still open. A failure here never fails the sync.
+        """
+        try:
+            floor = utcnow_naive() - timedelta(days=self.FOLLOW_ODOO_DAYS)
+            rows = self.db.scalars(select(AttendanceRecord).where(
+                AttendanceRecord.tenant_id == self.tenant.id,
+                AttendanceRecord.odoo_attendance_id.is_not(None),
+                or_(AttendanceRecord.check_in >= floor, AttendanceRecord.check_out.is_(None)))).all()
+            if not rows:
+                return
+            ids = sorted({r.odoo_attendance_id for r in rows})
+            alive: set[int] = set()
+            for start in range(0, len(ids), 1000):
+                alive |= odoo.existing_attendance_ids(ids[start:start + 1000])
+            gone = [r for r in rows if r.odoo_attendance_id not in alive]
+            if not gone:
+                return
+            if len(gone) == len(rows) and len(rows) > self.DELETED_ALL_AT_ONCE:
+                self._log(f"Odoo shows none of the {len(rows)} attendance records BioBridge holds for the "
+                          "last weeks — kept them: check the Odoo connection points at the right database",
+                          "warning")
+                return
+            for row in gone:
+                self.db.delete(row)
+            self.db.flush()
+            self._log(f"{len(gone)} attendance record(s) deleted in Odoo removed here too: "
+                      f"{', '.join(str(r.odoo_attendance_id) for r in gone[:10])}"
+                      f"{' …' if len(gone) > 10 else ''}", "info")
+        except Exception as exc:  # noqa: BLE001 — a copy for display must never fail a sync
+            log.warning("checking for records deleted in Odoo skipped for %s: %s", self.tenant.slug, exc)
 
     def _refresh_open_mirror(self, odoo: OdooClient) -> None:
         """Bring records BioBridge shows as open in step with Odoo.

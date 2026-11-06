@@ -108,6 +108,10 @@ class TerminalRecord:
     area: str | None = None
     ip_address: str | None = None
     model: str | None = None
+    #: When the platform last heard from the terminal itself (UTC, aware), if it says:
+    #: a heartbeat, not a punch. None = the platform doesn't tell, so BioBridge can't
+    #: judge whether the terminal is up.
+    last_contact_at: datetime | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 

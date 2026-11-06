@@ -186,6 +186,9 @@ def _json2(client: httpx.Client, url: str, db: str, key: str, model: str, method
                              "Odoo (My Profile → Account Security → New API Key).", auth=True)
     if "database" in lowered and ("not found" in lowered or "does not exist" in lowered):
         raise OdooProbeError(f"Odoo has no database named {db!r}.", auth=True)
+    if resp.status_code == 404 and "no database is selected" in resp.text.lower():
+        raise OdooProbeError(f"Odoo has no database named {db!r} at this address. Check the database name.",
+                             auth=True)
     if resp.status_code == 403:
         raise OdooProbeError(f"The Odoo user may not use {model}: {message[:160]}", auth=True)
     raise OdooProbeError(f"Odoo answered HTTP {resp.status_code} on {model}.{method}: {message[:200]}")

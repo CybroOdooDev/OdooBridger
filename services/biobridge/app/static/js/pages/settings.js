@@ -1337,6 +1337,18 @@ async function renderBiometric(mount, route) {
 
   wireBiometric(mount, canProvision, sources, providersFor);
 
+  // #/settings/biometric?device=<id> — the Overview's terminal lines link here:
+  // scroll to that terminal's row (Enable/Disable, Delete live on it) and flash it.
+  // Dropped from the address afterwards so a reload does not repeat it.
+  if (route?.query?.device) {
+    const row = mount.querySelector(`tr[data-device="${CSS.escape(String(route.query.device))}"]`);
+    history.replaceState(null, '', '#/settings/biometric');
+    if (row) {
+      row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      row.classList.add('flash-row');
+    }
+  }
+
   // #/settings/biometric?add=1 — the Overview's setup checklist links here
   // to open the wizard straight away. Dropped from the address afterwards so
   // a reload does not open it again.

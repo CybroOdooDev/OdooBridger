@@ -48,7 +48,7 @@ import socket
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -436,7 +436,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/personnel/api/employees/":
             return self._json(self._page([_public(e) for e in EMPLOYEES], query, path))
         if path == "/iclock/api/terminals/":
-            return self._json(self._page([_public(t) for t in TERMINALS], query, path))
+            # BioTime's terminal list carries last_activity: when the terminal last talked to it.
+            alive = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            return self._json(self._page([{**_public(t), "last_activity": alive} for t in TERMINALS], query, path))
 
         one = re.fullmatch(r"/iclock/api/transactions/(\d+)/", path)
         if one:

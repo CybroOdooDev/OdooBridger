@@ -256,6 +256,8 @@ class SyncRun(Base, UUIDPk, Timestamped):
     punches_skipped: Mapped[int] = mapped_column(Integer, default=0)
     attendances_created: Mapped[int] = mapped_column(Integer, default=0)
     attendances_closed: Mapped[int] = mapped_column(Integer, default=0)
+    #: Existing Odoo records changed by a punch (check-out moved, a day's first/last punch).
+    attendances_updated: Mapped[int] = mapped_column(Integer, default=0)
     employees_matched: Mapped[int] = mapped_column(Integer, default=0)
     #: Odoo employees newly provisioned onto a device/platform this run, via
     #: DeviceSource.auto_provision_employees — see SyncEngine._provision_employees.

@@ -77,7 +77,7 @@ export async function renderAttendance(mount, route) {
     $('#rows', mount).innerHTML = rows.length ? `
       <div class="grid cols-3" style="margin-bottom:14px">
         ${stat({ label: 'Employees', value: people })}
-        ${stat({ label: 'Total Worked Hours', value: hours.toFixed(1) })}
+        ${stat({ label: 'Total Worked Time', value: fmtHours(hours) })}
         ${stat({ label: 'Open Attendances', value: open, tone: open ? 'warn' : '' })}
       </div>
       <div class="card">
@@ -122,7 +122,7 @@ function flags(record) {
   if (record.overtime_hours > 0) {
     const ot = Number(record.overtime_hours);
     const worked = Number(record.worked_hours || 0);
-    out.push(`<span class="pill" title="One shift here. In Odoo, its overtime rule split it into ${(worked - ot).toFixed(2)} h attendance and ${ot.toFixed(2)} h overtime.">A + OT ${ot.toFixed(2)} h</span>`);
+    out.push(`<span class="pill" title="One shift here. In Odoo, its overtime rule split it into ${fmtHours(worked - ot)} attendance and ${fmtHours(ot)} overtime.">A + OT ${fmtHours(ot)}</span>`);
   }
   if (record.origin === 'odoo') out.push('<span class="pill" title="Found in Odoo for a matched employee: entered there by hand, from a kiosk, or by another app. Not built from punches.">added in Odoo</span>');
   if (record.is_auto_closed) out.push('<span class="pill warn">auto-closed</span>');

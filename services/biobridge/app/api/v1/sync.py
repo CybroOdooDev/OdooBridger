@@ -59,7 +59,9 @@ from app.services.scheduling import (
     renewal_warning,
     scheduler_health,
 )
+from app.services.connection_overview import active_odoo_connection, connection_overview
 from app.services.alerts import tenant_alerts
+from app.services.dashboard_activity import activity_summary
 from app.services.name_match import clear_suggestion, dismiss_suggestion
 from app.services.run_lock import TenantRunLock
 from app.services.sync_engine import SyncEngine, active_run, close_abandoned_runs
@@ -257,7 +259,7 @@ def _queue_or_run(principal: Principal, db: Session) -> str:
     return (
         f"Ran inline: {run.status} — {run.punches_new} new punch(es), "
         f"{run.attendances_created} attendance record(s) created, "
-        f"{run.attendances_closed} closed."
+        f"{run.attendances_closed} closed, {run.attendances_updated} updated."
     )
 
 
@@ -875,16 +877,12 @@ def dashboard(
     principal: Principal = Depends(get_principal), db: Session = Depends(get_db)
 ) -> DashboardOut:
     tenant = principal.tenant
-    midnight = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    )
+    activity = activity_summary(db, tenant)
 
     def count(**filters) -> int:
         stmt = select(func.count(PunchRecord.id)).where(PunchRecord.tenant_id == tenant.id)
         if "state" in filters:
             stmt = stmt.where(PunchRecord.process_state == filters["state"])
-        if filters.get("today"):
-            stmt = stmt.where(PunchRecord.punch_time_utc >= midnight)
         return db.scalar(stmt) or 0
 
     last_run = db.scalars(
@@ -894,9 +892,7 @@ def dashboard(
         .limit(1)
     ).first()
 
-    odoo_conn = db.scalars(
-        select(OdooConnection).where(OdooConnection.tenant_id == tenant.id).limit(1)
-    ).first()
+    odoo_conn = active_odoo_connection(db, tenant)
     sources = db.scalars(
         select(DeviceSource).where(DeviceSource.tenant_id == tenant.id)
         .order_by(DeviceSource.created_at)
@@ -913,7 +909,11 @@ def dashboard(
 
     return DashboardOut(
         tenant=TenantOut.model_validate(tenant),
-        punches_today=count(today=True),
+        punches_today=activity["punches_today"],
+        people_today=activity["people_today"],
+        people_total=activity["people_total"],
+        punches_week=activity["punches_week"],
+        latest_punches=activity["latest_punches"],
         punches_pending=count(state=PunchState.pending.value),
         punches_error=count(state=PunchState.error.value),
         punches_held=count(state=PunchState.held.value),
@@ -932,6 +932,7 @@ def dashboard(
         },
         source_counts=counts,
         schedule=_schedule_out(db, tenant),
+        connections=connection_overview(db, tenant),
         renewal_warning=renewal_warning(tenant),
     )
 

@@ -323,11 +323,26 @@ def _apply_users(db: Session, tenant: Tenant, people: list[dict[str, Any]]) -> N
                 session.revoked_reason = "removed in OdooBridger"
 
 
+def _left_in_core(user: User) -> bool:
+    """A user OdooBridger managed and has removed: deactivated by ``_apply_users``.
+    A standalone BioBridge login (no platform id) is never taken over."""
+    return user.platform_user_id is not None and not user.is_active
+
+
 def upsert_user(db: Session, tenant: Tenant, person: dict[str, Any]) -> User:
     email = (person.get("email") or "").strip().lower()
     user = db.scalar(select(User).where(User.platform_user_id == person["id"]))
     if user is None:
         user = db.scalar(select(User).where(func.lower(User.email) == email))
+        if user is not None and user.tenant_id != tenant.id and _left_in_core(user):
+            # Removed from their old account in OdooBridger (deactivated here), and the
+            # core has since given the address to someone in another account. Emails are
+            # unique here, so the old row lets go of it — its history stays with the old
+            # account under a placeholder — instead of refusing the new account's whole
+            # provisioning (and its SSO) for ever.
+            user.email = f"removed-{user.id}@users.invalid"
+            db.flush()
+            user = None
         if user is not None and user.tenant_id != tenant.id:
             raise PlatformError(
                 f"{email} already signs in to another BioBridge account, so it can't join this one.")
@@ -391,7 +406,7 @@ def sign_in(db: Session, claims: dict[str, Any]) -> User:
 
 
 def usage(db: Session, tenant: Tenant, *, check_odoo: bool = False) -> dict[str, Any]:
-    from app.models import Device, EmployeeMapping, MappingStatus, SyncRun
+    from app.models import Device, EmployeeMapping, MappingStatus, SyncRun, SyncStatus
 
     devices = db.scalar(select(func.count(Device.id)).where(Device.tenant_id == tenant.id)) or 0
     employees = db.scalar(select(func.count(EmployeeMapping.id)).where(
@@ -406,7 +421,11 @@ def usage(db: Session, tenant: Tenant, *, check_odoo: bool = False) -> dict[str,
         "sync_interval_minutes": tenant.sync_interval_minutes,
         "last_sync": {"status": last.status, "started_at": last.started_at.isoformat() if last.started_at else None}
         if last else None,
-        # Initial setup is done once a sync has run: that needs Odoo and a source of punches.
-        "setup_complete": last is not None,
+        # Initial setup is done once a sync has worked end to end: that needs Odoo and a source
+        # of punches. Any run is not enough — "No attendance platform is connected" is a run too,
+        # and counting it hid stuck accounts from OdooBridger's "setup not finished" list.
+        "setup_complete": bool(db.scalar(select(SyncRun.id).where(
+            SyncRun.tenant_id == tenant.id,
+            SyncRun.status.in_((SyncStatus.success.value, SyncStatus.partial.value))).limit(1))),
         "odoo": odoo_readiness(db, tenant, live=check_odoo),
     }

@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -661,5 +661,21 @@ class BioTimeProvider(AttendanceProvider):
                 area=area.get("area_name") if isinstance(area, dict) else area,
                 ip_address=row.get("ip_address"),
                 model=row.get("model"),
+                last_contact_at=self._contact_time(row.get("last_activity")),
                 raw=row,
             )
+
+    def _contact_time(self, value: Any) -> datetime | None:
+        """BioTime's ``last_activity``: when the terminal last talked to the server.
+        Read in the server's timezone unless it carries an offset of its own;
+        anything unreadable means "not told", never a guess."""
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=ZoneInfo(self.config.timezone or "UTC"))
+        return moment.astimezone(timezone.utc)
